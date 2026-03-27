@@ -1,0 +1,357 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" modified="2024-01-01T00:00:00.000Z" agent="5.0" version="22.1.0" type="device">
+  <diagram name="File Monitor System Flowchart" id="file-monitor-flow">
+    <mxGraphModel dx="1400" dy="2000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="1700" background="#ffffff" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- START -->
+        <mxCell id="start" value="START" style="ellipse;whiteSpace=wrap;html=1;fillColor=#90EE90;strokeColor=#000000;strokeWidth=2;fontSize=14;fontStyle=bold;" vertex="1" parent="1">
+          <mxGeometry x="450" y="30" width="100" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- 1.1: Parse Command Line Arguments -->
+        <mxCell id="parse-args" value="1.1: Parse Command Line Arguments&#10;(-g, -d, -h)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor=#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="380" y="110" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- 1.2: Instantiate Build Object -->
+        <mxCell id="build-init" value="1.2: Instantiate Build Object&#10;Build(script_name, log_level)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor=#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="380" y="210" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- 1.3: Initialize System Info -->
+        <mxCell id="sys-info" value="1.3: Initialize System Info&#10;User, Hostname, PID, CWD" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor=#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="380" y="310" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- 1.4: Initialize Logger -->
+        <mxCell id="init-logger" value="1.4: Initialize Logger&#10;(DEBUG or INFO level)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor=#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="380" y="410" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- 1.5: Load Configuration XML -->
+        <mxCell id="load-config" value="1.5: Load Configuration XML&#10;build_config.xml" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor=#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="380" y="510" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- 2.1: Load Default Parameters -->
+        <mxCell id="load-defaults" value="2.1: Load Default Parameters&#10;(Tables, Emails, Folders)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor=#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="380" y="610" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- 2.2: Establish DB Connection -->
+        <mxCell id="db-connect" value="2.2: Establish Database Connection&#10;(dsmonitor using cx_Oracle)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor=#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="380" y="710" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- 2.3: Check Config Table Data -->
+        <mxCell id="check-config" value="2.3: CONFIG_TABLE&#10;Has Records?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFD700;strokeColor=#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="410" y="810" width="180" height="100" as="geometry" />
+        </mxCell>
+
+        <!-- No Config Data - Exit -->
+        <mxCell id="no-config-exit" value="Log: No Records&#10;Update STATUS_LOG&#10;Exit (Code 0)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFB6C6;strokeColor=#000000;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="680" y="830" width="140" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- 2.4: Load File Config Data -->
+        <mxCell id="load-file-config" value="2.4: Load File Config Data&#10;SELECT * FROM CONFIG_TABLE" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor=#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="380" y="950" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- 2.5: Validate Configuration -->
+        <mxCell id="validate-config" value="2.5: Validate Each Config&#10;(Cutoff Time, Date Qualifier)" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFD700;strokeColor:#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="410" y="1060" width="180" height="100" as="geometry" />
+        </mxCell>
+
+        <!-- Config Invalid - Exit -->
+        <mxCell id="config-invalid" value="Send Notification&#10;Update STATUS_LOG&#10;Exit" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFB6C6;strokeColor:#000000;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="680" y="1080" width="140" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- 3.1: Get Current Time -->
+        <mxCell id="get-time" value="3.1: Get Current System Time" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor=#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="400" y="1200" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- 3.2: Process by File Group -->
+        <mxCell id="process-groups" value="3.2: For Each File Group" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFB6D9;strokeColor:#000000;strokeWidth=3;dashed=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="400" y="1290" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- 3.3: Process Each File -->
+        <mxCell id="process-files" value="3.3: For Each File in Group" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFB6D9;strokeColor=#000000;strokeWidth=3;dashed=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="400" y="1380" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- 3.3.1: Replace Date in Filename -->
+        <mxCell id="replace-date" value="3.3.1: Replace Date Qualifier&#10;in Filename" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor:#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="400" y="1480" width="200" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- 3.3.2: Get File Path -->
+        <mxCell id="get-filepath" value="3.3.2: Build Full File Path" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor:#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="400" y="1580" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- 3.3.3: Check File Exists -->
+        <mxCell id="check-exists" value="3.3.3: File Exists?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFD700;strokeColor:#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="420" y="1680" width="160" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- FILE NOT FOUND PATH -->
+        <!-- Get Attempt Count -->
+        <mxCell id="file-notfound-getcount" value="Get Attempt Count&#10;from DB" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor:#000000;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="700" y="1700" width="120" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Check Attempts -->
+        <mxCell id="check-attempts" value="Attempts &lt;&#10;Max?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFD700;strokeColor:#000000;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="720" y="1800" width="80" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- Increment Attempt -->
+        <mxCell id="increment-attempt" value="Increment Attempt&#10;in DB" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor:#000000;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="860" y="1820" width="100" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Max Attempts Exceeded -->
+        <mxCell id="max-attempts-action" value="Send Notification&#10;Max Attempts" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFB6C6;strokeColor:#000000;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="700" y="1920" width="120" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- FILE FOUND PATH -->
+        <!-- Check Timestamp -->
+        <mxCell id="check-timestamp" value="3.3.4: Timestamp &lt;&#10;Cutoff?" style="rhombus;whiteSpace=wrap;html=1;fillColor:#FFD700;strokeColor:#000000;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1680" width="130" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- File After Cutoff -->
+        <mxCell id="after-cutoff" value="Mark:&#10;NOT_PROCESSED" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFB6C6;strokeColor:#000000;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="90" y="1700" width="100" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Custom Validation -->
+        <mxCell id="check-validation" value="3.3.5: Custom&#10;Validation?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFD700;strokeColor:#000000;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1820" width="130" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- Run Validation -->
+        <mxCell id="run-validation" value="Execute Script&#10;Check Exit Code" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor:#000000;strokeWidth=2;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="80" y="1820" width="100" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Validation Result -->
+        <mxCell id="validation-pass" value="Validation&#10;Pass?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFD700;strokeColor:#000000;strokeWidth=2;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="80" y="1930" width="100" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Validation Failed -->
+        <mxCell id="validation-failed" value="Mark:&#10;VALIDATION_FAILED" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFB6C6;strokeColor:#000000;strokeWidth=2;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="50" y="2050" width="120" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Move to Processed Folder -->
+        <mxCell id="move-file" value="3.3.6: Move File to&#10;Processed Folder" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor:#000000;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="350" y="1930" width="120" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- Move Result -->
+        <mxCell id="move-success" value="Move OK?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFD700;strokeColor:#000000;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="370" y="2040" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Move Failed -->
+        <mxCell id="move-failed" value="Mark:&#10;MOVE_FAILED" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFB6C6;strokeColor:#000000;strokeWidth=2;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="520" y="2060" width="100" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Update Status and Notify -->
+        <mxCell id="update-success" value="3.3.7: Update STATUS_LOG&#10;Insert to DS_LOG&#10;Send Email Notification" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor:#000000;strokeWidth=2;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="340" y="2160" width="140" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Continue Next File -->
+        <mxCell id="next-file" value="Next File" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor:#000000;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="410" y="2290" width="80" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- All Files Processed -->
+        <mxCell id="all-files-done" value="All Files Processed" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor:#000000;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="410" y="2380" width="80" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- 4.1: Log Completion -->
+        <mxCell id="log-completion" value="4.1: Log Completion Event" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor:#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="400" y="2470" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- 4.2: Send Completion Email -->
+        <mxCell id="send-completion-email" value="4.2: Send Completion Email" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor:#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="400" y="2570" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- 4.3: Close Database Connection -->
+        <mxCell id="close-db" value="4.3: Close DB Connection" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#87CEEB;strokeColor:#000000;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="400" y="2670" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- END SUCCESS -->
+        <mxCell id="end-success" value="END (Success)" style="ellipse;whiteSpace=wrap;html=1;fillColor=#90EE90;strokeColor:#000000;strokeWidth=2;fontSize=14;fontStyle=bold;" vertex="1" parent="1">
+          <mxGeometry x="450" y="2770" width="100" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- EDGES / CONNECTIONS - WITH PROPER GEOMETRY -->
+        <!-- Main flow - Phase 1 to 2 -->
+        <mxCell id="edge1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="start" target="parse-args">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="parse-args" target="build-init">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="build-init" target="sys-info">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="sys-info" target="init-logger">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="init-logger" target="load-config">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="load-config" target="load-defaults">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge7" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="load-defaults" target="db-connect">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge8" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="db-connect" target="check-config">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <!-- Decision: Config has data -->
+        <mxCell id="edge9" value="YES" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#000000;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="check-config" target="load-file-config">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge10" value="NO" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#FF0000;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="check-config" target="no-config-exit">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <!-- Config validation -->
+        <mxCell id="edge11" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="load-file-config" target="validate-config">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge12" value="VALID" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#008000;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="validate-config" target="get-time">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge13" value="INVALID" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#FF0000;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="validate-config" target="config-invalid">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <!-- Main monitoring loop -->
+        <mxCell id="edge14" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="get-time" target="process-groups">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge15" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="process-groups" target="process-files">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge16" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="process-files" target="replace-date">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge17" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="replace-date" target="get-filepath">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge18" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="get-filepath" target="check-exists">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <!-- File exists decision -->
+        <mxCell id="edge19" value="NO" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#FF0000;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="check-exists" target="file-notfound-getcount">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge20" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="file-notfound-getcount" target="check-attempts">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge21" value="YES" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#008000;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="check-attempts" target="increment-attempt">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge22" value="NO" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#FF0000;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="check-attempts" target="max-attempts-action">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <!-- File found path -->
+        <mxCell id="edge23" value="YES" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#008000;exitX=0;exitY=0.5;entryX=0.5;entryY=0;" edge="1" parent="1" source="check-exists" target="check-timestamp">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge24" value="YES" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#008000;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="check-timestamp" target="check-validation">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge25" value="NO" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#FF0000;exitX=0;exitY=0.5;entryX=0.5;entryY=1;" edge="1" parent="1" source="check-timestamp" target="after-cutoff">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge26" value="YES" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#008000;exitX=0;exitY=0.5;entryX=0.5;entryY=1;" edge="1" parent="1" source="check-validation" target="run-validation">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge27" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="run-validation" target="validation-pass">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge28" value="NO" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#FF0000;exitX=0;exitY=0.5;entryX=0.5;entryY=1;" edge="1" parent="1" source="validation-pass" target="validation-failed">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge29" value="YES" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#008000;exitX=1;exitY=0.5;entryX=0;entryY=0;" edge="1" parent="1" source="validation-pass" target="move-file">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge30" value="NO" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#008000;exitX=1;exitY=0.5;entryX=0;entryY=0;" edge="1" parent="1" source="check-validation" target="move-file">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge31" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="move-file" target="move-success">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge32" value="YES" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#008000;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="move-success" target="update-success">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge33" value="NO" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;fontColor=#FF0000;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="move-success" target="move-failed">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <!-- Convergence to next file -->
+        <mxCell id="edge34" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="update-success" target="next-file">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge35" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="after-cutoff" target="next-file">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge36" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="validation-failed" target="next-file">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge37" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="move-failed" target="next-file">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge38" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="increment-attempt" target="next-file">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge39" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="max-attempts-action" target="next-file">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <!-- Completion phase -->
+        <mxCell id="edge40" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="next-file" target="all-files-done">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge41" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="all-files-done" target="log-completion">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge42" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="log-completion" target="send-completion-email">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge43" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="send-completion-email" target="close-db">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge44" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="close-db" target="end-success">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
