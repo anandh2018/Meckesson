@@ -1,0 +1,256 @@
+#!/usr/bin/perl
+
+# ds_encrypt: encrypt a file in-place
+#
+# Author: jmh, Per-Se Technologies
+# Initial release: 2/10/2006
+#
+# Note: The goal of this encryption utility is NOT performance.  The goal is to SAFELY replace a unencrypted
+# input file with an encrypted version of the file with a ".pgp" extension added to the filename.
+#
+# The input file must be readable via the 'read_file' command if the -verify option is specified.
+#
+# Currently, the private key for the encryption recipient must be available so that
+# decryption verification can be performed if the -verify option is given.
+#
+# 6/2006 : Initial release
+#
+# 10/9/2006 : Added "-compress-level #" and "-compress" options. Default of no compression remains.
+#
+# Version 1.2: 10/10/2019 J Hess
+#
+# Added support for repeating the -recipient option when multiple recipients are desired.
+
+
+use strict;
+use warnings;
+use String::CRC32;	# used here for verifying input and output equivalency
+use Getopt::Long;
+
+our $PGM = $0;
+$PGM =~ s|.*/||g;
+
+# defaults
+
+my $keep_original = 0;
+my $exit_success = 0;
+my $verify = 0;
+my @recipient = ();
+my $overwrite_output = 0;
+my $success_on_skip = 0;
+my ($min_file_age, $success_message, $compress_level, $compress);
+
+GetOptions(
+						"keep-original" => \$keep_original,
+						"exit=s" => \$exit_success,
+						"recipient=s" => \@recipient,
+						"verify" => \$verify,
+						"overwrite" => \$overwrite_output,
+						"min-file-age=s" => \$min_file_age,
+						"success-on-skip" => \$success_on_skip,
+						"success-message=s" => \$success_message,
+						"compress-level=s" => \$compress_level,
+						"compress" => \$compress
+) || exit(1);
+
+if (! @recipient) {
+	@recipient = ($ENV{DEFAULT_PGP_RECIPIENT});
+}
+
+if (! @recipient) {
+	print STDERR "$PGM: -recipient not specified and DEFAULT_PGP_RECIPIENT variable not set\n";
+	exit(1);
+}
+
+if (! defined($compress_level)) {
+	if (defined($compress)) {
+		$compress_level = 6;
+	} else {
+		$compress_level = 0;
+	}
+}
+
+my $fname = shift(@ARGV);
+
+if ( (! defined($fname)) or (! (length($fname) >= 1)) ) {
+	print STDERR "$PGM: encrypt a file in-place, with extremely thorough error checking\n";
+	print STDERR "Usage: $PGM [-keep-original] [-verify] [-exit exit_code] [-recipient key_id] [-min-file-age #_seconds] [-success-on-skip] [-compress] [-compress-level #] file [destination_dir]\n";
+	print STDERR "-recipient may be repeated for multiple recipients\n";
+	print STDERR "-compress-level # can be from 0 (no compression) to 9 (most compression) . Default is 0.\n";
+	print STDERR "-compress implies compression level of 6 .\n";
+	exit(1);
+}
+
+
+# sanity check input/output filenames
+
+if (! -f $fname) {
+	die "ERROR: $PGM: '$fname' does not exist\n";
+}
+
+if ($fname =~ /[.](pgp)|(gpg)$/i) {
+	die "ERROR: $PGM: The file '$fname' is already encrypted\n";
+}
+
+if (defined($min_file_age) && ($min_file_age > 0)) {
+	my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$fsize,$atime,$mtime,$ctime,$blksize,$blocks) = stat($fname);
+
+	if ($mtime > (time - $min_file_age)) {
+
+		if ($success_on_skip) {
+			exit($exit_success);
+		} else {
+			die "ERROR: $PGM: The file '$fname' has been modified within the last $min_file_age seconds, and the '-success-on-skip' option was NOT specified\n";
+		}
+
+	}
+}
+
+#
+
+my $output_file;
+my $destination = shift(@ARGV);
+
+if (defined($destination)) {
+
+	if ((-d $destination) || (-l $destination)) {
+		my $fname_base = $fname;
+		$fname_base =~ s|.*/||g;
+
+		$output_file = "${destination}/${fname_base}.pgp";
+	} else {
+		die "ERROR: $PGM: Optional 2nd parameter is not a directory or symbolic link. Only 1 file can be encrypted.\n";
+	}
+
+} else {
+	$output_file = "${fname}.pgp";
+}
+
+if ($fname eq $output_file) {
+	die "ERROR: $PGM: Output file name derived to same as input file name of '$output_file'\n";
+}
+
+
+if ($#ARGV >= 0) {
+	die "ERROR: $PGM: Too many arguments\n";
+}
+
+my $original_crc;
+
+if ($verify) {
+	# get checksum of original file so we can compare to output checksum later
+
+	open(ORIG, "read_file $fname |") || die "ERROR: $PGM: Cannot read contents of $fname to get checksum\n";
+	$original_crc = crc32(*ORIG);
+	close(ORIG);
+
+	if ($? != 0) {
+		die "ERROR: $PGM: could not read '$fname' via read_file\n";
+	}
+
+	if ((! defined($original_crc)) or (! (length($original_crc) >= 1)) ) {
+		die "ERROR: $PGM: Unable to get valid checksum for input file $fname\n";
+	}
+}
+
+
+if ($overwrite_output && (-f $output_file) ) {
+	die "ERROR: $PGM: Output file $output_file already exists, and --overwrite option not specified!\n";
+}
+
+my $recipient_args = join(' ', map { "--recipient '$_'" } @recipient);
+my $encrypt_command = qq/gpg --no-permission-warning --no-random-seed-file --batch --yes --quiet --no-tty $recipient_args -z $compress_level --encrypt --output $output_file $fname/;
+
+#print $encrypt_command . "\n";
+
+# perform encryption
+
+my $ret = system($encrypt_command);
+$ret = $ret >> 8;
+
+if ($ret != 0) {
+
+	# get rid of encrypted output file since it's no good
+
+	if (-f $fname) {	# just to be safe :-)
+		unlink($output_file);
+	}
+
+	die "ERROR: $PGM: Problem encrypting input file '$fname' to output file '$output_file'\n";
+}
+
+
+if ($verify) {
+	# get checksum of encrypted file (after decrypting and uncompressing via read_file) so we can compare to earlier input checksum
+
+	open(NEW, "read_file $output_file |") || die "ERROR: $PGM: Cannot read contents of $output_file to get checksum\n";
+	my $new_crc = crc32(*NEW);
+	close(NEW);
+
+	if ($? != 0) {
+		die "ERROR: $PGM: could not read '$output_file' via read_file\n";
+	}
+
+	if ((! defined($new_crc)) or (! (length($new_crc) >= 1)) ) {
+		die "ERROR: $PGM: Unable to get valid checksum for output file $output_file\n";
+	}
+
+	# verify that contents of input is equivalent to output via checksum values
+
+	if ($original_crc ne $new_crc) {
+		die "ERROR: $PGM: Validation of input file $fname with output file $output_file failed!\n";
+	}
+}
+
+# set mod times and perms of outfile to same as inputfile
+
+$ret = system(qq/touch -r $fname $output_file/);
+$ret = $ret >> 8;
+
+if ($ret != 0) {
+	print STDERR "Warning: $PGM: Unable to reset permissions and modification times of output file $output_file\n";
+}
+
+
+# use gpg program to verify output file is really a valid encrypted file
+
+$ret = system(qq/gpg --no-permission-warning --quiet --no-tty --verify-files $output_file/);
+$ret = $ret >> 8;
+
+if ($ret != 0) {
+
+	# get rid of encrypted output file since it's no good
+
+	if (-f $fname) {	# just to be safe :-)
+		unlink($output_file);
+	}
+
+	die "ERROR: $PGM: Ouput file '$output_file' is not a valid encrypted file\n";
+}
+
+
+
+# Encryption worked. File comparison checked out OK. GPG integrity verification passed.
+# So now we can safely remove the original input file and exit with a successful status
+# (unless SOMEHOW input and output files do not still exist, which would be really weird).
+
+if (-f $fname) {
+	if (-f $output_file) {
+		if (! $keep_original) {
+			if (! unlink($fname)) {
+				die "ERROR: $PGM: Unable to delete the input file $fname after encrypting to $output_file\n";
+			}
+		}
+	} else {
+		die "ERROR: $PGM: Output file $output_file mysteriously disappeared after encrypting from $fname\n";
+	}
+} else {
+	die "ERROR: $PGM: Input file $fname mysteriously disappeared after encrypting to $output_file\n";
+}
+
+if (defined($success_message)) {
+	print STDERR $success_message . "\n";
+}
+
+exit($exit_success);
+

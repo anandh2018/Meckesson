@@ -1,0 +1,248 @@
+#!/usr/bin/perl
+
+use Getopt::Std;
+
+our $DS_BASE_DIR = $ENV{DS_BASE_DIR};
+die "ERROR: DS_BASE_DIR environment variable is '$DS_BASE_DIR', which is not an existing directory\n" if (! ((defined($DS_BASE_DIR)) && (-d $DS_BASE_DIR)));
+
+$bftp_config_file = "$DS_BASE_DIR/common/etc/config_prod_send.bftp";
+
+if ($#ARGV < 0) {
+	print "Usage: $0 -c prod_send_configfile -i id [-p] [-b bftp_configfile]\n";
+	exit(0);
+}
+
+getopts('c:i:b:p');
+
+if (defined($opt_p)) {
+	$passive_option = '-p';
+} else {
+	$passive_option = '';
+}
+
+if (defined($opt_c)) {
+	$ps_config_file = $opt_c;
+} else {
+	die "ERROR: Must specify -c prod_send_configfile option\n";
+}
+
+if (! -f $ps_config_file) {
+	die "ERROR: prod_send_configfile $ps_config_file does not exist\n";
+}
+
+if (defined($opt_b)) {
+	$bftp_config_file = $opt_b;
+}
+
+if (! -f $bftp_config_file) {
+	die "ERROR: bftp_configfile $bftp_config_file does not exist\n";
+}
+
+if (defined($opt_i)) {
+	$id = $opt_i;
+} else {
+	die "ERROR: Must specify -i id option\n";
+}
+
+if (length($id) <= 0) {
+	die "ERROR: Must specify non-empty -i id option\n";
+}
+
+sub read_ps_config() {
+  my($ps_config_file) = shift;
+
+	open(PS_CONFIG, $ps_config_file) || die "ERROR: Could not open prod_send_configfile $ps_config_file : $!\n";
+
+	while (<PS_CONFIG>) {
+		chop;
+
+		# skip blank lines and comment lines
+		next if /^\s*$/;
+		next if /^\s*#/;
+
+		$original_line = $_;
+
+		($line_id, $host, $username, $password, $dir, $line_newest_file_sent, $line_file_mtime) = split(',', $original_line);
+
+		if (length($line_id) == 0) {
+			print STDERR "Warning: First field of prod_send_configfile $ps_config_file is blank: $original_line\n";
+		} else {
+
+			if ($dir eq '') {
+				$dir = '.';
+			}
+
+			if (($line_file_mtime =~ /^\s*$/) and (-f $line_newest_file_sent)) {
+				($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$file_size,$atime,$line_file_mtime,$ctime,$blksize,$blocks) = stat($line_newest_file_sent);
+			}
+
+			$PS_CONFIG{$line_id}{'HOST'} = $host;
+			$PS_CONFIG{$line_id}{'USERNAME'} = $username;
+			$PS_CONFIG{$line_id}{'PASSWORD'} = $password;
+			$PS_CONFIG{$line_id}{'DIR'} = $dir;
+			$PS_CONFIG{$line_id}{'NEWEST_FILE_NAME'} = $line_newest_file_sent;
+			$PS_CONFIG{$line_id}{'NEWEST_FILE_MTIME'} = $line_file_mtime;
+		}
+	}
+
+	close(PS_CONFIG);
+}
+
+&read_ps_config($ps_config_file);
+
+if (! (exists($PS_CONFIG{$id}))) {
+	die "Unable to find id of $id in prod_send_configfile $ps_config_file\n";
+}
+
+$previous_newest_file_mtime = $PS_CONFIG{$id}{NEWEST_FILE_MTIME};
+$previous_newest_file_name = $PS_CONFIG{$id}{NEWEST_FILE_NAME};
+
+if ($previous_newest_file_mtime eq '') {
+	$previous_newest_file_mtime = 0;
+}
+
+$current_newest_file_mtime = $previous_newest_file_mtime;
+
+if ($DEBUG) {
+	print STDERR "Previous newest file name = $previous_newest_file_name\n";
+}
+
+while (<STDIN>) {
+	chop;
+
+	next if /^\s*$/;
+
+	$send_fname = $_;
+
+	$send_fname_dir = $send_fname;
+
+	if ($send_fname_dir =~ /\//) {
+		$send_fname_dir =~ s!/[^/]+$!!;
+	} else {
+		$send_fname_dir = $ENV{PWD};
+	}
+
+	$send_fname_basename = $send_fname;
+	$send_fname_basename =~ s!^.*/([^/]+)$!$1!;
+
+	if ($send_fname_basename eq '') {
+		$send_fname_basename = $send_fname;
+	}
+
+	$reconstructed_fname = $send_fname_dir . '/' . $send_fname_basename;
+
+	if (! -f $reconstructed_fname) {
+		print STDERR "ERROR: Reconstructed full pathname of file $reconstructed_fname does not exist!\n";
+		$failed_files++;
+		next;
+	}
+
+	($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$file_size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($reconstructed_fname);
+
+	if ($mtime > $previous_newest_file_mtime) {
+		$temp_file_list{$mtime}{$reconstructed_fname} = 1;
+	}
+}
+
+
+# populate file send list in order of mtime (oldest to newest)
+$i = 0;
+
+foreach $mtime (sort { $a <=> $b } keys %temp_file_list) {
+	foreach $fname (keys %{$temp_file_list{$mtime}}) {
+		$files_to_send[$i]{'NAME'} = $fname;
+		$files_to_send[$i]{'MTIME'} = $mtime;
+		$i++;
+	}
+}
+
+$ps_config_file_temp = $ps_config_file . '.temp';
+
+for($i = 0; $i <= $#files_to_send; $i++) {
+	$send_fname = $files_to_send[$i]{'NAME'};
+	$mtime = $files_to_send[$i]{'MTIME'};
+
+
+	$send_fname_dir = $send_fname;
+
+	if ($send_fname_dir =~ /\//) {
+		$send_fname_dir =~ s!/[^/]+$!!;
+	} else {
+		$send_fname_dir = $ENV{PWD};
+	}
+
+	$send_fname_basename = $send_fname;
+	$send_fname_basename =~ s!^.*/([^/]+)$!$1!;
+
+	if ($send_fname_basename eq '') {
+		$send_fname_basename = $send_fname;
+	}
+
+	print STDERR "Attempting to send file $send_fname\n";
+
+	$ENV{PROD_SEND_PASS} = $PS_CONFIG{$id}{PASSWORD};
+
+	print STDERR "debug: bftp.pl -f $bftp_config_file $passive_option -v FILE=$send_fname_basename,HOST=$PS_CONFIG{$id}{HOST},SOURCE_DIR=$send_fname_dir,USER=$PS_CONFIG{$id}{USERNAME},DEST_DIR=$PS_CONFIG{$id}{DIR},ID=$id\n";
+
+	$ret = system("bftp.pl -f $bftp_config_file $passive_option -v FILE=$send_fname_basename,HOST=$PS_CONFIG{$id}{HOST},SOURCE_DIR=$send_fname_dir,USER=$PS_CONFIG{$id}{USERNAME},DEST_DIR=$PS_CONFIG{$id}{DIR},ID=$id");
+
+	#$ret = system('bftp.pl', '-f', $bftp_config_file, '-v', "FILE=$send_fname_basename,HOST=$PS_CONFIG{$id}{HOST},SOURCE_DIR=$send_fname_dir,USER=$PS_CONFIG{$id}{USERNAME},DEST_DIR=$PS_CONFIG{$id}{DIR},ID=$id");
+
+	$ret = $ret >> 8;
+
+	if ($ret != 0) {
+		print STDERR "ERROR: Could not send file $send_fname\n";
+		$failed_files++;
+		next;
+	}
+
+	push(@sent_files, $send_fname);
+
+	$PS_CONFIG{$id}{'NEWEST_FILE_NAME'} = $send_fname;
+	$PS_CONFIG{$id}{'NEWEST_FILE_MTIME'} = $mtime;
+
+	open(PS_CONFIG_TEMP, "> $ps_config_file_temp") || die "ERROR: Unable to create temp copy of prodsend_config file $ps_config_file as $ps_config_file_temp : $!\n";
+
+	foreach $config_id (sort keys %PS_CONFIG) {
+		print(	PS_CONFIG_TEMP join(',',
+			$config_id,
+			$PS_CONFIG{$config_id}{'HOST'},
+			$PS_CONFIG{$config_id}{'USERNAME'},
+			$PS_CONFIG{$config_id}{'PASSWORD'},
+			$PS_CONFIG{$config_id}{'DIR'},
+			$PS_CONFIG{$config_id}{'NEWEST_FILE_NAME'},
+			$PS_CONFIG{$config_id}{'NEWEST_FILE_MTIME'}
+		) . "\n") || die "ERROR: Unable to create temp copy of prodsend_config file $ps_config_file : $!\n";
+
+	}
+
+	close(PS_CONFIG_TEMP);
+
+	$ret = system('mv', $ps_config_file_temp, $ps_config_file);
+	$ret = $ret >> 8;
+
+	if ($ret != 0) {
+		die "ERROR: Unable to rename temp copy of $ps_config_file_temp to $ps_config_file\n";
+	}
+
+	$files_sent++;
+}
+
+
+if ($files_sent > 0) {
+	print STDERR "Files sent: $files_sent $id to $PS_CONFIG{$id}{HOST}:\n";
+	print STDERR join("\n", @sent_files) . "\n";
+}
+
+if ($failed_files > 0) {
+	print STDERR "$failed_files $id files failed to transfer to $PS_CONFIG{$id}{HOST}\n";
+	exit(10);
+} else {
+	if ($PS_CONFIG{$id}{'NEWEST_FILE_MTIME'} == $previous_newest_file_mtime) {
+		print STDERR "No new $id files to send\n";
+		exit(0);
+	}
+
+	exit(0);
+}
+

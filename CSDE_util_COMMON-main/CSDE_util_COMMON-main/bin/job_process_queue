@@ -1,0 +1,417 @@
+#!/usr/bin/perl
+
+# Program: job_process_queue
+# Purpose: Scan for and process incomplete Job pkg requests in job_queue table
+#
+# Note: As of October, 2014, this is initially intended to handle ad-hoc history extract
+# requests based on existing established daily automated data feeds in the job_config table.
+# The request entries in job_queue are placed there by a separate process which watches for,
+# validates, and sets up on-demand requests initiated via incoming request files.
+#
+# This process will be scheduled to run via cron automatically every 5 minutes. Parallelism will be handled
+# and limited via job_run/job_launcher by way of all requests being in the same group_id and the
+# min_processes configuration for that group in the job_param_default_set table.
+
+# 1) Search job_queue table for the highest priority requests that have not yet finished or started processing,
+#    and have not yet hit the max # of job_run attempts.
+# 2) If none found, do nothing and quietly exit.
+# 3) Set request status to PROCESSING and attempt to process via job_run
+# 4) If successful (exit 0), change status to WAITING_QA, send notification email, then exit.
+# 5) If exited w/99, skip request and try next request (i.e. go back to step 3).
+# 6) Set request status to PROCESSING_ERROR, increment job_attempts, send notification email, then exit.
+
+# Note: "Highest priority" will initially mean just first come, first serve. However, future versions
+# will likely have a more sophisticated definition (e.g. specific priority # could be provided in each
+# request).
+#
+# 7/10/2015 - Remove '-keep-worker-files' from job_run call
+#
+# 5/12/2020 - Disable checking of Max Records during concatenation by adding -no-max-records-check option to job_run command line.
+
+use Params::Validate qw(:all);
+use Data::Dumper;
+use BLUELITE::Job;
+use Getopt::Long;
+use File::Spec;
+use File::PathConvert qw(rel2abs);
+
+use warnings;
+use strict;
+
+our ($LOG_FH, $LOGFILE);
+my @dir_parts = File::Spec->splitdir(rel2abs($0));
+our $PGM = pop(@dir_parts);
+
+#my $job_run_cmd = 'perl -I /ds/development/Job/dev/blib/lib /ds/development/Job/dev/job_run';
+#my $df_report_cmd = 'perl -I /ds/development/DataFeed/Analyzer_v2.2/blib/lib -S df_report';
+
+my $job_run_cmd = 'job_run';
+my $df_report_cmd = 'df_report';
+
+sub update_queue($$) {
+  my ($app_obj, $updates) = @_;
+
+	my $app_id = $app_obj->app_id;
+	my $update_result = $app_obj->update_job_config( assignments => $updates);
+
+	if ($update_result->{error}) {
+		mylog("Could not update job_queue for $app_id : " . $update_result->{error} . "\n\nThe updates were: " . Dumper $updates);
+	} else {
+		$app_obj->commit;
+	}
+}
+
+
+sub mylog($) {
+  my $msg = shift;
+
+	$msg =~ s/\n$//;
+	$msg .= "\n";
+
+	if (-t 0) {
+		print $msg;
+	}
+
+	if (defined($LOG_FH)) {
+		print $LOG_FH $msg;
+	}
+}
+
+
+sub extract_step($$) {
+	my ($rq, $app_obj) = @_;
+
+	my $job_reset = 0;
+
+	if (defined($rq->{RQ_RESET}) && ($rq->{RQ_RESET} =~ /^\s*Y\s*/i)) {
+		$job_reset = 1;
+	}
+
+	# do not attempt if it has no post date range
+
+	my $post_date = $rq->{RQ_POST_DATE};
+
+	if ((! defined($post_date)) || ($post_date =~ /^\s*$/)) {
+		return 0; # do not attempt
+	}
+
+	# attempt to process the request
+
+	my $app_id = $rq->{RQ_SOURCE_APP_ID};
+	my $request_id = $rq->{RQ_REQUEST_ID};
+	my $job_attempts = $rq->{RQ_JOB_ATTEMPTS};
+	my $max_attempts = $rq->{RQ_MAX_JOB_ATTEMPTS};
+
+	if (! defined($job_attempts)) {
+		$job_attempts = 0;
+	}
+
+	if (! defined($max_attempts)) {
+		$max_attempts = 1;
+	}
+
+	# do not attempt if request id or app id is missing
+	return 0 if ((! defined($request_id)) || ! defined($app_id));
+
+	my $current_attempt_num = $job_attempts + 1;
+
+	update_queue($app_obj, {
+			rq_step => 'EXTRACT',
+			rq_status => 'PROCESSING',
+			rq_process_begin_date => 'sysdate',
+			rq_step_begin_date => 'sysdate',
+			rq_process_end_date => '',
+			rq_step_end_date => '',
+			rq_status_detail => "Extracting data (attempt $current_attempt_num)",
+			rq_job_attempts => $current_attempt_num
+	});
+
+	my $job_run = "$job_run_cmd -app-id $app_id -request-id $request_id -post-date $post_date -screen-only -no-max-records-check";
+	my $dfa_dir = $app_obj->dfa_dir;
+
+	if ($job_reset || ($job_attempts == 0)) {
+		$job_run .= ' -rerun';
+		empty_dfa_dir($app_obj);
+		remove_deliverable_files($app_obj);
+	}
+
+	if ($LOGFILE) {
+		$job_run .= " >> $LOGFILE 2>&1";
+	}
+
+	mylog "Processing attempt # $current_attempt_num for $app_id\n";
+	mylog "$job_run\n";
+
+	my $ret = system($job_run);
+	$ret = $ret >> 8;
+
+	if ($ret == 99) {
+		update_queue($app_obj, { rq_status => 'QUEUE', rq_process_begin_date => '', rq_step_begin_date => '', rq_status_detail => 'Wating to extract data', rq_job_attempts => $job_attempts});
+		return 0; # did not attempt
+	}
+
+# make conditional reset/resume based on 99 return status
+
+	my $updates = {
+		RQ_STEP_END_DATE => 'sysdate',
+		RQ_RESET => 'N',
+		RQ_RESUME => 'N'
+	};
+
+	if ($ret == 0) {
+		$updates->{RQ_STATUS} = 'COMPLETE';
+		$updates->{RQ_STATUS_DETAIL} = 'All data extracted.';
+	} else {
+		$updates->{RQ_STATUS} = 'ERROR';
+		my $attempts_remaining = $max_attempts - $current_attempt_num;
+
+		if ($attempts_remaining < 0) {
+			$attempts_remaining = 0;
+		}
+
+		my $detail = "job_run command failed. $attempts_remaining attempts remaining.";
+
+		if ($LOGFILE) {
+			$detail .= " See logfile for details: $LOGFILE";
+		}
+
+		$updates->{RQ_STATUS_DETAIL} = $detail;
+	}
+
+	update_queue($app_obj, $updates);
+
+	return 1;
+}
+
+
+sub dfa_log_fname($) {
+  my $app_obj = shift;
+	my $dfa_log_fname;
+
+	my $dfa_output_fname = dfa_output_fname($app_obj);
+
+	if (defined($dfa_output_fname)) {
+		$dfa_log_fname = $dfa_output_fname;
+		$dfa_log_fname =~ s/\.[^.]+$//;
+		$dfa_log_fname .= '.log';
+	}
+
+	return $dfa_log_fname;
+}
+
+sub dfa_output_fname($) {
+  my $app_obj = shift;
+	my $dfa_dir = $app_obj->dfa_dir;
+	my $app_id = $app_obj->app_id;
+
+	if (defined($dfa_dir)) {
+		return "$dfa_dir/${app_id}.dfa.txt";
+	}
+
+	return undef;
+}
+
+sub empty_dfa_dir($) {
+  my $app_obj = shift;
+
+	my $dfa_dir = $app_obj->dfa_dir;
+
+	if (defined($dfa_dir) && ($app_obj->qaqc() eq 'Y')) {
+		unlink(glob("$dfa_dir/*.dmp.gz"), dfa_output_fname($app_obj));
+	}
+}
+
+sub remove_deliverable_files($) {
+  my $app_obj = shift;
+	my $app_id = $app_obj->app_id;
+
+	my $files = $app_obj->dbh->selectcol_arrayref("select delivery_output_file from job_delivery where app_id = '$app_id'");
+
+	my @files_removed = grep { unlink($_) } @{$files};
+
+	if (@files_removed) {
+		mylog("Removed the following existing files: " . join(', ', @files_removed));
+	}
+}
+
+
+sub dfa_step($$) {
+	my ($rq, $app_obj) = @_;
+
+	my $current_status = $rq->{RQ_STATUS};
+	my $resume = $rq->{RQ_RESUME};
+
+	if ($current_status ne 'QUEUE') {
+		return 0;
+	}
+
+	my $detail = 'Running DataFeed Analyzer';
+	mylog $detail;
+
+	update_queue($app_obj, { rq_step => 'DFA', rq_step_begin_date => 'sysdate', rq_step_end_date => '', rq_status => 'PROCESSING', rq_status_detail => $detail});
+
+	my $app_id = $app_obj->app_id;
+	my $dfa_dir = $app_obj->dfa_dir;
+	my $dfa_output_fname = dfa_output_fname($app_obj);
+	my $report_opts = "";
+
+	if (! opendir(DIR, $dfa_dir)) {
+		my $message = "ERROR: Cannot open DFA dir $dfa_dir : $!";
+		update_queue($app_obj, { rq_step_end_date => 'sysdate', rq_status => 'ERROR', rq_status_detail => $message});
+		mylog($message);
+		return 0;
+	}
+
+	my ($job_id, $current_job_id);
+
+# change all DIEs to STDERR/return
+
+	while (my $fname = readdir(DIR)) {
+		if ($fname =~ /^([A-Z0-9_\-]+)_[0-9]{8,8}.*\.dmp\.gz$/) {
+			$job_id = $1;
+
+			if (defined($current_job_id) && ($job_id ne $current_job_id)) {
+				my $message = "ERROR: Found more than one DFA job id in the $dfa_dir directory: $job_id, $current_job_id !";
+				update_queue($app_obj, { rq_step_end_date => 'sysdate', rq_status => 'ERROR', rq_status_detail => $message});
+				mylog($message);
+				return 0;
+			}
+
+			$current_job_id = $job_id;
+		}
+	}
+
+	if (! closedir(DIR)) { 
+		my $message = "ERROR: Cannot close DFA dir $dfa_dir : $!";
+		update_queue($app_obj, { rq_step_end_date => 'sysdate', rq_status => 'ERROR', rq_status_detail => $message});
+		mylog($message);
+		return 0;
+	}
+
+	if (! defined($job_id)) {
+		my $message = "ERROR: Could not find any DFA files in the $dfa_dir directory!";
+		update_queue($app_obj, { rq_step_end_date => 'sysdate', rq_status => 'ERROR', rq_status_detail => $message});
+		mylog($message);
+		return 0;
+	}
+
+	unlink($dfa_output_fname);
+	unlink($LOGFILE) if ($LOGFILE);
+
+	my $dfa_cmd = "$df_report_cmd -job_id $job_id -report_id CON -input_dir $dfa_dir > $dfa_output_fname";
+	$dfa_cmd .= " 2>> $LOGFILE" if ($LOGFILE);
+
+	my $ret = system($dfa_cmd);
+	$ret = $ret >> 8;
+
+	if (($ret != 0) || ! -s $dfa_output_fname) {
+		my $message = "ERROR: DataFeed Analyzer failed: $dfa_cmd\n";
+		$message .= " . See log file for details: $LOGFILE" if ($LOGFILE);
+		update_queue($app_obj, { rq_step_end_date => 'sysdate', rq_status => 'ERROR', rq_status_detail => $message});
+		mylog($message);
+		return 1;
+	}
+
+	unlink(glob("$dfa_dir/*.dmp.gz"));
+
+	update_queue($app_obj, {
+		rq_step_end_date => 'sysdate',
+		rq_process_end_date => 'sysdate',
+		rq_status => 'COMPLETE',
+		rq_status_detail => 'Extract and DataFeed Analyzer complete'
+	});
+
+	return 1;
+}
+
+sub Usage() {
+	print "$PGM: find a queued job in job_queue table and process it\n";
+	print "\n";
+  print "Usage: $PGM -group-id g [-group-id g ...] [-lookback-days #]\n";
+}
+
+
+####### Main ######
+
+my @group_id = ();
+my $lookback_days = 21;
+
+GetOptions('lookback-days=i' => \$lookback_days, 'group-id=s@' => \@group_id) || exit(1);
+
+if (@ARGV) {
+  print STDERR "$PGM: Extraneous command-line arguments!\n";
+  Usage;
+  exit(1);
+}
+
+if (! @group_id) {
+  Usage;
+  exit(0);
+}
+
+
+my $logging_to_file = ! -t 0;
+
+# look for all recent requests that may need to be processed/resumed
+my $requests = BLUELITE::Job->get_requests(
+		add_where              => "rq_status = 'QUEUE' and rq_process_end_date IS NULL",
+		submission_search_days => $lookback_days,
+    group_id               => \@group_id,
+		order_by               => 'rq_submitted_date'
+);
+
+my $step_attempted = 0;
+
+foreach my $rq (@{$requests}) {
+
+	my $app_id = $rq->{RQ_SOURCE_APP_ID};
+	my $request_id = $rq->{RQ_REQUEST_ID};
+	my $step = $rq->{RQ_STEP};
+	my $post_date = $rq->{RQ_POST_DATE};
+	my @job_opts = ();
+
+	if ($logging_to_file) {
+		$LOGFILE = "${step}.${app_id}.${post_date}.$$.log";
+		push(@job_opts, logfile => $LOGFILE);
+	}
+
+	my $app_obj;
+	eval { $app_obj = BLUELITE::Job->new(app_id => $app_id, request_id => $request_id, force_log_init => 1, @job_opts) };
+
+	if (! defined($app_obj)) {
+		mylog("Could not obtain a BLUELITE::Job object for app_id '$app_id' $@ !\n");
+		next;
+	}
+
+	if ($logging_to_file) {
+		my $base_logfile = $LOGFILE;
+		$LOGFILE = $app_obj->logfile;
+
+		if ( ! open($LOG_FH, ">> $LOGFILE")) {
+			mylog("Could not open logfile $LOGFILE for append mode, app_id = $app_id, request_id = $request_id, base logfile = $base_logfile, step = $step : $!\n");
+			next;
+		}
+	}
+
+	if ($step eq 'EXTRACT') {
+		$step_attempted = extract_step($rq, $app_obj);
+	} elsif ($step eq 'DFA') {
+		$step_attempted = dfa_step($rq, $app_obj);
+	}
+
+	if ($LOG_FH) {
+		if (! close($LOG_FH)) {
+			print STDERR "Could not close logfile $LOGFILE : $!\n";
+		}
+	}
+
+	if ($step_attempted) {
+		# Attempt no more than 1 step, then exit (do not change)
+		last;
+	}
+
+	if ($LOG_FH) {
+		unlink($LOGFILE);
+	}
+}
+

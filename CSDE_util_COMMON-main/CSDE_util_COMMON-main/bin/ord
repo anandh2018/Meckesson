@@ -1,0 +1,15 @@
+#!/usr/bin/perl
+
+while (read(STDIN, $char, 1)) {
+
+	push(@ord_chars, ord($char));
+	push(@chars, $char);
+
+	if ($char eq "\n") {
+		print join('', @chars);
+		print join(' ', @ord_chars) . "\n";
+		@chars = ();
+		@ord_chars = ();
+	}
+}
+

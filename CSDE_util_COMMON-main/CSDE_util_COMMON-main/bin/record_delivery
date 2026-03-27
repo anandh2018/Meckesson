@@ -1,0 +1,420 @@
+#!/usr/bin/perl
+
+use DS::Billing;
+use Getopt::Long;
+use DS::DSLOG;
+
+use Data::Dumper;
+
+use strict;
+use warnings;
+
+our $VERSION = '1.0';
+our $VERSION_DATE = '5/13/2010';
+our $VERSION_COPYRIGHT = 'RelayHealth';
+
+# Version history
+# 1.0 5/20/2010 - Initial release (not yet production)
+#
+# 1.2 6/8/2010 - Added error display ($@) for when recording of billing details fails, so we can see why it failed.
+#
+# 1.3 7/12/2010 - If pharmacy is blank, pgm will no longer die, but will print to STDERR. This is so job_delivery_update can still
+# run.
+# 1.61 9/14/2016 - An empty file will no longer generate an error
+
+our $PGM = $0;
+$PGM =~ s/.*\///g;
+
+our $DEFAULT_ENV = 'DEV';
+my $env = $DEFAULT_ENV;
+
+our $DSLOG;
+
+our $WARN_FLAG;
+
+sub mywarn(;$) {
+  my $msg = $_[0];
+	chomp($msg);
+  $DSLOG->log(message => $msg, event_code => 'WARNING', log_level => 'FATAL') if (defined($DSLOG));
+  print STDERR $msg . "\n";
+
+  $WARN_FLAG = 1;
+}
+
+sub mydie(;$) {
+  my $msg = $_[0];
+  $DSLOG->log(message => $msg, event_code => 'FAILED', log_level => 'FATAL') if (defined($DSLOG));
+
+  die "ERROR: " . $_[0] . "\n";
+}
+
+sub Usage() {
+
+	print "Usage 1: $PGM -app-id id -add-billing [billing options] [other options] filename\n";
+	print "Usage 2: $PGM -app-id id -update-job-delivery [-delivery-host hostname] [other options] filename\n";
+	print "Usage 3: $PGM -app-id id -add-billing [billing options] -update-job-delivery [-delivery-host hostname] [other options] filename\n\n";
+
+	print "billing options:\n";
+	print "-count-by-delim-field #[,#] -count-by-delim-character c [-has-header-rec] [-has-trailer-rec]\n";
+	print "-count-by-fixed-begin-pos # -count-by-fixed-end-pos # [-has-header-rec] [-has-trailer-rec]\n";
+	print "-count-by-fixed-pos #b-#e[,#b-#e] [-has-header-rec] [-has-trailer-rec]\n";
+	print "-count-total-records [-has-header-rec] [-has-trailer-rec]\n";
+	print "-no-count\n";
+	print "-delivery-date YYYYMMDD {defaults to today's date}\n\n";
+
+	print "other options:\n";
+	print "-log-dir d\n";
+	print "-env DEV|PROD {defaults to DEV}\n";
+}
+
+sub count_by_delim($$$$$) {
+	my ($fname, $count_by_delim_field, $count_by_delim_chr, $has_header_rec, $has_trailer_rec) = @_;
+
+	mydie "$PGM: ERROR: No -count-by-delim-character parameter was not specified!\n" if (! defined($count_by_delim_chr));
+	mydie "$PGM: ERROR: No -count-by-delim-field parameter was not specified!\n" if (! defined($count_by_delim_field));
+
+	#mydie "$PGM: ERROR: No -count-by-delim-field parameter of '$count_by_delim_field' is invalid! Must be positive integer!\n" if ($count_by_delim_field !~ /^\s*\d+\s*$/);
+	#mydie "$PGM: ERROR: No -count-by-delim-field parameter of '$count_by_delim_field' is invalid! Must be positive integer!\n" if (! ($count_by_delim_field >= 1));
+
+	my (@field_nums, $line, $counts, @field_vals, $count_by_key, @data);
+
+	@field_nums = split(/,/, $count_by_delim_field);
+
+	foreach my $field (@field_nums) {
+		mydie "$PGM: ERROR: Invalid -count-by-delim-field parameter of '$count_by_delim_field'! '$field' is NOT a positive integer!\n"
+			if ($field !~ /^\s*\d+\s*$/) || ! ($field >= 1);
+	}
+
+	$line = 0;
+
+	$counts = {};
+
+	open(FH, "read_file $fname |") || mydie "$PGM: ERROR: Could not open file $fname for reading!\n";
+
+	while (<FH>) {
+		next if (! defined($counts)); # suck up rest of file if problem was encountered, to avoid "broken pipe" error
+
+		s/\r?\n$//; #chomp
+
+		$line++;
+
+		# ignore header/trailer records
+		next if ($has_header_rec && ($line == 1));
+		next if ($has_trailer_rec && eof(FH));
+
+		@data = split(/[$count_by_delim_chr]/, $_);
+		@field_vals = ();
+
+		foreach my $field (@field_nums) {
+			if (! exists $data[$field - 1]) {
+				mydie "$PGM: ERROR: Could not obtain count_by key from line $line in $fname because there are only " . scalar(@data) . " fields and field $field is configured to contain the count_by key!\n";
+			}
+
+			if ($data[$field -1] =~ /^\s*$/) {
+				mywarn "$PGM: ERROR: Line $line in $fname contains an empty value in field $field !\n";
+				@field_vals = (); # empty all field values collected so far
+				$counts = undef; # skip rest of the file
+				last;
+			}
+
+			push @field_vals, $data[$field - 1];
+		}
+
+		next if ! scalar(@field_vals); # skip over this count_by_key
+
+		$count_by_key = join('|', map { s/^\s+//; s/\s+$//; s/\|/ /g; $_ } @field_vals);
+
+		$counts->{$count_by_key}++;
+	}
+
+	close(FH) || mydie "$PGM: ERROR: Could not close input file $fname : $!\n";
+
+	return $counts;
+}
+
+sub count_by_fixed_pos($$$$) {
+  my ($fname, $count_by_fixed_pos, $has_header_rec, $has_trailer_rec) = @_;
+
+	my (@field_pos, $line, $counts, @field_vals, $count_by_key);
+
+	@field_pos = split(/,/, $count_by_fixed_pos);
+
+	foreach my $field_pos (@field_pos) {
+		my ($begin_pos, $end_pos) = ($field_pos =~ /^\s*(\d+)\s*\-\s*(\d+)\s*$/);
+		mydie "$PGM: ERROR: -count-by-fixed-begin-pos parameter was not specified!\n" if (! defined($begin_pos));
+		mydie "$PGM: ERROR: -count-by-fixed-begin-pos parameter of '$begin_pos' is invalid! Must be a positive integer!\n"
+			if ($begin_pos !~ /^\s*\d+\s*$/) || ! ($begin_pos >= 1);
+		mydie "$PGM: ERROR: -count-by-fixed-end-pos parameter was not specified!\n" if (! defined($end_pos));
+		mydie "$PGM: ERROR: -count-by-fixed-end-pos parameter of '$end_pos' is invalid! Must be a positive integer!\n"
+			if ($end_pos !~ /^\s*\d+\s*$/) || (! ($end_pos >= 1));
+		mydie "$PGM: ERROR: -end-pos parameter of '$end_pos' is less than -begin-pos of '$begin_pos', which is invalid!\n"
+			if ($end_pos < $begin_pos);
+	}
+
+	$line = 0;
+
+	$counts = {};
+
+	open(FH, "read_file $fname |") || mydie "$PGM: ERROR: Could not open file $fname for reading!\n";
+
+	while (<FH>) {
+		next if (! defined($counts)); # suck up rest of file if problem was encountered, to avoid "broken pipe" error
+
+		s/\r?\n$//; #chomp
+
+		$line++;
+
+		# ignore header/trailer records
+		next if ($has_header_rec && ($line == 1));
+		next if ($has_trailer_rec && eof(FH));
+
+		@field_vals = ();
+
+		foreach my $field_pos (@field_pos) {
+			my ($begin_pos, $end_pos) = ($field_pos =~ /^\s*(\d+)\s*\-\s*(\d+)\s*$/);
+
+			if (length($_) < $end_pos) {
+				mydie "$PGM: ERROR: Could not obtain count_by key from line $line in $fname because the line is only " . length($_) . " characters long, and the ending position for the count_by key is configured as $end_pos\n";
+			}
+
+			my $value = substr($_, $begin_pos - 1, $end_pos - $begin_pos + 1);
+
+			if ($value =~ /^\s*$/) {
+				mywarn "$PGM: ERROR: Line $line in $fname contains an empty value in field position $field_pos !\n";
+				@field_vals = (); # empty all field values collected so far
+				$counts = undef; # skip rest of the file
+				last;
+			}
+
+			push @field_vals, $value;
+		}
+
+		next if ! scalar(@field_vals); # skip over this count_by_key
+
+		$count_by_key = join('|', map { s/^\s+//; s/\s+$//; s/\|/ /g; $_ } @field_vals);
+
+		$counts->{$count_by_key}++;
+	}
+
+	close(FH) || mydie "$PGM: ERROR: Could not close input file $fname : $!\n";
+
+	return $counts;
+}
+
+
+sub get_total_records($$$) {
+  my ($fname, $has_header_rec, $has_trailer_rec) = @_;
+
+	open(FH, "read_file $fname |") || mydie "$PGM: ERROR: Could not open file $fname for reading!\n";
+
+	my $count = 0;
+	my $line = 0;
+
+	while (<FH>) {
+		chomp;
+		$line++;
+
+		# ignore header/trailer records
+		next if ($has_header_rec && ($line == 1));
+		next if ($has_trailer_rec && eof(FH));
+
+		# ignore blank records
+		next if ($_ =~ /^\s*$/);
+
+		$count++;
+	}
+
+	close(FH) || mydie "$PGM: ERROR: Could not close input file $fname : $!\n";
+
+	return $count;
+}
+
+
+if (! @ARGV) {
+	print "This is $PGM, v$VERSION, $VERSION_DATE, Copyright $VERSION_COPYRIGHT\n\n";
+	Usage;
+	exit(1);
+}
+
+
+my ($destination_host, $delivery_date, $log_dir, $app_id, $count_by_delim_field, $count_by_delim_chr, $count_by_fixed_begin_pos, $count_by_fixed_end_pos, $count_by_fixed_pos, $count_total_records, $no_count);
+
+my $add_billing = 0;
+my $update_job_delivery = 0;
+my $has_header_rec = 0;
+my $has_trailer_rec = 0;
+
+my $ret = GetOptions(
+	'-update-job-delivery' => \$update_job_delivery,
+	'-delivery-host=s' => \$destination_host,
+	'-delivery-date=s' => \$delivery_date,
+	'-env=s' => \$env,
+	'-add-billing' => \$add_billing,
+	'-log-dir=s' => \$log_dir,
+	'-app-id=s' => \$app_id,
+	'-count-by-delim-field=s' => \$count_by_delim_field,
+	'-count-by-delim-character=s' => \$count_by_delim_chr,
+	'-count-by-fixed-begin-pos=s' => \$count_by_fixed_begin_pos,
+	'-count-by-fixed-end-pos=s' => \$count_by_fixed_end_pos,
+	'-count-by-fixed-pos=s' => \$count_by_fixed_pos,
+	'-count-total-records' => \$count_total_records,
+	'-no-count' => \$no_count,
+	'-has-header-rec' => \$has_header_rec,
+	'-has-trailer-rec' => \$has_trailer_rec
+);
+
+mydie "$PGM: ERROR: Invalid options\n" if (! $ret);
+
+if (! @ARGV) {
+	mydie "$PGM: ERROR: Input file name not provided on command-line!\n";
+}
+
+$ENV{LOG_ENV_NAME} = $env;
+
+# Initialize DSLOG
+$DSLOG = DS::DSLOG->new(
+                       APP_ID  => 'DATAFEEDS',
+                       PROCESS =>      "BILLING_RECORD_DELIVERY",
+                       LOG_LEVEL       =>      'INFO',
+                       EVENT_CODE      =>      'BEGIN',
+                       MESSAGE => "Starting Record Delivery",);
+
+
+my $fname = $ARGV[0];
+
+mydie "$PGM: ERROR: Input file $fname does not exist!\n" if (! -f $fname);
+
+if ((! $add_billing) && (! $update_job_delivery)) {
+	mywarn "$PGM: ERROR: No action was specified on command-line!\n";
+	Usage;
+	exit(1);
+}
+
+if (! defined($log_dir)) {
+	$log_dir = '.';
+
+	if ($update_job_delivery) {
+		print STDERR "$PGM: Warning: no -log-dir option specified, defaulting to $log_dir\n";
+	}
+}
+
+if (! defined($app_id)) {
+	mydie "$PGM: ERROR: -app-id parameter is mandatory!\n";
+}
+
+my $exit_status = 0;
+
+##### COUNT TXNS BY PHARMACY AND ADD TO BILLING_DETAIL TABLE
+
+if ($add_billing) {
+	my $billing = DS::Billing->new(env => $env, log_file => 'STDOUT') || mydie "$PGM: ERROR: Cannot obtain DS::Billing object for the $env environment! Billing details for $fname could not be recorded!\n";
+
+	if (! defined($delivery_date)) {
+		$delivery_date = DateTime->now->ymd('') || mydie "$PGM: ERROR: Could not get today's date!  Billing details for $fname could not be recorded!\n";
+	}
+
+	my ($counts, $total_records);
+	my $got_counts = 0;
+
+	if (defined($count_by_delim_field)) {
+		$counts = count_by_delim($fname, $count_by_delim_field, $count_by_delim_chr, $has_header_rec, $has_trailer_rec);
+		$got_counts = 1;
+	} elsif (defined($count_by_fixed_pos)) {
+		$counts = count_by_fixed_pos($fname, $count_by_fixed_pos, $has_header_rec, $has_trailer_rec);
+		$got_counts = 1;
+	} elsif (defined($count_by_fixed_begin_pos) && defined($count_by_fixed_end_pos)) {
+		$counts = count_by_fixed_pos($fname, "$count_by_fixed_begin_pos-$count_by_fixed_end_pos", $has_header_rec, $has_trailer_rec);
+		$got_counts = 1;
+	} elsif (defined($count_total_records)) {
+		$total_records = get_total_records($fname, $has_header_rec, $has_trailer_rec);
+		mydie "ERROR: $PGM: Could not determine total # of records in file $fname !\n" if (! defined($total_records));
+	} elsif (! defined($no_count)) {
+		mydie "ERROR: Must specify one of the following options when -add-billing is used: -count-by-delim-field, -count-by-fixed-begin-pos, -count-total-records, -no-count\n";
+	}
+
+	my $status = $billing->remove_billing_details(app_id => $app_id, file_name => $fname);
+
+	if ($status) {
+		if ($got_counts) {
+			if (defined $counts) {
+				foreach my $count_by_key (keys %{$counts}) {
+					$status = 0;
+
+					eval { $status = $billing->add_billing_details(app_id => $app_id, delivery_date => $delivery_date, file_name => $fname, count_by => $count_by_key, total_records => $counts->{$count_by_key}) };
+
+					if (! $status) {
+						mywarn "$PGM: ERROR: Could not record billing details to database for file $fname, count_by key '$count_by_key' ! Billing details for this file could not be recorded!\n$@";
+						last;
+					}
+				}
+			}
+		} else {
+			$status = 0;
+			my @add_billing_opts = ();
+			push(@add_billing_opts, total_records => $total_records) if (defined($total_records));
+
+			eval { $status = $billing->add_billing_details(app_id => $app_id, delivery_date => $delivery_date, file_name => $fname, @add_billing_opts) };
+
+			if (! $status) {
+				mywarn "$PGM: ERROR: Could not record billing details to database for file $fname ! Billing details for this file could not be recorded!\n$@";
+			}
+
+		}
+	}
+
+	my $action;
+
+	if ($status) {
+		$action = 'commit';
+		eval { $billing->commit };
+	} else {
+		$exit_status = $exit_status || 4;
+		mywarn "$PGM: Rolling back all billing details from database for file $fname";
+
+		$action = 'rollback';
+		eval { $billing->rollback };
+	}
+
+	if ($@) {
+		$exit_status = $exit_status || 2;
+		mywarn "$PGM: Could not perform $action for billing details from file $fname : $@\n";
+	} elsif ($action eq 'commit') {
+		print "$PGM: Successfully added billing details for $app_id delivery date $delivery_date from delivery file $fname\n";
+	}
+} elsif (defined($count_by_delim_field) || defined($count_by_fixed_begin_pos) || defined($count_total_records) || defined($no_count) || defined($count_by_delim_chr) || defined($has_header_rec) || defined($has_trailer_rec) || defined($count_by_fixed_end_pos)) {
+	mywarn "$PGM: ERROR: cannot use billing options without specifying -add-billing option!\n";
+	Usage;
+	exit(1);
+}
+
+##### UPDATE JOB_DELIVERY TABLE FOR THIS FILE
+
+if ($update_job_delivery) {
+	my $cmd = "job_delivery_update -app-id $app_id -log-dir $log_dir";
+	$cmd .= " -destination-host $destination_host" if (defined($destination_host));
+	$cmd .= " $fname";
+	my $ret = system($cmd);
+	$ret = $ret >> 8;
+
+	if ($ret == 0) {
+		if (-t 0) {
+			print "$PGM: Successfully updated JOB delivery info for $app_id delivery file $fname\n";
+		}
+	} else {
+		mywarn "$PGM: ERROR: Could not update JOB delivery info for $app_id delivery file $fname !\n";
+	}
+
+	$exit_status = $exit_status || $ret;
+} elsif (defined($destination_host)) {
+	mywarn "$PGM: ERROR: Cannot specify -delivery-host option without specifying -update-job-delivery option!\n";
+	Usage;
+	exit(1);
+}
+
+
+if (! $WARN_FLAG) {
+  $DSLOG->log(EVENT_CODE => 'COMPLETE', LOG_LEVEL => 'INFO', MESSAGE => "Record delivery completed successfully",) if (defined($DSLOG));
+}
+
+exit($exit_status);
+

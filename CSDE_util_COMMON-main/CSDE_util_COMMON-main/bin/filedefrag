@@ -1,0 +1,280 @@
+#!/usr/bin/perl
+
+
+use Getopt::Long;
+use strict;
+use warnings;
+use File::stat;
+
+our $PGM = $0;
+$PGM =~ s|.*/||g;
+
+my $exit_success = 0;
+my $max_defrag_attempts = 1;
+my $max_fragmentation_desired_pct = 5;
+my $sleep_secs = 30;
+
+GetOptions(
+						'exit=s' => \$exit_success,
+						'max-attempts=s'	=> \$max_defrag_attempts,
+						'max-fragmentation-pct=s'	=> \$max_fragmentation_desired_pct,
+						'attempt-interval-secs=s'	=> \$sleep_secs
+) || exit(1);
+
+
+sub usage() {
+        print STDERR "$PGM: attempt to defragment files if they are fragmented\n\n";
+        print STDERR "Usage: $PGM [-options] file [file ...]\n";
+        print STDERR "  Options:\n";
+        print STDERR "  -exit #		Exit with status # on successful conversion (default $exit_success)\n";
+        print STDERR "  -max-attempts #	Make no more than # attempts to defrag the file ($max_defrag_attempts)\n";
+        print STDERR "  -max-fragmentation-pct #	Attempt to defrag to max level of # % ($max_fragmentation_desired_pct)\n";
+        print STDERR "  -attempt-interval-secs #	Wait # seconds between retry attempts ($sleep_secs)\n";
+}
+
+if (scalar(@ARGV) == 0) {
+        usage;
+        exit(1);
+}
+
+sub max($$) {
+  my ($val1, $val2) = @_;
+
+	if (! defined($val1)) {
+		return $val2;
+	}
+
+	if (! defined($val2)) {
+		return $val1;
+	}
+
+	if ($val1 > $val2) {
+		return $val1;
+	} else {
+		return $val2;
+	}
+}
+
+
+sub get_fragments($) {
+  my $file = $_[0];
+
+	if (! open(FH, "sudo filefrag $file 2>&1 |")) {
+		print STDERR "ERROR: unable to launch sudo filefrag $file : $!\n";
+		return (undef, undef);
+	}
+
+# dimension_list: 3 extents found, perfection would be 1 extent
+
+	while (my $record = <FH>) {
+		chomp $record;
+
+		if (
+				($record =~ /^${file}:\s*(\d+)\s+extents?\s+found,\s+perfection\s+would\s+be\s+(\d+)\s+extent/i) ||
+				($record =~ /^${file}:\s*(\d+)\s+extents?\s+found/i)
+			) {
+
+			close(FH);
+
+			my ($num_fragments, $perfection_fragments) = ($1, $2);
+
+			if (! defined($num_fragments)) {
+				print "ERROR: Could not determine number of fragments for '$file'\n";
+				exit(1);
+			}
+
+			if ($num_fragments !~ /^\d+$/) {
+				print "ERROR: Number of fragments for '$file' is '$num_fragments', which is not a valid integer\n";
+				exit(1);
+			}
+
+			if (! ($num_fragments >= 1)) {
+				print "ERROR: Number of fragments for '$file' is '$num_fragments', which is not valid (must be at least 1)\n";
+				exit(1);
+			}
+
+			return ($num_fragments, $perfection_fragments);
+		} else {
+			print STDERR "ERROR: could not obtain fragmentation info from 'sudo filefrag $file' command\n";
+			close(FH);
+			exit(1);
+		}
+	}
+
+	if (! close(FH)) {
+		print STDERR "ERROR: problem running sudo filefrag $file : cannot close FH : $!\n";
+	}
+
+	if ($? != 0) {
+		print STDERR "ERROR: problem running sudo filefrag $file: $!\n";
+	}
+
+	return (undef, undef);
+}
+
+
+sub defrag_file($$$) {
+  my ($source_file, $original_fragments, $original_perfection_fragments) = (shift, shift, shift);
+  my $temp_file = "${source_file}.tmp";
+
+	#`cat $source_file > /dev/null 2>&1`;
+  my $ret = system('cp', '-p', $source_file, $temp_file);
+	$ret = $ret >> 8;
+
+	if ($ret != 0) {
+		unlink($temp_file);
+		die "ERROR: Unable to copy $source_file to $temp_file\n";
+	}
+
+  my ($new_num_fragments, $perfection_fragments) = get_fragments($temp_file);
+
+	if (! defined($new_num_fragments)) {
+		unlink($temp_file);
+		die "ERROR: Could not determine number of fragments in new temp file $temp_file\n";
+	}
+
+	if ($new_num_fragments < $original_fragments) {
+
+		if (stat($temp_file)->size != stat($source_file)->size) {
+			unlink($temp_file);
+			die "ERROR: size of new temp file does not match size of source file $source_file\n";
+		}
+
+	  my $ret = system('mv', $temp_file, $source_file);
+		$ret = $ret >> 8;
+
+		if ($ret != 0) {
+
+			if (-f $source_file) {
+				unlink($temp_file);
+			}
+
+			die "ERROR: Unable to move temp file $temp_file to source file $source_file\n";
+		}
+
+		return ($new_num_fragments, $perfection_fragments);
+	} else {
+		#print STDERR "Note: number of fragments ($new_num_fragments) did not decrease from $original_fragments\n";
+		unlink($temp_file);
+		return ($original_fragments, $original_perfection_fragments);
+	}
+
+}
+
+
+sub calc_frag_pct($$) {
+  my ($extents, $size) = (shift, shift);
+
+	if ($extents == 1) {
+		return 0;
+	} else {
+  	my $blocks = int(($size + 4095) / 4096);
+		return 100 * $extents / $blocks;
+	}
+
+}
+
+
+
+if ($max_fragmentation_desired_pct < 0) {
+	die "ERROR: -max-fragmentation-pct must be at least 0\n";
+}
+
+if ($max_fragmentation_desired_pct >= 100) {
+	die "ERROR: -max-fragmentation-pct must be < 100\n";
+}
+
+if ($max_defrag_attempts < 1) {
+	die "ERROR: max-attempts must be at least 1\n";
+}
+
+my @input_files;
+
+if (-d $ARGV[0]) {
+
+  if (scalar(@ARGV) > 1) {
+      die "ERROR: no more arguments may be specified when 1st argument is a directory\n";
+  }
+
+  @input_files = grep { -f $_ } glob("$ARGV[0]/*");
+} else {
+  @input_files = @ARGV;
+
+  my @non_files = grep { ! -f $_ } @input_files;
+
+  if (scalar(@non_files) >= 1) {
+    print STDERR "ERROR: the following arguments were not regular files:\n";
+    print STDERR join("\n", @non_files) . "\n";
+    exit(1);
+  }
+}
+
+
+my ($num_fragments, $defrag_attempts, $perfection_fragments, $original_fragments, $status, $max_fragments_desired, $size, $blocks, $original_fragmentation_pct, $new_fragmentation_pct);
+my $fragmented_files = 0;
+
+my $d;
+
+#foreach my $source_file (sort { -s $b <=> -s $a } @input_files) {
+foreach my $source_file (sort { rand > 0.5 } @input_files) {
+
+	if (! -e $source_file) {
+		die "ERROR: source file $source_file does not exist\n";
+	}
+
+	next if (! -f $source_file);
+
+	($num_fragments, $perfection_fragments) = get_fragments($source_file);
+
+  $size = -s $source_file;
+
+	if ($size !~ /^\d+$/) {
+		die "ERROR: Cannot determine size of file $source_file\n";
+	}
+
+  $blocks = int(($size + 4095) / 4096);
+	$max_fragments_desired = max(sprintf('%d', $max_fragmentation_desired_pct * $blocks / 100), 1);
+
+	$perfection_fragments = max($perfection_fragments, $max_fragments_desired);
+	$original_fragments = $num_fragments;
+
+	$defrag_attempts = 0;
+
+	while (($defrag_attempts < $max_defrag_attempts) && ($num_fragments > $perfection_fragments)) {
+
+		if ($defrag_attempts >= 1) {
+			print "Sleeping for $sleep_secs seconds..\n";
+			sleep($sleep_secs);
+		}
+
+		($num_fragments, $perfection_fragments) = defrag_file($source_file, $num_fragments, $perfection_fragments);
+		$perfection_fragments = max($perfection_fragments, $max_fragments_desired);
+
+		if (! defined($num_fragments)) {
+			print "ERROR: defrag operation failed for '$source_file'\n";
+			exit(1);
+		}
+
+		$defrag_attempts++;
+	}
+
+	if ($num_fragments > $perfection_fragments) {
+		$status = 'STILL FRAGMENTED';
+		$fragmented_files++;
+	} else {
+		$status = 'OK';
+	}
+
+	$original_fragmentation_pct = sprintf('%.1f', calc_frag_pct($original_fragments, $size));
+	$new_fragmentation_pct = sprintf('%.1f', calc_frag_pct($num_fragments, $size));
+
+	print join(', ', "file=$source_file", "old_frag_%=$original_fragmentation_pct", "new_frag_%=$new_fragmentation_pct", "attempts=$defrag_attempts", "status=$status") . "\n";
+}
+
+
+if ($fragmented_files) {
+	exit(99);
+} else {
+	exit($exit_success);
+}
+

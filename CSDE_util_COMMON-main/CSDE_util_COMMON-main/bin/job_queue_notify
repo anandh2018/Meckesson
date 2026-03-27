@@ -1,0 +1,181 @@
+#!/usr/bin/perl
+
+# Program: job_queue_notify
+# Purpose: Scan job_queue for new (email) notifications that need to be sent, and send them
+# Version 6.2: Add request ids to email subject and only output attempt # in email if set
+
+use Data::Dumper;
+use BLUELITE::Job;
+use Getopt::Long;
+use File::Spec;
+use File::PathConvert qw(rel2abs);
+
+use warnings;
+use strict;
+
+my @dir_parts = File::Spec->splitdir(rel2abs($0));
+our $PGM = pop(@dir_parts);
+
+sub mylog($) {
+  my $msg = shift;
+  $msg =~ s/\n$//;
+  $msg .= "\n";
+
+  if (-t 0) {
+    print  $msg;
+  }
+}
+
+sub update_queue($$) {
+  my ($app_obj, $updates) = @_;
+
+	my $app_id = $app_obj->app_id;
+  my $update_result = $app_obj->update_job_config( assignments => $updates);
+
+  if ($update_result->{error}) {
+    die "Could not update job_queue for $app_id : " . $update_result->{error} . "\n\nThe updates were: " . Dumper $updates;
+  }
+}
+
+sub Usage() {
+  print "$PGM: Send notifications for job_queue status changes\n";
+  print "\n";
+  print "Usage: $PGM -group-id g [-group-id g ...] [-lookback-days #]\n";
+}
+
+#### Main ####
+
+my @group_id = ();
+my $lookback_days = 21;
+
+GetOptions(
+            'group-id=s@' => \@group_id,
+            'lookback-days=i' => \$lookback_days,
+) || exit(1);
+
+if (@ARGV) {
+  print STDERR "$PGM: Extraneous command-line arguments!\n";
+  Usage;
+  exit(1);
+}
+
+if (! @group_id) {
+  Usage;
+  exit(0);
+}
+
+
+my $email_step_map = {
+	VALIDATE => 'RQ_REQUESTER_EMAIL',
+	EXTRACT => 'RQ_EXTRACT_EMAIL',
+	DFA => 'RQ_DFA_EMAIL',
+	DELIVERY => 'RQ_DELIVERY_EMAIL'
+};
+
+my $requests = BLUELITE::Job->get_requests(
+		add_where              => "rq_step_notify_date < nvl(rq_step_end_date, rq_step_begin_date) or rq_step_notify_date is null",
+		submission_search_days => $lookback_days,
+    group_id               => \@group_id,
+		order_by               => 'rq_submitted_date'
+);
+
+my %email_list;
+
+foreach my $rq (@{$requests}) {
+	my $app_id = $rq->{RQ_SOURCE_APP_ID};
+	my $request_id = $rq->{RQ_REQUEST_ID};
+	my $rq_step = $rq->{RQ_STEP};
+	my $app_obj;
+
+	eval { $app_obj = BLUELITE::Job->new(app_id => $app_id, request_id => $request_id, force_log_init => 1) };
+
+	if (! defined($app_obj)) {
+		next;
+	}
+
+	my @email_list;
+
+	push(@email_list, $app_obj->{RQ_REQUESTER_EMAIL}, $app_obj->{$email_step_map->{$rq_step}});
+
+	if ($rq->{RQ_STATUS} eq 'ERROR') {
+		push(@email_list, $app_obj->failure_email);
+	}
+
+	my @rq_text;
+
+	{
+		no warnings 'uninitialized';
+
+		@rq_text = (
+				"           App ID: $rq->{RQ_SOURCE_APP_ID}",
+				"     Reference ID: $rq->{RQ_REFERENCE_ID}",
+				"       Request ID: $rq->{RQ_REQUEST_ID}",
+				"        Post Date: $rq->{RQ_POST_DATE}",
+				"     Current Step: $rq->{RQ_STEP}",
+				"   Current Status: $rq->{RQ_STATUS}",
+				"    Status detail: $rq->{RQ_STATUS_DETAIL}",
+				"       Output dir: " . $app_obj->output_dir
+		);
+	}
+
+	if (defined($rq->{RQ_JOB_ATTEMPTS})) {
+		push(@rq_text, "Extract attempt #: $rq->{RQ_JOB_ATTEMPTS}");
+	}
+
+	if (defined($rq->{RQ_SUBMITTED_DATE})) {
+		push(@rq_text, "        Submitted: $rq->{RQ_SUBMITTED_DATE}");
+	}
+
+	if (defined($rq->{RQ_STEP_BEGIN_DATE})) {
+		push(@rq_text, "  Step begin date: $rq->{RQ_STEP_BEGIN_DATE}");
+	}
+
+	if (defined($rq->{RQ_STEP_END_DATE})) {
+		push(@rq_text, "    Step end date: $rq->{RQ_STEP_END_DATE}");
+	}
+
+	if (defined($rq->{RQ_PROCESS_BEGIN_DATE})) {
+		push(@rq_text, "    Process begin: $rq->{RQ_PROCESS_BEGIN_DATE}");
+	}
+
+	if (defined($rq->{RQ_PROCESS_END_DATE})) {
+		push(@rq_text, "      Process end: $rq->{RQ_PROCESS_END_DATE}");
+	}
+
+	my $rq_text .= join("\n", @rq_text);
+
+	foreach my $email (BLUELITE::Job->email_addresses(@email_list)) {
+		if (defined($email)) {
+			push(@{$email_list{lc($email)}}, { rq_text => "$rq_text", app_obj => $app_obj, rq_reference_id => $rq->{RQ_REFERENCE_ID}});
+		}
+	}
+}
+
+my @apps;
+
+foreach my $email_to (keys %email_list) {
+	my $email_info = $email_list{$email_to};
+	my $body;
+
+	my %rq_reference_ids;
+
+	foreach my $rq_info (@{$email_list{$email_to}}) {
+		$body .= $rq_info->{rq_text} . "\n\n";
+		push(@apps, $rq_info->{app_obj});
+
+		if (exists($rq_info->{rq_reference_id}) && defined($rq_info->{rq_reference_id})) {
+			$rq_reference_ids{$rq_info->{rq_reference_id}} = undef;
+		}
+	}
+
+	my $ref_ids_txt = join(',', keys %rq_reference_ids);
+	
+	mylog($body);
+	BLUELITE::Job->email(to => $email_to, subject => "JobPkg Request Status ($ref_ids_txt)", msg => $body);
+}
+
+foreach my $app (@apps) {
+	update_queue($app, { rq_step_notify_date => 'sysdate' });
+	$app->commit;
+}
+

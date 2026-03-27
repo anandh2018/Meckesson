@@ -1,0 +1,1398 @@
+#!/usr/bin/perl
+
+#use lib '/ds/development/Job/dev/blib/lib';
+
+# job_concat_post_date : Concatenate BLUELITE::Job worker output files into 1-file-per-post-date client deliverable files
+# job_concat: Concatenate BLUELITE::Job worker output files into client deliverable files
+#
+# Author(s): John Hess		RelayHealth
+#
+# Version history:
+#
+# Version 1.0 - 10/4/2007
+#
+#
+# Version 1.1 - 3/30/2009
+#
+# Fixed bug where output file was not being explicitly closed if encoding type is compressed and trailer is defined.
+# Effect of bug was incorrect file size written to job_delivery table.
+#
+# Added -keep-worker-files option
+#
+# Added $! error output in addition to $GzipError error output
+#
+#
+# Version 1.5 - 4/2/2009
+# 
+# Added support for running as "job_concat", in addition to existing "job_concat_post_date".
+# As job_concat, output from any completed workers not already concatenated are concatenated.
+# This required adding support for "post_date_seq" coming from $job->deliverable_fname_vars
+# (in addition to existing support for "post_date").
+#
+# Version 1.6 - 4/13/2009
+#
+# Concatenation is now serialized for a given app, to prevent workers from being concatenated
+# into multiple concatenation processes running simultaneously.
+#
+# Added calls to the following methods: concat_begin, concat_end, concatenation_minutes.
+# Added DISCONNECT_ON_DESTROY option to constructor, so that concat_end will work in END block.
+#
+# Version 1.7 - 5/19/2009
+#
+# Temp dir for concatenation is now in /temp, or where ever a reasonable temp dir can be found
+# (several possibilities are checked). Last resort is temp under deliverables dir, which will
+# be created if necessary.
+#
+# Temp file name now has current PID ($$) as prefix of file name to avoid clobbering other temp
+# files on same temp dir.
+#
+# Version 1.8 - 5/20/2009
+#
+# Added support for post-process command
+#
+# Version 1.9 - 2/20/2010
+#
+# Added -post-date, -max-concat-input-txns, -deliverable-dir, and -log-to-screen parameters
+#
+#
+# Version 1.91 - 4/20/2010
+#
+# Changed signal handler setup to use std_abort_signals function from BLUELITE::Common instead of explicit list
+#
+#
+# Version 1.4 6/22/2010 (version # adjusted down to match version of BLUELITE::Job package)
+#
+# Made -app-dir parameter optional (defaults to value returned by app_dir method of Job object)
+#
+# Change logging by providing desired logfile name to Job object constructor, and use logger method
+# of Job object to obtain logger.
+#
+# Version 1.5 7/23/2010
+#
+# Using post-date command line option will now pass those post dates to the ready_to_deliver method.
+# This will allow the method to override the usual search_days config parameter. Previously, this
+# option only worked if the date requested was not beyond the search days.
+#
+# Version 1.6 8/6/2010
+#
+# Removed requirement to create valid XML document in STDERR of post-process to convey # of output records.
+# Now only a XML tag must be present like:    <data_records>12345</data_records>
+#
+# Version 2.1 10/20/2010
+#
+# Fixed bug where logfile was not removed is no files were concatenated.
+#
+# Version 2.3 12/28/2010
+#
+# Added '-mark-delivered' command-line option. This should be used to avoid late file delivery warnings when
+# a post process delivers the data via some non-standard means (i.e. database inserts) instead of
+# transmitting a file via ftp.
+#
+# Added '-group-id' command-line option. This will sequentially attempt to perform concatenation for each app_id
+# within the requested group_id.
+#
+# Fix "modification of a read-only value" bug when looking for a usable temp dir.
+#
+# Version 2.5 1/5/2011
+#
+# Added -exclude-app command-line option
+#
+# Version 2.63 - 2/23/2011
+# - Fixed bug where sometimes neither of 2 concatenators attempting to run at the same time would properly detect the other
+# one and the result would be a "Missing worker files" notification. This was resolved by: 
+# 1) Adding a "AND concat_begin_time IS NULL" to the WHERE clause of the UPDATE inside the concat_begin_time method.
+# 2) Having the concat_begin method return true only if the UPDATE of the concat_begin_time actually updated a row.
+# 3) Changing the job_concat script to use the return value of the concat_begin method to determine whether it was
+# actually able to update the concat_begin_time column in the job_config table. If not, then it logs warning or info
+# and exits.
+# 4) Checking concatenation_minutes method BEFORE calling ready_to_deliver method.
+#
+# - Changed "skipped concatenation" log message to be INFO level if reason is "already concatenating" for less than
+# 10 minutes, or WARN if more than 10 minutes.
+#
+# Version 2.7 - 3/28/2011
+#
+# - Added -no-max-records-check to command line options
+# - Fixed bug where no concatenation would occur if multiple post dates are provided on command line
+# - Removed "no concatenation has ever occurred" message since it is often wrong when generating test
+# files and it's not worth fixing.
+#
+# Version 2.8 - 4/26/2011
+#
+# - Added support for flexible date specifications in -post-date option (ranges, months, etc)
+# - The "Added ## records from .." message is now logged only if ## is at least 1
+# - Added -one-output-file command line option, which will put all output into a single file instead of seperating
+#   by post date.
+# - Refactored main concatenation loop by moving file start & finish steps into subroutines (due to new
+#   -one-output-file option).
+# - Removed "post_date_complete" behavior that was based on script name. Now handled as job_config setting internal
+#   to ready_to_deliver method.
+# - Added -ds-format command line option for concatenating workers that were launched with the same command-line option.
+# - Fixed logging problem that caused logging to screen when -group-id specified
+#
+# Version 2.9 - 5/29/2011
+#
+# - Changed "skipped concatenation" log message to be ERROR if already concatenating more than 30 minutes, and DEBUG
+# for less than 10 messages. The DEBUG will prevent this message from clearing a yellow alert in job_status script.
+# - Changed log_type from 'INFO' to 'DEBUG' for 'Attempting concatenation' message of log() call. This will
+# avoid a concat "attempt" from clearing a yellow alert in job_status script.
+# - Changed log_type from 'INFO' to 'DEBUG' for 'A file concatenation attempt for $APP_ID was skipped ...'
+# message of log() call. This will prevent this message from clearing a yellow alert in job_status script.
+# - Added optional log_type to mydie subroutine, defaulting to ERROR
+# - Added log_type of 'WARN' to mydie call when add_delivery method fails, so job_status will show details of problem
+#
+# Version 3.0 - 6/8/2011
+#
+# - Added support for gzip (.gz) input files to concat function
+# - Added -all-or-none command line option
+#
+# Version 3.2 - 6/28/2011
+#
+# - Added new deliverable_fname_vars tokens supported in job_config table (YYYY, MM, DD).
+# - Added -any command line option, which can be used with -span-post-dates to turn off -all-or-none option.
+#
+# Version 4.1 - 9/19/2011
+#
+# - Increased warning/error thresholds for "already concatenating" from 10/30 to 20/40.
+#
+# Version 4.2 - 9/26/2011
+#
+# - Shortened concat success log message in finish_output_file function.
+# - Shortened "Created deliverable file.." message.
+#
+# Version 4.3 - 10/24/2011
+#
+# - Added -config-group-id command-line option, for getting default config settings from that group.
+#
+# Version 4.6 - 11/8/2012
+#
+# - Added "cd" to bin dir before running post process
+#
+# Version 4.7 - 4/16/2013
+#
+# - Added -no-mutex command line option, which will allow multiple job_concat processes for the same app-id to
+# be executing simultaneously. The -post-date option becomes mandatory when using this option, as the caller
+# must become the coordinator of parallel job_concat processing by segregating work via exclusive post dates/ranges.
+#
+# - Added error check in concat() function between end of read loop and file handle close to detect an error
+# such as "unexpected end of file" when reading compressed files.
+#
+# - Added support for 'date_created' in deliverable_fname_vars config attribute
+#
+# Version 4.8 - 6/6/2013
+#
+# - The -app-id and -post-date parameters are now provided to the post-process command
+# - Improved error display when errors caused by concat post-process. Not just "broken pipe" anymore.
+#
+# Version 4.9 - 6/20/2013
+#
+# - Warnings/errors generated for long concatenation times are now based on app config parameters instead of being
+# hard-coded to 20 and 40 minutes for all apps. Can be disabled by setting config value <= 0.
+#
+# Version 5.0 - 3/5/2014
+#
+# - Added -keep-log option. Default is now to remove logfile is no errors.
+# - Input workers with no filename are now skipped (i.e. filename no longer required)
+# - Output file is no longer generated if deliverable_fname_sprintf is not defined and there is no input or output from post_concat_cmd
+# - An attempt to remove an existing temp file of the same name is made prior to attempting to create it
+# - Fixed bug that prevented STDERR of post_concat_cmd from appearing in log output
+# - Logfile naming convention is now consistent with that of job_launcher script
+#
+# Version 5.1 - 6/9/2014
+# - Add support for new auto_completion config parameter
+#
+# Version 6.0 - 10/31/2014
+# - Added support for "autohoc" requests (i.e. automated on-demand ad-hoc processing).
+#
+# Version 6.2 - 12/15/2014 - Michael Carey <michael.carey@mckesson.com>
+# - removing command line option -max-concat-input-txns, moving this parm
+#   to the job config table  MAX_CONCAT_INPUT_TXNS.  This is being done to
+#   support datafeed deliverable file size limitation for SENTRY datafeed.
+#   04/16/2015 - Michael Carey <michael.carey@mckesson.com>
+# - adding support for special record terminator of "NONE" which will disable
+#   job_concat's line ending management (binary file deliverables).  The IO
+#   loop is still not ideal for use where binary deliverables are large, but
+#   job_concat shouldn't corrupt binary output from a post processor.
+# - Add REQUEST_ID variable support for deliverable_fname_vars
+#
+# Version 6.3 - 7/2/2015 - J Hess
+# - Add support for REFERENCE_ID file naming variable
+#
+
+use IO::Compress::Gzip qw($GzipError gzip);
+use IO::Uncompress::Gunzip qw($GunzipError);
+use IO::File;
+use DateTime::Format::Strptime;
+use Getopt::Long;
+use Mail::SendEasy;
+use File::Copy;
+use File::PathConvert qw(rel2abs);
+use File::Spec;
+use Params::Validate qw(:all);
+use Data::Dumper;
+use File::Path;
+
+use BLUELITE::Job;
+use BLUELITE::Logger;
+use BLUELITE::Mail qw(email);
+use BLUELITE::Common qw(std_abort_signals);
+
+use strict;
+use warnings;
+
+my @dir_parts = File::Spec->splitdir(rel2abs($0));
+our $PGM = pop(@dir_parts);
+my $pgm = rel2abs($0);
+
+our $MAX_CONCAT_INPUT_TXNS;
+our $POST_DATE;
+our $JOB;
+our $CONCATENATING = 0;
+our $SCREEN_ONLY = 0;
+our $MARK_DELIVERED;
+our $DEFAULT_EXIT_SUCCESS = 0;
+our ($SUCCESS_EMAIL, $FAILURE_EMAIL, $DEFAULT_FAILURE_EMAIL, $DELIVERABLE_OUTFILE_NAME, $REQUEST_ID);
+our $DEFAULT_DATE_FORMAT = DateTime::Format::Strptime->new( pattern => '%Y%m%d%H%M%S') || die "ERROR: Unable to set default date format!\n";
+our $FILES_CREATED = 0;
+our ($DBH, $OUT_FH, $LOGGER, $APP_ID, $LOGFILE, $DELIVERABLE_DIR, $APP_DIR_TOP, $BIN_DIR);
+our $custom_header = 0;
+our $custom_trailer = 0;
+our $KEEP_WORKER_FILES = 0;
+our ($TEMP_OUTPUT_DIR, $HEADER, $TRAILER, $TODAY_DATE);
+our $OUTPUT_FILE_OPEN = 0;
+
+
+sub failure_email() {
+
+	if (defined($FAILURE_EMAIL)) {
+		return $FAILURE_EMAIL;
+	} elsif (defined($DEFAULT_FAILURE_EMAIL)) {
+		return $DEFAULT_FAILURE_EMAIL;
+	}
+
+	return undef;
+}
+
+sub mydie($;$) {
+  my $message = shift;
+	my $log_type = shift;
+	$log_type = 'ERROR' if (! defined($log_type));
+
+	# close output file
+
+	if (defined($OUT_FH) && $OUT_FH->opened) {
+		$OUT_FH->close;
+	}
+
+	# remove output file
+
+	if (defined($DELIVERABLE_OUTFILE_NAME)) {
+		if (-f $DELIVERABLE_OUTFILE_NAME) {
+
+			eval '$LOGGER->info("Removing concatenated output file $DELIVERABLE_OUTFILE_NAME")' if (defined($LOGGER));
+
+			if (! unlink($DELIVERABLE_OUTFILE_NAME)) {
+				$message .= "\nCould not delete output file $DELIVERABLE_OUTFILE_NAME : $!\n";
+			} else {
+				$message .= "\nDeleted output file $DELIVERABLE_OUTFILE_NAME\n";
+			}
+		}
+	}
+
+	if (defined($LOGGER)) {
+		eval '$LOGGER->info("Created $FILES_CREATED deliverable files")';
+		$message .= "\nSee logfile $LOGFILE for more details\n" if (defined($LOGFILE));
+	}
+
+	if (defined($JOB)) {
+		$JOB->rollback;
+		$JOB->log(event_code => 'CCFAIL', log_type => $log_type, message => $message, email_subject => 'Concatenation failed');
+	}
+
+	if (defined($LOGGER)) {
+		exit(1);
+	} else {
+		die $message . "\n";
+	}
+}
+
+
+sub get_deliverable_fname($$$$$) {
+	my ($post_date, $deliverable_dir, $temp_dir, $job, $post_date_spec) = @_;
+
+  my $deliverable_fname_sprintf = $job->deliverable_fname_sprintf;
+  my $deliverable_fname_vars = $job->deliverable_fname_vars;
+
+	mydie "get_deliverable_fname: deliverable_fname_sprintf must be configured in the JOB_CONFIG table\n" if (! defined($deliverable_fname_sprintf));
+	$deliverable_fname_sprintf =~ s/^\s+//;
+	$deliverable_fname_sprintf =~ s/\s+$//;
+	mydie "get_deliverable_fname: deliverable_fname_sprintf must be configured in the JOB_CONFIG table\n" if (length($deliverable_fname_sprintf) == 0);
+
+	mydie "get_deliverable_fname: deliverable_fname_vars must be configured in the JOB_CONFIG table\n" if (! defined($deliverable_fname_vars));
+	$deliverable_fname_vars =~ s/^\s+//;
+	$deliverable_fname_vars =~ s/\s+$//;
+	mydie "get_deliverable_fname: deliverable_fname_vars must be configured in the JOB_CONFIG table\n" if (length($deliverable_fname_vars) == 0);
+
+	my @var_list = split(/\s*,\s*/, uc($deliverable_fname_vars));
+	mydie "get_deliverable_fname: could not parse any variables from deliverable_fname_vars value of '$deliverable_fname_vars'\n" if (scalar(@var_list) == 0);
+
+	my @fname_vars = ();
+
+	my $info = {};
+	my $seq_num;
+	my $pd_parm = $post_date;
+	$pd_parm = $post_date_spec if (defined($post_date_spec));
+	$pd_parm = 'POST_DATES' if (! defined($pd_parm));
+
+	my $yyyy = '';
+	my $mm = '';
+	my $dd = '';
+
+	if ($pd_parm =~ /^\s*(\d\d\d\d)/) {
+		$yyyy = $1;
+	}
+
+	if ($pd_parm =~ /^\s*(\d\d\d\d)(\d\d)/) {
+		$mm = $2;
+	}
+
+	if ($pd_parm =~ /^\s*(\d\d\d\d)(\d\d)(\d\d)/) {
+		$dd = $3;
+	}
+
+	foreach my $var (@var_list) {
+		if ($var eq 'POST_DATE') {
+			push(@fname_vars, $pd_parm);
+		} elsif ($var eq 'POST_DATE_SEQ') {
+			$seq_num = $job->next_post_date_seq_num($pd_parm);
+
+			push(@fname_vars, $seq_num);
+
+			$info->{seq_num} = $seq_num;
+		} elsif ($var eq 'YYYY') {
+			push(@fname_vars, $yyyy);
+		} elsif ($var eq 'MM') {
+			push(@fname_vars, $mm);
+		} elsif ($var eq 'DD') {
+			push(@fname_vars, $dd);
+		} elsif ($var eq 'DATE_CREATED') {
+			push(@fname_vars, $TODAY_DATE);
+		} elsif ($var eq 'REQUEST_ID') {
+			push(@fname_vars, $job->rq_request_id);
+		} elsif ($var eq 'REFERENCE_ID') {
+			push(@fname_vars, $job->rq_reference_id);
+		} else {
+			mydie "get_deliverable_fname: deliverable_fname_vars = '$deliverable_fname_vars', which contains a unrecognized variable named '$var'\n";
+		}
+	}
+
+	mydie "get_deliverable_fname: could not find any recognized variables from deliverable_fname_vars value of '$deliverable_fname_vars'\n" if (scalar(@fname_vars) == 0);
+
+	my $fname = sprintf($deliverable_fname_sprintf, @fname_vars);
+	my $fname_temp = "$temp_dir/$$.$fname";
+	$fname = "$deliverable_dir/$fname";
+
+	$info->{fname} = $fname;
+	$info->{fname_temp} = $fname_temp;
+
+	return $info;
+}
+
+
+sub Usage() {
+  print "$PGM: Concatenate BLUELITE::Job worker output files into deliverable files\n\n";
+  print "Usage 1: $PGM -group-id g [-options]\n";
+  print "Usage 2: $PGM -app-id a   [-options]\n";
+	print "\n";
+  print " Options (defaults in parenthesis):\n";
+  print "  -request-id #                 Concatenate request id in job_queue table\n";
+  print "  -app-dir d                    Top-level application directory (from job_config table)\n";
+  print "  -exit #                       Exit with status # on success. ($DEFAULT_EXIT_SUCCESS)\n";
+  print "  -logging-level level          Set logging to level (INFO). Values: DEBUG, INFO, WARN, ERROR, FATAL\n";
+  print "  -success-email list           Send status to list addresses upon success (application default)\n";
+  print "  -failure-email list           Send status to list addresses upon failure (application default)\n";
+  print "  -default-failure-email list   Send status to list addresses upon failure (does not override app default)\n";
+  print "  -check-only                   Only check to see if concatenation would be performed (off)\n";
+  print "  -keep-worker-files            Preserve worker files after concatenation (off)\n";
+#  print "  -max-concat-input-txns #      Max # of input txns\n";
+  print "  -deliverable-dir dir          Output deliverable directory\n";
+  print "  -mark-delivered               Mark output as 'delivered' (off)\n";
+  print "  -exclude-app a                Exclude app_id a from group_id g (Usage 1 only, can repeat)\n";
+  print "  -log-to-screen                Log to the screen\n";
+  print "  -screen-only                  Log only to the screen\n";
+  print "  -no-max-records-check         Do NOT check for violation of max # of output records (max records checked)\n";
+  print "                                {in production, use only with management approval}\n";
+  print "  -span-post-dates              Do NOT limit each output file to 1 post date (1 post date per file)\n";
+  print "  -all-or-none                  Must concatenate all dates in pd_spec or none of them (default if -span-post-dates used)\n";
+  print "  -any                          Turn off -all-or-none option (default except when -span-post-dates used)\n";
+  print "  -ds-format fmt                Concatenate workers with data_source_format of fmt (e.g. POSTDATE)\n";
+  print "  -config-group-id id           Get default group config params from group_id id\n";
+  print "  -no-mutex                     Allow concatenation when other processes of same app_id are concatenating\n";
+  print "  -keep-log                     Keep log file (removed if no errors encountered)\n";
+  print "  -post-date PRIOR              Only concatenate workers from post dates prior to today\n";
+  print "  -post-date pd_spec            Only concatenate workers from these post dates\n\n";
+  print "Note: pd_spec may be a comma-separated list of any combination of the following syntaxes:\n";
+  print "  YYYYMMDD\n";
+  print "  YYYYMMDD-YYYYMMDD\n";
+  print "  YYYYMM\n";
+  print "  YYYYMM-YYYYMM\n";
+  print "  YYYYMMDD-YYYYMM\n";
+  print "  YYYYMM-YYYYMMDD\n";
+}
+
+
+sub sig_handler() {
+  my $signal = shift;
+
+  mydie "$PGM process was killed via $signal signal.\n";
+}
+
+sub concat($$$) {
+	my ($fname, $record_terminator, $temp_stderr_fname) = (shift, shift, shift);
+	my $records_added = 0;
+	my $input_fh;
+
+	return 0 if (! defined($fname));
+
+	if ($fname =~ /[.]gz$/i) {
+		$input_fh = new IO::Uncompress::Gunzip $fname || mydie "Cannot open gzipped input file $fname : $GunzipError\n";
+	} else {
+		$input_fh = new IO::File || mydie "Cannot get file handle to read input file $fname\n";
+		$input_fh->open("< $fname") || mydie "Cannot open file handle to read input file $fname : " . $input_fh->error() . "\n";
+	}
+
+	my $line;
+	while ($line = $input_fh->getline()) {
+		
+		if ($record_terminator ne 'NONE') {
+			$line =~ s/[\015]?[\012]$//;	# remove CR/LF or LF at end of line
+			$line .= $record_terminator;	# put appropriate record terminator at end of line
+		}
+		
+		if (! $OUT_FH->print($line)) {
+			my $general_error_txt = "$@ : $!";
+
+			$OUT_FH->close;
+
+			my @temp_pp_stderr = ();
+
+			if (defined($temp_stderr_fname)) {
+				if (open(TMP, $temp_stderr_fname)) {
+					@temp_pp_stderr = <TMP>;
+					close(TMP);
+				}
+			}
+
+			mydie "Cannot append data from $fname to output file : " . join('', @temp_pp_stderr) . ": $general_error_txt\n";
+		}
+
+		$records_added++;
+	}
+
+	if ($input_fh->can('error') && $input_fh->error) {
+		mydie "Cannot append data from $fname to output file : " . $input_fh->error;
+	}
+
+	if (! $input_fh->close()) {
+		my $error;
+
+		if ($input_fh->can('error')) {
+			$error = $input_fh->error;
+		} else {
+			$error = $GunzipError;
+			$error = $! if (! defined($error));
+		}
+
+		mydie "Cannot close input file $fname : $error\n";
+	}
+
+	if ($records_added) {
+		$LOGGER->info("Added $records_added records from $fname") || mydie "Cannot write to log file $LOGFILE : $@\n";
+	}
+
+	return $records_added;
+}
+
+
+
+sub write_header() {
+  my $header_string;
+
+	return undef if (! defined($OUT_FH));
+
+	my $start_time = DateTime->now(time_zone => 'local', formatter => $DEFAULT_DATE_FORMAT) || return undef;
+	my $base_file_name = $DELIVERABLE_OUTFILE_NAME;
+	$base_file_name =~ s/.*\///g;
+
+	return undef if ((! defined($base_file_name)) || (length($base_file_name) == 0));
+  
+  if ( $custom_header) {
+      $header_string = get_header($start_time, $base_file_name);
+  }
+  else {
+      $header_string = get_std_header($start_time, $base_file_name);
+  }
+
+	if (defined($header_string)) {
+		print $OUT_FH $header_string || mydie "ERROR: Cannot append header to $DELIVERABLE_OUTFILE_NAME : $! , $GzipError\n";
+	}
+
+	return 1;
+}
+
+
+sub get_std_header($$$) {
+    my $start_time = shift;
+    my $base_file_name = shift;
+
+    my $header_string = sprintf("H%14.14s%100.100s" . "\n", $start_time, $base_file_name) || mydie "ERROR: Cannot create the header string\n";
+
+    return $header_string;
+
+}
+
+sub get_std_trailer($$) {
+    my $end_time = shift;
+    my $num_records = shift;
+
+    my $trailer_string = sprintf("T%10d%14.14s" . "\n", $num_records, $end_time) || mydie "ERROR: Cannot create the header string\n";
+
+    return $trailer_string;
+
+}
+
+sub write_trailer($) {
+  my ($num_records) = (shift);
+  my $trailer_string;
+
+	return undef if (! defined($OUT_FH));
+
+	my $end_time = DateTime->now(time_zone => 'local', formatter => $DEFAULT_DATE_FORMAT) || return undef;
+
+  if ( $custom_trailer ) {
+      $trailer_string = get_trailer($end_time, $num_records);
+  }
+  else {
+      $trailer_string = get_std_trailer($end_time, $num_records);
+  }
+
+  print $OUT_FH $trailer_string if (defined($trailer_string));
+
+	return 1;
+}
+
+
+
+sub mymove($$) {
+  my ($source_file, $dest_dir) = (shift, shift);
+
+	return undef if (! move($source_file, $dest_dir));
+
+	my $base_fname = $source_file;
+	$base_fname =~ s/.*\///g;
+
+	return "${dest_dir}/${base_fname}";
+}
+
+
+
+sub add_delivery($$$$$$$$) {
+  my ($fname_temp, $job, $post_date, $data_records, $total_txns, $workers_in_output, $seq_num, $check_record_count) = @_;
+
+	my $fsize = -s $fname_temp;
+
+	my @is_delivered = ();
+	push(@is_delivered, is_delivered => $MARK_DELIVERED) if (defined($MARK_DELIVERED));
+
+	if (! $job->add_delivery(fname => $DELIVERABLE_OUTFILE_NAME, workers => $workers_in_output, commit => 0, data_records => $data_records, txn_processed => $total_txns, post_date => $post_date, seq_num => $seq_num, fsize => $fsize, @is_delivered, check_record_count => $check_record_count)) {
+		mydie("Could not successfully call BLUELITE::Job->add_delivery() for output file $DELIVERABLE_OUTFILE_NAME . The temp filename is $fname_temp\n", 'WARN');	# use WARN because add_delivery method will log ERROR, which is what we want most recent status to show in job_status output
+	}
+
+	my $created_file = 0;
+
+	if ($job->fname_spec_configured() || ($fsize > 0)) {
+		move($fname_temp, $DELIVERABLE_OUTFILE_NAME) || mydie "Could not move temp file $fname_temp to deliverable directory $DELIVERABLE_DIR : $!\n";
+		$created_file = 1;
+	} else {
+		unlink($fname_temp);
+	}
+
+	$job->commit || mydie "Could not commit addition of delivery for $DELIVERABLE_OUTFILE_NAME\n";
+
+	# clean up temp worker files since we no longer need them
+
+	if (! $KEEP_WORKER_FILES) {
+		my @undeleted_files = ();
+		my $output_file;
+
+		foreach my $worker (@{$workers_in_output}) {
+			$output_file = $worker->output_fname;
+
+			next if (! defined($output_file));
+
+			if (! unlink($output_file)) {
+				push(@undeleted_files, "$output_file : $!");
+			}
+		}
+
+		if (defined($FAILURE_EMAIL) && (scalar(@undeleted_files) >= 1)) {
+			email(
+				to => $FAILURE_EMAIL,
+				subject => "$APP_ID concatenation process warning",
+				msg => "The following worker output files could not be removed after successful concatenation into the deliverable file $DELIVERABLE_OUTFILE_NAME:\n" . join("\n", @undeleted_files) . "\n\nThis did not cause any problems, but it may warrant investigation."
+			);
+		}
+	}
+
+	return $created_file;
+}
+
+
+sub myexit($) {
+	my $exit_code = shift;
+
+	if ($FILES_CREATED && defined($LOGGER)) {
+		eval '$LOGGER->info("$FILES_CREATED concatenations performed.")';
+	} else {
+		eval '$LOGGER->info("No worker files concatenated.")';
+	}
+
+	unlink($LOGFILE) if (defined($LOGFILE) && (! $FILES_CREATED));
+	
+	exit($exit_code);
+}
+
+
+sub start_output_file(%) {
+  my %option = validate_with
+    ( params  => \@_,
+      spec    => {
+                  post_date_spec => { type => SCALAR|UNDEF, optional => 0 },
+                  post_date => { type => SCALAR|UNDEF, optional => 0 },
+                  span_post_dates => { type => SCALAR, optional => 0 }
+                },
+      called  => 'start_output_file',
+      normalize_keys => sub { my $k = shift; $k =~ s/^-//; return uc $k }
+  );
+
+	my $post_date_spec = $option{POST_DATE_SPEC};
+	my $post_date = $option{POST_DATE};
+
+	if ($option{SPAN_POST_DATES}) {
+		$post_date = undef;
+	} else {
+		$post_date_spec = undef;
+	}
+
+	my $post_concat_cmd = $JOB->post_concat_cmd;
+	my $via_text = '';
+	$via_text = "via post-concat command '$post_concat_cmd'" if (defined($post_concat_cmd));
+
+	my $file_info = get_deliverable_fname($post_date, $DELIVERABLE_DIR, $TEMP_OUTPUT_DIR, $JOB, $post_date_spec);
+	$DELIVERABLE_OUTFILE_NAME = $file_info->{fname};
+	my $fname_temp = $file_info->{fname_temp};
+
+	my $eff_post_date = $post_date_spec;
+	$eff_post_date = $post_date if (! defined($eff_post_date));
+
+	$JOB->log(event_code => 'CCATT', post_date => $eff_post_date, log_type => 'DEBUG', email_subject => 'Attempting concatenation', message => "Attempting concatenation for post date $eff_post_date $via_text", email_to => undef);
+
+	my $file_encoding = $JOB->deliverable_encoding;
+	$file_encoding = '' if (! defined($file_encoding));
+
+	my $temp_stderr_fname;
+
+	unlink($fname_temp) if (-e $fname_temp);
+
+	if (defined($post_concat_cmd)) {
+		$OUT_FH = new IO::File "> $fname_temp" || mydie "Cannot create temp output file $fname_temp : $!\n";
+
+		if (defined($HEADER)) {
+			 write_header || mydie "Could not write header to $fname_temp : $! , $GzipError\n";
+		}
+
+		$OUT_FH->close || mydie "Could not close output file $fname_temp : $!\n";
+
+		$temp_stderr_fname = "$fname_temp.err";
+		chdir($BIN_DIR);
+		unlink($temp_stderr_fname) if (-e $temp_stderr_fname);
+
+		$OUT_FH = new IO::File "| $post_concat_cmd -app-id $APP_ID -post-date $eff_post_date >> $fname_temp 2> $temp_stderr_fname" || mydie "Cannot create temp output file $fname_temp via post-process command '$post_concat_cmd': $!\n";
+
+	} elsif ($file_encoding =~ /^\s*(raw|uncompressed)\s*$/i) {
+		$OUT_FH = new IO::File "> $fname_temp" || mydie "Cannot create temp output file $fname_temp : $!\n";
+
+		if (defined($HEADER)) {
+			 write_header || mydie "Could not write header to $fname_temp : $! , $GzipError\n";
+		}
+	} elsif ($file_encoding =~ /^\s*gzip\s*$/i) {
+		$OUT_FH = new IO::Compress::Gzip $fname_temp || mydie "Gzip failed to create $fname_temp : $GzipError\n";
+
+		if (defined($HEADER)) {
+			 write_header || mydie "Could not write header to $fname_temp : $! , $GzipError\n";
+		}
+	} else {
+		mydie "ERROR: file_encoding type of '$file_encoding' is not supported!\n";
+	}
+
+	$OUTPUT_FILE_OPEN = 1;
+
+	return { fname_temp => $file_info->{fname_temp}, seq_num => $file_info->{seq_num}, temp_stderr_fname => $temp_stderr_fname };
+}
+
+
+sub finish_output_file(%) {
+
+  my %option = validate_with
+    ( params  => \@_,
+      spec    => {
+                  fname_temp => { type => SCALAR, optional => 0 },
+                  temp_stderr_fname => { type => SCALAR|UNDEF, optional => 0 },
+                  total_records => { type => SCALAR, optional => 0 },
+                  post_date => { type => SCALAR|UNDEF, optional => 0 },
+                  post_date_spec => { type => SCALAR|UNDEF, optional => 0 },
+                  seq_num => { type => SCALAR|UNDEF, optional => 0 },
+                  check_record_count => { type => SCALAR, optional => 0 },
+                  total_txns => { type => SCALAR, optional => 0 },
+                  workers_in_output => { type => ARRAYREF, optional => 0 },
+                  span_post_dates => { type => SCALAR, optional => 0 },
+                },
+      called  => 'finish_output_file',
+      normalize_keys => sub { my $k = shift; $k =~ s/^-//; return uc $k }
+  );
+
+	my $post_date = $option{POST_DATE};
+	$post_date = $option{POST_DATE_SPEC} if ($option{SPAN_POST_DATES});
+
+	my $post_concat_cmd = $JOB->post_concat_cmd;
+	my $fname_temp = $option{FNAME_TEMP};
+	my $temp_stderr_fname = $option{TEMP_STDERR_FNAME};
+	my $total_records = $option{TOTAL_RECORDS};
+	my $total_input_records = $option{TOTAL_RECORDS};
+	my $file_encoding = $JOB->deliverable_encoding;
+	$file_encoding = '' if (! defined($file_encoding));
+
+		my $pp_input_records;
+
+		if (defined($post_concat_cmd)) {
+
+			my $post_concat_failed = 0;
+
+			if (! $OUT_FH->close) {
+				unlink($fname_temp) || $LOGGER->warn("Could not remove temp output file $fname_temp produced by post-process command : $!");
+				$post_concat_failed = 1;
+			}
+
+			$LOGGER->info("Input records for post-process: $total_records");
+			$total_records = undef;
+
+			if ((-s $temp_stderr_fname) > 0) {
+
+				if (open(SE, $temp_stderr_fname)) {
+					my $stderr = '';
+
+					while (<SE>) {
+						if ($_ =~ /<data_records>\s*(\d+)\s*<\/data_records>/i) {
+							if (! defined($total_records)) {
+								$total_records = $1;
+							} else {
+								$LOGGER->error("Found <data_records> tag more than once in the post-process STDERR output");
+								close(SE);
+								mydie "Found <data_records> tag more than once in the post-process STDERR output\n";
+							}
+						} else {
+							$stderr .= $_;
+						}
+					}
+
+					$LOGGER->info("STDERR/log output from post-process:\n" . $stderr) if (length($stderr) > 0);
+					close(SE);
+				} else {
+					$LOGGER->error("Could not open STDERR output file $temp_stderr_fname from post-process command : $!");
+					mydie "Could not open STDERR output file $temp_stderr_fname from post-process command : $!";
+				}
+			}
+
+			unlink($temp_stderr_fname) || $LOGGER->warn("Could not remove STDERR output file $temp_stderr_fname produced by post-process command : $!");
+			mydie "The post-process command terminated abnormally: $! $@\n" if ($post_concat_failed);
+
+			if (defined($TRAILER)) {
+				$OUT_FH = new IO::File ">> $fname_temp";
+
+				if (! defined($OUT_FH)) {
+					unlink($fname_temp) || $LOGGER->warn("Could not remove temp output file $fname_temp produced by post-process command : $!");
+					mydie "Cannot open temp output file $fname_temp for appending trailer: $!\n";
+				}
+
+				no warnings 'uninitialized';
+
+				if (! write_trailer($total_records)) {
+					unlink($fname_temp) || $LOGGER->warn("Could not remove temp output file $fname_temp produced by post-process command : $!");
+					mydie "Could not append trailer to $fname_temp : $!\n";
+				}
+
+				$OUT_FH->close || mydie "Could not close output file $fname_temp after appending trailer: $!\n";
+			}
+
+			$LOGGER->warn("Number of output data_records could not be determined from STDERR of post-process command") if (! defined($total_records));
+
+			# gzip post-process output, if appropriate
+
+			if ($file_encoding =~ /^\s*gzip\s*$/i) {
+				my $temp_fname_temp = "$fname_temp.temp";
+				gzip $fname_temp => $temp_fname_temp or mydie "Could not compress temp output file $fname_temp to temp temp output file $temp_fname_temp: $GzipError\n";
+
+				move($temp_fname_temp, $fname_temp) or mydie "Could not move temp temp output file $temp_fname_temp to $fname_temp : $!\n";
+			}
+		} else {
+
+			if (defined($TRAILER)) {
+				 write_trailer($total_records) || mydie "Could not write trailer to $fname_temp : $! , $GzipError\n";
+			}
+
+			$OUT_FH->close || mydie "Could not close output file $fname_temp : $! , $GzipError\n";
+		}
+
+	no warnings 'uninitialized';
+
+	my $created_file = add_delivery($option{FNAME_TEMP}, $JOB, $post_date, $total_records, $option{TOTAL_TXNS}, $option{WORKERS_IN_OUTPUT}, $option{SEQ_NUM}, $option{CHECK_RECORD_COUNT});
+
+ mydie "Could not add delivery $DELIVERABLE_OUTFILE_NAME\n" if (! defined($created_file));
+
+	$FILES_CREATED++;
+
+	my ($vol, $dir, $file) = File::Spec->splitpath($DELIVERABLE_OUTFILE_NAME);
+	my $msg;
+
+	if ($created_file) {
+		$msg = "Created file $file .";
+	} else {
+		$msg = "Concatenated output for ${post_date} .";
+	}
+
+	$msg .= " Output records = $total_records." if (defined($total_records));
+	$msg .= " Input records = $total_input_records." if ($total_input_records != $total_records);
+
+	$JOB->log(event_code => 'CCSUCCESS', log_type => 'INFO', message => $msg, email_subject => 'file concatenation successful', post_date => $post_date) || mydie "Cannot write to log file $LOGFILE: $@";
+
+	$OUTPUT_FILE_OPEN = 0;
+	$DELIVERABLE_OUTFILE_NAME = undef;
+}
+
+
+sub my_size($) {
+  my $worker = shift;
+
+	my $fname = $worker->output_fname;
+
+	return -s $fname if (defined($fname));
+	return 0;
+}
+
+sub already_concatenating($) {
+	my $no_mutex = shift;
+
+	return 0 if ($no_mutex);
+
+	my $concat_minutes = $JOB->concatenation_minutes;
+
+	if (defined($concat_minutes)) {
+		my $log_type;
+
+		if (defined($JOB->max_concat_time_min) && ($concat_minutes > $JOB->max_concat_time_min)) {
+			$log_type = 'ERROR';
+		} elsif (defined($JOB->alert_concat_time_min) && ($concat_minutes > $JOB->alert_concat_time_min)) {
+			$log_type = 'WARN';
+		} else {
+			$log_type = 'DEBUG';
+		}
+
+		$JOB->log(email_subject => 'skipped concatenation', log_type => $log_type, event_code => 'CCSKIP', message => sprintf("A file concatenation attempt for $APP_ID was skipped because another process for this application may still be concatenating (for %.2f minutes and counting). If concatenation is not actually being performed, then the CONCAT_BEGIN_TIME column of the JOB_CONFIG table will need to be reset to NULL for this application before any new concatenation can take place.", $concat_minutes));
+
+		return 1;
+	}
+
+	return 0;
+}
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+############# MAIN ###########
+
+$APP_ID = 'UNKNOWN';
+my $exit_success = $DEFAULT_EXIT_SUCCESS;
+my $logging_level = 'INFO';
+my $check_only = 0;
+my $concat_interval_hours;	# number of hours required between actual concatenation activity
+my $group_id;
+
+# setup signal handler so we can cleanup before getting interrupted
+
+foreach my $sig (&std_abort_signals) {
+  if ((! defined($SIG{$sig})) || ($SIG{$sig} ne 'IGNORE')) {
+    $SIG{$sig} = \&sig_handler;
+  }
+}
+
+
+if (scalar(@ARGV) == 0) {
+  Usage;
+  exit(1);
+}
+
+# Get command-line options
+
+my $log_to_screen = -t 1;
+
+my @args = @ARGV;
+my @exclude_app = ();
+my $no_max_records_check;
+my $span_post_dates;
+my $no_mutex = 0;
+my $keep_log = 0;
+my ($data_source_format, $all_or_none, $any, $config_group_id);
+
+GetOptions(
+	'all-or-none'             => \$all_or_none,
+	'any'                     => \$any,
+	'app-dir=s'               => \$APP_DIR_TOP,
+	'app-id=s'                => \$APP_ID,
+	'check-only'              => \$check_only,
+	'config-group-id=s'       => \$config_group_id,
+	'default-failure-email=s' => \$DEFAULT_FAILURE_EMAIL,
+	'deliverable-dir=s'       => \$DELIVERABLE_DIR,
+	'ds-format=s'             => \$data_source_format,
+	'exclude-app=s@'          => \@exclude_app,
+	'exit=s'                  => \$exit_success,
+	'failure-email=s'         => \$FAILURE_EMAIL,
+	'group-id=s'              => \$group_id,
+	'keep-log'                => \$keep_log,
+	'keep-worker-files'       => \$KEEP_WORKER_FILES,
+	'log-to-screen'           => \$log_to_screen,
+	'logging-level=s'         => \$logging_level,
+	'mark-delivered'          => \$MARK_DELIVERED,
+	'no-max-records-check'    => \$no_max_records_check,
+	'no-mutex'                => \$no_mutex,
+	'post-date=s'             => \$POST_DATE,
+	'request-id=i'            => \$REQUEST_ID,
+	'screen-only'             => \$SCREEN_ONLY,
+	'span-post-dates'         => \$span_post_dates,
+	'success-email=s'         => \$SUCCESS_EMAIL,
+	) || exit(1);
+
+my $check_record_count = defined($no_max_records_check) ? 0 : 1;
+$log_to_screen = 1 if ($SCREEN_ONLY);
+
+if (defined($group_id)) {
+	if ($APP_ID ne 'UNKNOWN') {
+		mydie "ERROR: The parameters '-app-id' and '-group-id' cannot be used together!\n";
+	}
+
+	if (defined($config_group_id)) {
+		mydie "ERROR: -config-group-id cannot be used with -group-id!\n";
+	}
+
+	if (defined($REQUEST_ID)) {
+		mydie "ERROR: -group-id cannot be used with -request-id!\n";
+	}
+
+	my @job_list = BLUELITE::Job->new(GROUP_ID => $group_id, dbh_caching => 1, is_concatenator => 1, log_to_screen => $log_to_screen);
+
+	if ( ! defined($job_list[0]) ) {
+		mydie "ERROR: Unable to obtain a BLUELITE::Job object for GROUP_ID = '$group_id' : $@\n";
+	}
+
+	my (@common_args, @run_args);
+
+	for(my $i = 0; $i <= $#args; $i++) {
+		if ($args[$i] =~ /^[^a-z]*group-id\s*$/i) {
+			$i++;
+			next;
+		}
+
+		push(@common_args, $args[$i]);
+	}
+
+	my $exclude_apps = {};
+	map { $exclude_apps->{$_} = undef } @exclude_app;
+
+	my $exit_code = 0;
+
+	foreach my $job (@job_list) {
+
+		my $app_id = $job->app_id;
+
+		next if (defined($exclude_apps) && exists($exclude_apps->{$app_id}));
+
+		my $ret = system($pgm, '-app-id' => $job->app_id, @common_args);
+		$ret = $ret >> 8;
+
+		$exit_code = $exit_code | $ret;
+	}
+
+	exit($exit_code);
+}
+
+mydie "ERROR: -app-id or -group-id must be specified!\n" if ($APP_ID eq 'UNKNOWN');
+mydie "ERROR: The -post-date option must be specified when using the -no-mutex option!\n" if ($no_mutex && ! defined($POST_DATE));
+mydie "ERROR: The -post-date option must be specified when using the -request-id option!\n" if ($REQUEST_ID && ! defined($POST_DATE));
+
+my $post_date_txt = $POST_DATE;
+
+if (defined($post_date_txt)) {
+	$post_date_txt =~ s/,/_/g;
+	$post_date_txt .= '.';
+} else {
+	$post_date_txt = '';
+}
+
+$LOGFILE = "concat.${APP_ID}.${post_date_txt}$$.log";
+
+my @job_constructor_opts = (app_id => $APP_ID, disconnect_on_destroy => 0);
+
+push(@job_constructor_opts, logfile => $LOGFILE) if (! $SCREEN_ONLY);
+push(@job_constructor_opts, log_to_screen => $log_to_screen);
+push(@job_constructor_opts, logging_level => $logging_level) if (defined($logging_level));
+push(@job_constructor_opts, config_group_id => $config_group_id) if (defined($config_group_id));
+push(@job_constructor_opts, request_id => $REQUEST_ID) if (defined($REQUEST_ID));
+
+$JOB = BLUELITE::Job->new(@job_constructor_opts) || mydie "Unable to obtain BLUELITE::Job object for app_id = '$APP_ID' : $@\n";
+
+# maximum number of records per deliverable file, defined in job_config table
+$MAX_CONCAT_INPUT_TXNS = $JOB->max_concat_input_txns;
+
+my $output_scope = $JOB->output_scope;
+
+# use "span post dates" mechanism to support output_scope=all config
+if ((! defined($span_post_dates)) && ($output_scope eq 'ALL')) {
+	$span_post_dates = 1;
+}
+
+if (! defined($span_post_dates)) {
+	$span_post_dates = 0;
+}
+
+# default to all-or-none if span-post-dates requested
+if ($span_post_dates && ! defined($all_or_none)) {
+	$all_or_none = 1;
+}
+
+mydie "ERROR: The -post-date option must be specified when using the -span-post-dates option!\n" if ($span_post_dates && ! defined($POST_DATE));
+
+$all_or_none = 0 if (defined($any));
+
+$LOGFILE = $JOB->logfile;
+
+$APP_DIR_TOP = $JOB->app_dir if (! defined($APP_DIR_TOP));
+$BIN_DIR = "$APP_DIR_TOP/bin";
+
+mydie "ERROR: The mandatory -app-dir parameter was not specified and is not set in the JOB_CONFIG table!\n" if (! defined($APP_DIR_TOP));
+mydie "ERROR: Application directory $APP_DIR_TOP does not exist!\n" if (! -e $APP_DIR_TOP);
+
+if (! defined($DELIVERABLE_DIR)) {
+	$DELIVERABLE_DIR = $JOB->deliv_dir;
+}
+
+if ((! -e $DELIVERABLE_DIR) && ! mkpath $DELIVERABLE_DIR) {
+	mydie "ERROR: Cannot create output directory $DELIVERABLE_DIR : $!\n";
+}
+
+mydie "ERROR: Deliverables directory $DELIVERABLE_DIR does not exist!\n" if (! -e $DELIVERABLE_DIR);
+mydie "ERROR: Cannot write to deliverable directory $DELIVERABLE_DIR\n" if (! -w $DELIVERABLE_DIR);
+
+foreach my $tmp_dir ($ENV{TMPDIR}, $ENV{TEMPDIR}, $ENV{TMP}, $ENV{TEMP}, '/temp', '/tmp') {
+	next if (! defined($tmp_dir));
+
+	my $t_dir = $tmp_dir;
+	$t_dir =~ s/\/$//;
+
+	if ((-d $t_dir) && (-w $t_dir)) {
+		$TEMP_OUTPUT_DIR = $t_dir;
+		last;
+	}
+}
+
+if (! defined($TEMP_OUTPUT_DIR)) {
+	$TEMP_OUTPUT_DIR = "$DELIVERABLE_DIR/temp";
+}
+
+if (! -d $TEMP_OUTPUT_DIR) {
+	if (! mkdir $TEMP_OUTPUT_DIR) {
+		mydie "ERROR: Cannot temp directory $TEMP_OUTPUT_DIR : $!\n";
+	}
+}
+
+if (! -w $TEMP_OUTPUT_DIR) {
+		mydie "ERROR: No write permission for temp directory $TEMP_OUTPUT_DIR\n";
+}
+
+eval '$LOGGER = $JOB->logger' || mydie "Cannot get logger: $@";
+
+# setup default failure/success email addresses
+$FAILURE_EMAIL = $JOB->failure_email if (! defined($FAILURE_EMAIL));
+$SUCCESS_EMAIL = $JOB->success_email if (! defined($SUCCESS_EMAIL));
+
+$HEADER = $JOB->header_name;
+$TRAILER = $JOB->trailer_name;
+
+if (defined($HEADER)) {
+	if ($HEADER =~ /^$APP_ID/ ) {
+		$custom_header = 1;
+	} elsif ((length($HEADER) > 0) && ($HEADER !~ /^(std|standard)/i)) {
+		mydie "ERROR: header name in job_config table is '$HEADER', which is not supported. It must begin with '$APP_ID' for a custom header, or can be NULL or 'STANDARD' for the standard header\n";
+	}
+}
+
+if (defined($TRAILER)) {
+	if ($TRAILER =~ /^$APP_ID/ ) {
+		$custom_trailer = 1;
+	} elsif ((length($TRAILER) > 0) && ($TRAILER !~ /^(std|standard)/i)) {
+		mydie "ERROR: trailer name in job_config table is '$TRAILER', which is not supported. It must begin with '$APP_ID' for a custom trailer, or can be NULL or 'STANDARD' for the standard trailer\n";
+	}
+}
+
+if ( ($custom_header) || ($custom_trailer) ) {
+    my $HEADER_TRAILER_FILE = $APP_DIR_TOP . "/bin/" . lc($APP_ID) . "_header_trailer.pl";
+    mydie "ERROR: Header Trailer script $HEADER_TRAILER_FILE does not exist!\n" if (! -e $HEADER_TRAILER_FILE);
+    require $HEADER_TRAILER_FILE;
+}
+
+my ($seconds_since_last_creation, $hours_since_last_creation);
+my $current_time = DateTime->now(time_zone => 'local');
+
+if (already_concatenating($no_mutex)) {
+	myexit($exit_success);
+}
+
+if (! $no_mutex) {
+	if ($JOB->concat_begin) {
+		$CONCATENATING = 1;
+	} else {
+		$JOB->log(message => "A file concatenation attempt for $APP_ID was skipped because another concatenation process for this application attempted to start at the same time as this one.", log_type => 'DEBUG', email_subject => 'skipped concatenation', event_code => 'CCSKIP');
+		myexit($exit_success);
+	}
+}
+
+my $last_creation_time = $JOB->last_creation_datetime;
+
+if (defined($last_creation_time)) {
+	$LOGGER->info("Last concatenation time for $APP_ID = $last_creation_time");
+	$seconds_since_last_creation = ($current_time->subtract_datetime_absolute($last_creation_time))->seconds;
+	$hours_since_last_creation = sprintf('%.2f', $seconds_since_last_creation / 3600);
+	$LOGGER->info("It has been $hours_since_last_creation hours since the last concatenation.");
+}
+
+######
+
+eval { $TODAY_DATE = DateTime->now(time_zone => 'local')->strftime('%Y%m%d'); };
+
+if ($@) {
+	mydie "Could not obtain today's date via DateTime module\n";
+}
+
+my @ready_opts = ();
+my ($POST_DATES, $post_date_spec, %requested_post_dates);
+
+if (defined($POST_DATE)) {
+	$POST_DATE = uc($POST_DATE);
+
+	if ($POST_DATE eq 'PRIOR') {
+
+	} else {
+
+		my $post_date_list = BLUELITE::Job->post_date_list($POST_DATE);
+		mydie "ERROR: Could not decipher post date of '$POST_DATE'\n" if (! defined($post_date_list));
+
+		$POST_DATES = { map { $_ => undef } @{$post_date_list}};
+		push(@ready_opts, post_date => $post_date_list);
+
+		$post_date_spec = $JOB->format_post_date_spec($POST_DATE);
+		%requested_post_dates = map { $_ => undef } @{$post_date_list};
+	}
+}
+
+if (defined($REQUEST_ID)) {
+	push(@ready_opts, request_id => $REQUEST_ID);
+}
+
+$JOB->data_source_format($data_source_format) if (defined($data_source_format));
+
+my @workers = $JOB->ready_to_deliver(@ready_opts);	# returns list of worker objects
+
+if (scalar(@workers) == 0) {
+	# no new files to concatenate
+	my $msg = "No workers need to be concatenated";
+	$msg .= " for $POST_DATE" if (defined($POST_DATE));
+	$msg .= '.';
+
+	$LOGGER->info($msg);
+	myexit($exit_success)
+}
+
+# organize workers by post date in a data structure
+my ($post_date_worker, $post_date);
+
+foreach my $worker (@workers) {
+	$post_date = $worker->post_date;
+	$LOGGER->info("Post date $post_date is ready for concatenation.") if ($check_only && ! exists($post_date_worker->{$post_date}));
+	push(@{$post_date_worker->{$post_date}}, $worker);
+};
+
+if ($all_or_none && scalar(%requested_post_dates)) {
+	my @post_dates_not_ready = grep {! exists($post_date_worker->{$_})} keys %requested_post_dates;
+
+	if (@post_dates_not_ready) {
+		$LOGGER->warn("The -all-or-none option is in effect for post date $POST_DATE, but the following post dates were either previously concatenated or are not yet ready to be concatenated: " . join(' ', sort @post_dates_not_ready) . "\nNothing was concatenated.");
+		myexit($exit_success);
+	}
+}
+
+myexit($exit_success) if ($check_only);
+
+#if (! $no_mutex) {
+#print "debug: CONCAT begin time = " . `date` . "\n";
+#	if ($JOB->concat_begin) {
+#		$CONCATENATING = 1;
+#	} else {
+#		$JOB->log(message => "A file concatenation attempt for $APP_ID was skipped because another concatenation process for this application attempted to start at the same time as this one.", log_type => 'DEBUG', email_subject => 'skipped concatenation', event_code => 'CCSKIP');
+#		myexit($exit_success);
+#	}
+#}
+
+# for each post date, concatenate all worker output files into one deliverable file
+
+my ($total_records, $total_txns, $records_added, @workers_in_output, @missing_files, $txns_processed, @skipped_workers, $file_info);
+my $record_terminator = $JOB->concat_record_terminator;
+
+if (! defined($record_terminator)) {
+	mydie "Could not determine which record terminator to use. Check CONCAT_RECORD_TERMINATOR field in JOB_CONFIG table.\n";
+}
+
+foreach my $post_date (sort keys %{$post_date_worker}) {
+	if (defined($POST_DATE)) {
+		if ($POST_DATE eq 'PRIOR') {
+			next if ($post_date ge $TODAY_DATE);
+		} elsif (! exists($POST_DATES->{$post_date})) {
+			next;
+		}
+	}
+
+	if (@missing_files = grep {defined($_->output_fname) && ! -f $_->output_fname} @{$post_date_worker->{$post_date}}) {
+		$JOB->log(log_type => 'ERROR', event_code => 'CCFAIL', email_subject => 'Missing worker files', message => "Could not concatenate post date $post_date because the following worker files are missing:\n" . join("\n", map { $_->output_fname } @missing_files) . "\n");
+		mydie("Missing worker files!\n");
+		exit(1);
+	}
+
+	# "main" concat loop
+	do {
+		
+		if (scalar(@skipped_workers) >= 1) {
+			@{$post_date_worker->{$post_date}} = @skipped_workers;
+		}
+		@skipped_workers = ();
+		my $worker_num = 0;
+
+		if (! $OUTPUT_FILE_OPEN) {
+			$total_records = 0;
+			$total_txns = undef;
+			@workers_in_output = ();
+			$file_info = start_output_file(
+				post_date => $post_date,
+				post_date_spec => $post_date_spec,
+				span_post_dates => $span_post_dates
+				);
+		}
+
+		# iterate over workers (sort by file size)
+		foreach my $worker (sort { my_size($a) <=> my_size($b) } @{$post_date_worker->{$post_date}}) {
+
+			$worker_num++;
+			$txns_processed = $worker->txn_processed; # number of txns in worker
+
+			# skip workers if we are past max number of records allowed
+			if (defined($MAX_CONCAT_INPUT_TXNS)) {
+				
+				if (defined($txns_processed)) {
+					no warnings 'uninitialized';
+
+					# if number of txns concatted thus far, plus txns that WOULD
+					# be concatted from this worker would exceeed the threshold,
+					# skip this worker (and probably all subsequent)
+					if (
+							($total_txns + $txns_processed > $MAX_CONCAT_INPUT_TXNS) &&
+							($worker_num != 1)
+						) {
+
+						$LOGGER->warn("Skipping worker " . $worker->worker_id . " containing $txns_processed txns due to max_concat_input_txns setting of $MAX_CONCAT_INPUT_TXNS");
+						push(@skipped_workers, $worker);
+						next;
+
+					}
+	
+				} else {
+					mydie "ERROR: max_concat_input_txns is set to $MAX_CONCAT_INPUT_TXNS , but txn_processed() returns NULL for worker ID " . $worker->worker_id . "\n";
+				}
+
+			}
+			
+			$records_added = concat(
+				$worker->output_fname,
+				$record_terminator,
+				$file_info->{temp_stderr_fname}
+				);
+			
+			if (! defined($records_added)) {
+				mydie "ERROR: Could not append $worker to " . $file_info->{fname_temp} . " : $! , $GzipError\n";
+			}
+
+			$total_records += $records_added;
+			$total_txns += $txns_processed if (defined($txns_processed));
+
+			push(@workers_in_output, $worker);
+		}
+
+		if (@skipped_workers || ! $span_post_dates) {
+			finish_output_file(
+				fname_temp => $file_info->{fname_temp},
+				temp_stderr_fname => $file_info->{temp_stderr_fname},
+				total_records => $total_records,
+				post_date => $post_date,
+				post_date_spec => $post_date_spec,
+				seq_num => $file_info->{seq_num},
+				check_record_count => $check_record_count,
+				total_txns => $total_txns,
+				workers_in_output => \@workers_in_output,
+				span_post_dates => $span_post_dates
+			);
+		}
+
+	} until (scalar(@skipped_workers) == 0);
+}
+
+
+if ($OUTPUT_FILE_OPEN) {
+	finish_output_file(
+		fname_temp => $file_info->{fname_temp},
+		temp_stderr_fname => $file_info->{temp_stderr_fname},
+		total_records => $total_records,
+		post_date => $post_date,
+		post_date_spec => $post_date_spec,
+		seq_num => $file_info->{seq_num},
+		check_record_count => $check_record_count,
+		total_txns => $total_txns,
+		workers_in_output => \@workers_in_output,
+		span_post_dates => $span_post_dates
+	);
+}
+
+$LOGGER->info("Completed concatenation process.") || mydie "Cannot write to log file $LOGFILE: $@";
+
+unlink($LOGFILE) if ((! $keep_log) && (! $SCREEN_ONLY) && -f $LOGFILE);
+myexit($exit_success);
+
+END {
+	if (defined($JOB) && $CONCATENATING) {
+		$CONCATENATING = 0;
+		$JOB->concat_end;
+	}
+}
+

@@ -1,0 +1,207 @@
+#!/usr/bin/perl
+
+# job_config: Basic command-line interface to updating the config table associated with the BLUELITE::Job module
+# Author: J Hess, RelayHealth
+#
+# Version 1.0 - 5/25/2011
+# - Initial release
+#
+# Version 4.7 - 12/6/2012
+# - config values displayed in sorted order
+# - no longer display parameters with empty config values
+#
+# Version 5.0 - 3/5/2014
+# - Added -no-email command-line option
+#
+# Version 6.0 - 10/31/2014
+# - Added support for "autohoc" requests (i.e. automated on-demand ad-hoc processing).
+#
+
+use BLUELITE::Job;
+use Data::Dumper;
+use strict;
+use warnings;
+use List::Util qw(max);
+
+our $PGM = $0;
+$PGM =~ s/.*\///g;
+
+our $REQUEST_ID;
+
+sub Usage {
+	print "$PGM: Update or view config settings for various applications or application groups
+
+Usage 1: $PGM [-options] -app-id app_id     column1=value1 [column2=value2] ...
+Usage 2: $PGM [-options] -group-id group_id column1=value1 [column2=value2] ...
+Usage 3: $PGM [-options] -app-id app_id     {view-only}
+
+Options:
+ -no-email
+ -request-id #
+
+Note: As a safeguard, certain columns are not supported\n";
+}
+
+
+sub show_config(@) {
+
+	my @opts = ();
+	push(@opts, request_id => $REQUEST_ID) if (defined($REQUEST_ID));
+
+	foreach my $app_id (@_) {
+
+		print "\nConfiguration for app_id '$app_id':\n\n";
+
+		my $job = BLUELITE::Job->new(app_id => $app_id, @opts) || die;
+		my $config = $job->get_config;
+
+		my $max_length = max(map { length($_) } keys %{$config});
+
+		foreach my $attribute_name (sort keys %{$config}) {
+			my $value = $config->{$attribute_name};
+			next if ((! defined($value)) || ($value =~ /^\s*$/));
+
+			# translate end-of-line characters to something displayable
+			$value =~ s/\r/\\r/g;
+			$value =~ s/\n/\\n/g;
+
+			printf("%-${max_length}s : %s\n", $attribute_name, $value);
+		}
+	}
+
+}
+
+
+if (! @ARGV) {
+	Usage;
+	exit(1);
+}
+
+use Getopt::Long;
+
+my @app_id = ();
+my @group_id = ();
+my $post_date;
+my $no_email = 0;
+
+GetOptions(
+            'app-id=s@' => \@app_id,
+            'group-id=s@' => \@group_id,
+            'no-email' => \$no_email,
+            'request-id=i' => \$REQUEST_ID
+) || exit(1);
+
+if (! @app_id && ! @group_id) {
+	print STDERR "ERROR: Neither -app-id or -group-id parameter not provided!\n\n";
+	Usage;
+	exit(1);
+}
+
+if (! @ARGV) {
+
+	if (@group_id) {
+		print STDERR "ERROR: Must provide assignments when using the -group-id parameter!\n\n";
+		Usage;
+		exit(1);
+	}
+
+	show_config(@app_id);
+	exit(0);
+}
+
+
+
+
+my @update_opts = ();
+
+push(@update_opts, app_id => [split(/\s*,\s*/, join(',', @app_id))]) if (@app_id);
+push(@update_opts, group_id => [split(/\s*,\s*/, join(',', @group_id))]) if (@group_id);
+push(@update_opts, request_id => $REQUEST_ID) if (defined($REQUEST_ID));
+
+
+my %assigns = ();
+
+foreach my $assignment (@ARGV) {
+	if ($assignment =~ /^\s*([^=]+)=(.*)$/) {
+		$assigns{"$1"} = $2;
+	} else {
+		print STDERR "$PGM: ERROR: assignment '$assignment' does not conform to 'column=value' syntax\n\n";
+		Usage;
+		exit(1);
+	}
+}
+
+my $update_result = BLUELITE::Job->update_job_config(@update_opts, assignments => \%assigns);
+
+if (! exists($update_result->{rows})) {
+	BLUELITE::Job->rollback;
+
+	if (exists($update_result->{error})) {
+		print STDERR "The following error occurred: " . $update_result->{error} . "\n";
+	} else {
+		print STDERR "Could not determine # of rows updated or retrieve an error message\n";
+	}
+
+	die "Nothing was updated!\n";
+}
+
+if (exists($update_result->{error}) && defined($update_result->{error}) && length($update_result->{error}) > 0) {
+	BLUELITE::Job->rollback;
+
+	print STDERR "The following error occurred: " . $update_result->{error} . "\n";
+	die "Nothing was updated!\n";
+}
+
+my $rows = $update_result->{rows};
+
+if ($rows <= 0) {
+	die "ERROR: Could not find any rows to update!\n";
+}
+
+my $app_id = $update_result->{app_id};
+
+print "This will update the following $rows APP_IDs in the config table:\n\n" . join("\n", @{$app_id}) . "\n\nProceed with update (y/N) ? : ";
+
+my $response = <STDIN>;
+
+if ($response !~ /^\s*(y|yes)\s*$/i) {
+	BLUELITE::Job->rollback;
+	print "Did not attempt to update anything\n";
+	exit(1);
+}
+
+my $job;
+my @emails = ();
+
+my @opts;
+
+if (defined($REQUEST_ID)) {
+	push(@opts, request_id => $REQUEST_ID);
+}
+
+foreach my $app (@{$app_id}) {
+	$job = BLUELITE::Job->new(app_id => $app, @opts);
+	my $message = "Made the following update to the config table: " . join(', ', map { "$_ = $assigns{$_}" } keys %assigns);
+	$job->log(event_code => 'JCU', log_type => 'DEBUG', to_table => 1, message => $message, commit => 0, dbh_caching => 1);
+	push(@emails, $job->warning_email) if (defined($job->warning_email));
+}
+
+BLUELITE::Job->commit;
+$job->log_dbh->commit; # committing 1 commits them ($job->log calls) all since dbh_caching was used
+
+my $message = "Warning: The following $rows APP_IDs in the config table were updated:\n\n" . join("\n", @{$app_id});
+
+if (defined($REQUEST_ID)) {
+	$message .= " (request ID $REQUEST_ID)";
+}
+
+$message .= "\n\nThe updates were:\n\n" . join(', ', map { "$_ = $assigns{$_}" } keys %assigns);
+
+BLUELITE::Job->email(
+	to => BLUELITE::Job->email_addresses(@emails),
+	subject => "WARN: Updated config table / " . $job->env,
+	msg => $message
+) if (scalar(@emails) && ! $no_email);
+
+print $message . "\n";
+

@@ -1,0 +1,347 @@
+#!/usr/bin/perl
+
+use BLUELITE::Common;
+use Getopt::Std;        # for parsing command line arguments
+
+# version info:
+# April 25, 2005 - Changed "mv" invokation to "cp -> touch -r -> rm" method
+
+our $DS_BASE_DIR = $ENV{DS_BASE_DIR};
+die "ERROR: DS_BASE_DIR environment variable is '$DS_BASE_DIR', which is not an existing directory\n" if (! ((defined($DS_BASE_DIR)) && (-d $DS_BASE_DIR)));
+
+$SOURCE_INFO{T}{IN_DIR} = '/ds/data_sources/incoming/tulsa';
+$SOURCE_INFO{T}{FMASK} = '*.dat.gz';
+
+$SOURCE_INFO{P}{IN_DIR} = '/ds/data_sources/incoming/vftp';
+$SOURCE_INFO{P}{FMASK} = '*.zip *.dat.gz';
+
+$SOURCE_INFO{INC}{IN_DIR} = '/ds/data_sources/incoming/cps';
+$SOURCE_INFO{INC}{FMASK} = '*.DOWNLOAD.IL* *.HCPSDNLD.IL* *.DOWNLOAD.PX* *.HCPSDNLD.PX*';
+$SOURCE_INFO{INC}{OUT_DIR} = "$DS_BASE_DIR/pal/lookup_data/contract_exclusions";
+
+$PCLAIMS_TOP = '/ds/data_sources/pclaims';
+$HCLAIMS_TOP = '/ds/data_sources/hospital_claims';
+
+$EXIT_CODE = 0;
+
+$WU_FILE = "$DS_BASE_DIR/common/etc/wu.move_sources";
+
+$minimum_file_age = 60 * 20;	# files wont be moved if modified within the last $minimum_file_age seconds
+
+$PGM = $0;
+$PGM =~ s!^.*/!!;
+
+sub usage() {
+
+	print "Usage: $PGM [-t] -s T|P|INC [-o] [-q] -a|YYYYMM
+Note:	-o means overwrite existing OLDER files
+	-a means move all files regardless of year and month
+	-s means source to move (T for Tulsa, P for Proxymed)
+	-t means test only (only displays move commands, does not actually move or rename anything
+	-q means quiet mode\n";
+}
+
+if (! defined($ARGV[0])) {
+	&usage;
+	exit(0);
+}
+
+getopts('-as:otdq');
+
+if (defined($opt_d)) {
+	$DEBUG = 1;
+}
+
+if (defined($opt_q)) {
+	$quiet_mode = 1;
+}
+
+if (defined($opt_o)) {
+	$overwrite_older_files = 1;
+} else {
+	$overwrite_older_files = 0;
+}
+
+if (defined($opt_a)) {
+	$do_all_yyyymm = 1;
+	$date_request_text = 'ALL';
+} else {
+	$do_all_yyyymm = 0;
+}
+
+if ($ARGV[0] =~ /^[0-9][0-9][0-9][0-9][0-9][0-9]$/) {
+	$requested_yyyymm = $ARGV[0];
+	$date_request_text = $requested_yyyymm;
+	$do_all_yyyymm = 0;
+} elsif (! $do_all_yyyymm) {
+	die "ERROR: Must specify -a or valid YYYYMM\n";
+}
+
+
+if (defined($opt_s)) {
+	$SOURCE = $opt_s;
+	$source_dir = $SOURCE_INFO{$SOURCE}{IN_DIR};
+
+	if (! defined($source_dir)) {
+		die "ERROR: Source value of $SOURCE is not valid.\n";
+	}
+} else {
+	die "ERROR: Must specify source via -s option\n";
+}
+
+if (defined($opt_t)) {
+	$test_only = 1;
+} else {
+	$test_only = 0;
+}
+
+chdir($source_dir) || die "ERROR: Unable to cd to $source_dir: $!\n";
+
+if (! -w $source_dir) {
+	die "ERROR: File movement did not begin because no write permission exists for source directory $source_dir\n";
+}
+
+foreach $curr_name (glob($SOURCE_INFO{$SOURCE}{FMASK})) {
+
+	$new_full_name = '';
+
+	if ($SOURCE eq 'INC') {
+		if ($curr_name =~ /^\$?([^.]+)[.](DOWNLOAD|HCPSDNLD)[.]([^0-9]+)([0-9][0-9])([0-9][0-9])([0-9][0-9])[^0-9]*$/i) {
+			($prefix, $root, $suffix, $yy, $mm, $dd) = ($1, $2, $3, $4, $5, $6);
+			$REQUESTED_YEAR_MONTH = substr($requested_yyyymm, 2, 4);	# YYMM
+			$FILE_YEAR_MONTH = "${yy}${mm}";
+			$new_full_name = $SOURCE_INFO{$SOURCE}{OUT_DIR} . "/${prefix}.${root}.${suffix}${yy}${mm}${dd}.gz";
+		}
+	} else {
+		$REQUESTED_YEAR_MONTH = $requested_yyyymm;	# YYYYMM
+		$fname_date = &get_filename_date($curr_name);
+		($yyyy, $mm) = (substr($fname_date, 0, 4), substr($fname_date, 2, 2));
+		$FILE_YEAR_MONTH = "${yyyy}${mm}";
+
+		$new_full_name = &get_std_full_filename($curr_name);
+	}
+
+	$curr_full_name = "${source_dir}/${curr_name}";
+
+	if (length($new_full_name) > 0) {
+		$YYYYMM = "${yyyy}${mm}";
+
+		if (($FILE_YEAR_MONTH eq $REQUESTED_YEAR_MONTH) or ($do_all_yyyymm)) {
+
+			$output_dir = $new_full_name;
+			$output_dir =~ s/\/[^\/]+$//;
+
+			if ((! -d $output_dir) && (! -l $output_dir)) {
+				die "ERROR: File movement did not begin because output directory $output_dir does not exist!\n";
+
+				# add sym link creation logic later
+
+				#print STDERR "Note: Creating output directory $output_dir\n";
+				#system('mkdir', $output_dir);
+
+				#if (! -d $output_dir) {
+				#	die "ERROR: File movement did not begin because output directory $output_dir could not be created\n";
+				#}
+			}
+
+			if (! -w $output_dir) {
+				die "ERROR: File movement did not begin due to no write permission on output directory $output_dir\n";
+			}
+
+			$move_list{$curr_full_name} = $new_full_name;
+		}
+	}
+}
+
+if ($DEBUG) {
+	print STDERR "Source directory: $source_dir\n";
+	print STDERR "Source data: $opt_s\n";
+	print STDERR "Month requested: $date_request_text\n\n";
+}
+
+$curr_time = time;	# get current time
+
+foreach $old_file (keys %move_list) {
+
+	if (! -r $old_file) {
+		print STDERR "Warning: No read permission for file $old_file\n";
+		delete $move_list{$old_file};
+		$EXIT_CODE = 1;
+		next;
+	}
+
+	$new_file = $move_list{$old_file};
+
+	if (! (length($new_file) > 0)) {
+		print STDERR "Warning: Could not determine new location or name for file $old_file\n";
+		delete $move_list{$old_file};
+		$EXIT_CODE = 1;
+		next;
+	}
+
+	($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$fsize,$atime,$old_mtime,$ctime,$blksize,$blocks) = stat($old_file);
+	($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$fsize,$atime,$new_mtime,$ctime,$blksize,$blocks) = stat($new_file);
+
+	if (-f $new_file) {
+		if ($new_mtime < $old_mtime) {
+			if ($overwrite_older_files) {
+				print STDERR "Note: older existing file will be overwritten: $new_file\n";
+			} else {
+				print STDERR "Warning: older existing file will NOT be overwritten: $new_file . Use -o to override\n";
+				delete $move_list{$old_file};
+				$EXIT_CODE = 1;
+				next;
+			}
+		} else {
+			print STDERR "ERROR: newer existing file will NOT be overwritten: $new_file . Incoming file = $old_file\n";
+			delete $move_list{$old_file};
+			$EXIT_CODE = 1;
+			next;
+		}
+	}
+
+	if (exists($unique_output_files{$new_file})) {
+		print STDERR "ERROR: A new location the output file $new_file was derived from two different input files:
+$old_file
+$unique_output_files{$new_file}
+Those files will NOT be moved\n";
+		delete $move_list{$old_file};
+		delete $move_list{$unique_output_files{$new_file}};
+		next;
+	} else {
+		$unique_output_files{$new_file} = $old_file;
+	}
+
+	if ($old_mtime > ($curr_time - $minimum_file_age)) {
+		print STDERR "Warning: The following file has been modified within the last $minimum_file_age seconds seconds, and will not be moved: $old_file\n";
+		delete $move_list{$old_file};
+		next;
+	}
+
+	$preliminary_num_files++;
+}
+
+if (! ($preliminary_num_files > 0)) {
+	if (! $quiet_mode) {
+		print STDERR "No $opt_s files to move\n";
+	}
+
+	exit(0);
+}
+
+if ($SOURCE ne 'INC') {
+	$WU_FILE_DONE = $WU_FILE . '.done';
+
+	open(WU, "> $WU_FILE") || die "Cannot create $WU_FILE : $!\n";
+
+	foreach $old_file (keys %move_list) {
+		print WU $old_file . "\n" || die "Cannot write to $WU_FILE : $!\n";
+	}
+
+	close(WU);
+
+	if (-f $WU_FILE_DONE) {
+		if (unlink($WU_FILE_DONE) != 1) {
+			die "Cannot remove $WU_FILE_DONE : $!\n";
+		}
+	}
+
+	print STDERR "Checking compression integrity of $preliminary_num_files files\n";
+
+	$ret = system("prun2 -q -r rx -f $WU_FILE gunzip -t %p > /dev/null 2>&1");
+	$ret = $ret >> 8;
+
+	if (! -f $WU_FILE_DONE) {
+		die "Unable to determine how many files passed zip integrity. File $WU_FILE_DONE missing\n";
+	}
+
+	open(WU_DONE, $WU_FILE_DONE) || die "Unable to open $WU_FILE_DONE : $!\n";
+
+	while (<WU_DONE>) {
+		chop;
+		($done_filename) = split(',', $_);
+
+		$goodzip_files{$done_filename} = 1;
+	}
+
+	close(WU_DONE);
+
+	print STDERR "\n";
+
+	foreach $old_file (keys %move_list) {
+
+		if (! exists($goodzip_files{$old_file})) {
+			delete $move_list{$old_file};
+
+			print STDERR "ERROR: The following file did not pass zip integrity check: $old_file\n";
+
+			$EXIT_CODE = 1;
+		}
+	}
+}
+
+$total_file_size = 0;
+$files_moved = 0;
+
+foreach $old_file (keys %move_list) {
+
+	$file_ok = 0;
+	$new_file = $move_list{$old_file};
+
+	$bname_old_file = $old_file;
+	$bname_old_file =~ s!^.*/!!;
+
+	print STDERR "move $bname_old_file to ${new_file} ... ";
+
+	($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$fsize,$atime,$mtime,$ctime,$blksize,$blocks) = stat($old_file);
+
+	if (! $test_only) {
+		if ($SOURCE ne 'INC') {
+			move_file($old_file, $new_file);
+		} else {
+			$type = `file '$old_file'`;
+
+			if ($type =~ /text/i) {
+				$ret = system("gzip -c '$old_file' > $new_file");
+				$ret = $ret >> 8;
+
+				if ($ret == 0) {
+					if (-f $new_file) {
+						unlink($old_file);
+					}
+				} else {
+					print STDERR "ERROR: Unable to gzip $old_file to $new_file\n";
+					unlink($new_file);
+					$EXIT_CODE = 1;
+				}
+			} else {
+				move_file($old_file, $new_file);
+			}
+		}
+
+		if (-f $old_file) {
+			print STDERR "ERROR: Unable to move $old_file to $new_file\n";
+			$EXIT_CODE = 1;
+		} elsif (! -f $new_file) {
+			print STDERR "ERROR: Unable to move $old_file to $new_file\n";
+			$EXIT_CODE = 1;
+		} else {
+			$file_ok = 1;
+			$files_moved++;
+			print STDERR "done\n";
+		}
+	} else {
+		$file_ok = 1;
+		print STDERR "test ok\n";
+	}
+
+	if ($file_ok) {
+		$total_file_size += $fsize;
+	}
+}
+
+print STDERR "\nTotal size of moveable files: $total_file_size\n";
+print STDERR "Files moved: $files_moved\n";
+
+exit($EXIT_CODE);
+

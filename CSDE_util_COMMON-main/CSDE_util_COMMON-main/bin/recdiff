@@ -1,0 +1,1988 @@
+#!/usr/bin/perl
+
+# recdiff: analyze, summarize, and detail differences between two similarly-formatted delimited flat files
+#
+# Author: J. Hess, RelayHealth
+# Initial release: 1/30/2009
+#
+# Version 1.0 - 1/30/2009
+# - Initial release
+#
+# Version 1.1 - 5/22/2009
+# - Fixed bug with recdif .... file1.dat file2.dat usage
+# - Added single-quotes around delimiter character on sort command-line
+# - Added check for sort failure on file handle close calls
+#
+# Version 1.2 - 1/26/2010
+# - Fixed bug where "division by zero" would appear if no comparisons could be made
+# - Fixed bug where pipe and other special characters could not be used as a delimiter
+#
+# Version 1.3 - 3/16/2010
+# - Fixed bug where "sort command failed" would sometimes be encountered due to closing
+# the sort pipe before all of it had been read.
+#
+# Version 1.4 - 3/25/2010
+# - Added -show-exclusive-keys command line option
+#
+# Version 1.5 - 5/19/2010
+# - Added -decrypt-field command line option (to avoid requirement to create config file for field decryption)
+#
+# Version 1.6 - 7/22/2010
+# - Fixed bug that inflated key counts when dupes are encountered
+# - Added -show-duplicate-keys command line option
+# - Duplicate keys are no longer displayed by default
+#
+# Version 1.61 7/23/2010
+# - Fixed bug that inflated some percentages in the report
+#
+# Version 1.62 8/16/2010
+# - Fixed bug that sometimes inflated the percentages in the "Field-count stats" section.
+# It was using the # of compared keys as the denominator instead of the number of compared records.
+#
+# Version 2.0 8/10/2012
+# - Added xml-formatted config file option with layout and AutoQA sections.
+# - Some command-line opts can now be specified in xml config (e.g. header/trailer regex, key fields, num-fields, ignore)
+# - Field names can now be defined in xml config instead of previous non-xml config
+# - AutoQA section in xml config can be used to specify difference constraints. Exceeding the constraints
+#   will cause recdiff to exit with error status, for automated QA.
+# - Added -input2-dir command-line option, which will find previous file so that -input2 option can be omitted
+#
+# Version 2.1 9/7/2012
+# - Fixed dupe counting bug where key was not counted as dupe when it was dupe in one file but exists as non-dupe in other file
+# - Added # of records compared to report
+# - Renamed variable for # of records compared
+#
+# Version 2.2 10/2/2012
+# - Tweaked various code/functions to improve overall performance
+# - Prefixed sort command with LANG=POSIX to preserve collating sequence locale of traditional sort (i.e. uppercase comes before lowercase).
+# Prior to this, incorrect key stats could be reported on a RHEL6 system.
+#
+
+use Getopt::Long;
+eval "use BLUELITE::Deid::Std_Encryption";
+use Data::Dumper;
+use XML::Simple;
+use XML::LibXML;
+use List::Util qw(min max);
+use Params::Validate qw(:all);
+use File::Basename;
+use File::stat;
+
+no strict;
+no warnings;
+
+#use strict;
+#use warnings;
+
+my $TOP_DIFF_COMBINATIONS_TO_SHOW = 3;
+our $MAX_ID_LENGTH = 30;
+our $DISABLE_DECRYPTION = 0;
+our $DEFAULT_XSD = 'recdiff.xsd';
+our $REQUESTED_XSD;
+our $PGM = $0;
+$PGM =~ s/.*\///g;
+
+our $VERSION = '2.2';
+our $VERSION_DATE = '10/2/2012';
+our $VERSION_COPYRIGHT = 'RelayHealth';
+
+my $start_time = time;
+
+sub Usage() {
+	my $common_args = "-delimiter D -num-fields # -key # [-key # ..] [-options]";
+
+	print "Usage 1: $PGM $common_args file1 file2\n";
+	print "Usage 2: $PGM $common_args -input1 file [-input1 file ..] -input2 file [-input2 file ..]\n";
+	print "\n";
+	print "a) D may be any single character or a 2 character hex code (e.g. 'EC')\n";
+	print "b) -key numbers must be positive integers. 1st key index is 1.\n";
+	print "c) ONLY records with matching key fields are compared.\n";
+	print "\nOptions:
+	[-config fname.xml]      {If used, these are optional: -delimiter, -num-fields, -key}
+	[-num-sample-records #]
+	[-decrypt-type DT]       {DT supported: WK}
+	[-min-num-fields n]
+	[-header-regex RE]
+	[-trailer-regex RE]
+	[-ignore-regex RE]
+	[-disable-decryption]
+	[-top-diffs #]           {defaults to $TOP_DIFF_COMBINATIONS_TO_SHOW}
+	[-ignore-field #]        [-ignore-field #] [...]
+	[-decrypt-field #]       [-decrypt-field #] [...]
+	[-show-exclusive-keys]   {Lists all keys exclusive to each file}
+	[-show-duplicate-keys]   {Lists all duplicate keys in each file}
+	[-xsd fname.xsd]         Verify fname.xml structure against fname.xsd {default \$RECDIFF_XSD}\n";
+
+}
+
+sub pct2dec($) {
+  my $pct = shift;
+
+	no warnings 'uninitialized';
+
+	if (defined($pct) && ($pct =~ /^\s*(\d+)([.]\d+)?\s*%\s*$/)) {
+		my $val = "${1}${2}";
+		return $val / 100 if ($val >= 0 && $val <= 100);
+	}
+
+	return undef;
+}
+
+sub get_field_index($$) {
+	my ($name, $fields) = @_;
+
+	foreach my $index (keys %{$fields}) {
+		return $index if ($fields->{$index}->{name} eq $name);
+	}
+
+	return undef;
+}
+
+
+sub get_xsd_filename() {
+
+	no warnings 'uninitialized';
+
+	if (defined($REQUESTED_XSD) && (! -r $REQUESTED_XSD)) {
+		die "$PGM: ERROR: Requested XSD file $REQUESTED_XSD cannot be accessed!\n";
+	}
+
+	foreach my $xsd_file ($REQUESTED_XSD, $ENV{RECDIFF_XSD}, $DEFAULT_XSD, 'recdiff.xsd') {
+		return $xsd_file if (defined($xsd_file) && (-f $xsd_file));
+	}
+
+	return undef;
+}
+
+
+sub get_config(%) {
+  my %option = validate_with
+    ( params  => \@_,
+      spec    => {
+									CONFIG_FILE => { type => SCALAR, optional => 1 },
+									DELIMITER => { type => SCALAR, optional => 1 },
+									NUM_FIELDS => { type => SCALAR, optional => 1 },
+									MIN_NUM_FIELDS => { type => SCALAR, optional => 1 }, 
+									HEADER_REGEX =>  { type => SCALAR, optional => 1 },
+									TRAILER_REGEX =>  { type => SCALAR, optional => 1 },
+									IGNORE_REGEX => { type => ARRAYREF, optional => 1 },
+									IGNORE_FIELDS => { type => ARRAYREF, optional => 1},
+									DECRYPT_FIELDS => { type => ARRAYREF, optional => 1},
+									KEYS => { type => ARRAYREF, optional => 1}
+                },
+      called  => 'read_config',
+      normalize_keys => sub { my $k = shift; $k =~ s/^-//; return uc $k }
+  );
+
+	my $config_info;
+
+	if (exists($option{CONFIG_FILE})) {
+		$config_info = read_config_file($option{CONFIG_FILE});
+		die "ERROR: Could not parse config file " . $option{CONFIG_FILE} . "\n" if (! defined($config_info));
+	} else {
+		$config_info = { layout => {} };
+	}
+
+	my $layout = $config_info->{layout};
+	foreach my $layout_parameter ('DELIMITER', 'NUM_FIELDS', 'MIN_NUM_FIELDS', 'HEADER_REGEX', 'TRAILER_REGEX') {
+		if (exists($option{$layout_parameter})) {
+#print "debug: $layout_parameter = $option{$layout_parameter}\n";
+			$layout->{lc($layout_parameter)} = $option{$layout_parameter};
+		}
+	}
+
+	if (exists($option{IGNORE_REGEX})) {
+		for(my $i = 0; $i < @{$option{IGNORE_REGEX}}; $i++) {
+			$layout->{ignore}->{cmdline_$i} = $option{IGNORE_REGEX}->[$i];
+		}
+	}
+
+	my $fields = $layout->{fields};
+
+
+	foreach my $field_num (@{$option{IGNORE_FIELDS}}) {
+		$fields->{$field_num}->{ignore} = 1;
+	}
+
+	$layout->{IGNORE} = [grep { $fields->{$_}->{ignore} == 1 } (keys %{$fields})];
+
+	print "ignored fields: " . join(', ', @{$layout->{IGNORE}}) . "\n" if (@{$layout->{IGNORE}});
+
+	foreach my $field_num (@{$option{DECRYPT_FIELDS}}) {
+		$fields->{$field_num - 1}->{encrypted} = 1;
+	}
+
+	$layout->{ENCRYPTED} = [grep { $fields->{$_}->{encrypted} == 1 } (keys %{$fields})];
+
+	print "encrypted fields: " . join(', ', @{$layout->{ENCRYPTED}}) . "\n" if (@{$layout->{ENCRYPTED}});
+
+	if (exists($option{KEYS})) {
+		foreach my $field_index (keys %{$fields}) {
+			$fields->{$field_index}->{key} = 0;
+		}
+
+		foreach my $field_index (@{$option{KEYS}}) {
+			$fields->{$field_index - 1}->{key} = 1;
+		}
+	}
+
+	# find fields that are keys and add one to each position (for sort command)
+	foreach my $field_id (sort { $a <=> $b } keys %{$fields}) {
+		push(@{$layout->{KEYS}}, $field_id + 1) if ($fields->{$field_id}->{key});
+	}
+
+	$layout->{min_num_fields} = $layout->{num_fields} if (! exists($layout->{min_num_fields}));
+
+	foreach my $required_layout_parameter ('delimiter', 'num_fields', 'min_num_fields', 'KEYS') {
+		if (! exists($layout->{$required_layout_parameter})) {
+			die "$PGM: ERROR: '$required_layout_parameter' parameter was not provided!\n";
+		}
+	}
+
+	print "key fields: " . join(', ', @{$layout->{KEYS}}) . "\n";
+
+	if ($layout->{delimiter} =~ /^[0-9A-F][0-9A-F]$/i) {
+		$layout->{delimiter} = chr(hex($layout->{delimiter}));
+	}
+
+	my $num_fields = $layout->{'num_fields'};
+
+	if ($num_fields < 1) {
+		die "$PGM: ERROR: num_fields is $num_fields, which is invalid. Must be at least 1\n";
+	}
+
+	my $min_num_fields = $layout->{'min_num_fields'};
+
+	if (($min_num_fields < 1) || ($min_num_fields > $num_fields)) {
+		die "$PGM: ERROR: min_num_fields is $min_num_fields, which is invalid. Must be between 1 and ${num_fields}.\n";
+	}
+
+#print Dumper $layout;
+
+	#push(@{$layout->{IGNORE_REGEX}}, );
+
+	my ($autoqa, $attributes, $qa_field);
+	$autoqa = $config_info->{autoqa} if (exists($config_info->{autoqa}));
+
+	if (defined($autoqa)) {
+		$attributes = $autoqa->{attributes} if (exists($autoqa->{attributes}));
+
+		if (defined($attributes)) {
+			if (exists($attributes->{default_max_diff})) {
+				foreach my $field_index (keys %{$fields}) {
+					$fields->{$field_index}->{qa_max_diff_pct} = pct2dec($attributes->{default_max_diff});
+				}
+			}
+
+			$qa_field = $attributes->{qa_field} if (exists($attributes->{qa_field}));
+
+#print Dumper $qa_field;
+#print Dumper $fields;
+
+			if (defined($qa_field)) {
+				foreach my $field_name (keys %{$qa_field}) {
+					my $field_index = get_field_index($field_name, $fields);
+
+					if (defined($field_index)) {
+						$fields->{$field_index}->{qa_max_diff_pct} = pct2dec($qa_field->{$field_name}->{max_diff}) if (exists($qa_field->{$field_name}->{max_diff}));
+					} else {
+						die "ERROR: qa_field '$field_name' does not exist as a field in the layout section\n";
+					}
+				}
+			}
+		}
+	}
+
+	return $config_info;
+}
+
+
+sub read_config_file($) {
+  my $fname = shift;
+
+	die "Config file '$fname' does not exist!\n" if (! -f $fname);
+
+	# see if this is a parseable xml file
+
+	my $xml_doc;
+	eval { $xml_doc = XML::LibXML->new->parse_file($fname) };
+
+	if (! defined($xml_doc)) {
+		print STDERR "ERROR: Could not parse xml config file $fname: $@\n";
+		return undef;
+	}
+
+	print "Using xml config file $fname\n";
+
+	my $xsd_file = get_xsd_filename();
+
+	if (defined($xsd_file)) {
+
+		print "Validating xml config file against XSD file $xsd_file\n";
+
+		# guarantee that the xml config file adheres to the structure defined in xsd file
+		my $xml_schema;
+		eval { $xml_schema = XML::LibXML::Schema->new(location => $xsd_file) };
+
+		if (! defined($xml_schema)) {
+			print STDERR "ERROR: Could not interpret or open XSD file $xsd_file : $! $@\n";
+			return undef;
+		}
+
+		my $validation_status = 1;
+
+		eval { $validation_status = $xml_schema->validate($xml_doc); };
+
+		if (($validation_status != 0) || ($@)) {
+			print STDERR "ERROR: Validation of config file $fname failed schema defined in $xsd_file \n$@\n";
+			return undef;
+		}
+	} else {
+		print STDERR "WARNING: Unable to attempt validation of config file $fname because XSD file could not be located.\n";
+	}
+
+	# read validated xml file into $ref data structure
+	my $ref;
+	eval { $ref = XMLin($fname, KeyAttr => { field => 'id', ignore => 'id', 'qa_field' => 'id' }, ForceArray => ['field', 'qa_field', 'ignore']) };
+
+	if (! defined($ref)) {
+		print STDERR "Could not open config file '$fname' : $@\n";
+		return undef;
+	}
+
+#	print Dumper $ref;
+
+	my $field_config;
+	my @keys = ();
+
+	if (exists($ref->{layout})) {
+		my $layout = $ref->{layout};
+
+		my $num_expected_fields;
+		$num_expected_fields = $layout->{num_fields} if (exists($layout->{num_fields}));
+
+		if (exists($layout->{field})) {
+			my $fields = $layout->{field};
+
+			foreach my $field_id (keys %{$fields}) {
+				my $field_info = $fields->{$field_id};
+				my $index = $field_info->{num};
+
+				if ($index < 1) {
+					print STDERR "Field $field_id has position 'num' of $index, which is invalid. Lowest 'num' should be 1!\n";
+					return undef;
+				}
+
+				$index--;
+
+				if (exists($field_config->{$index})) {
+					print STDERR "Fields '$field_id' and '" . $field_config->{$index}->{id} . "' both have field num of '$index'\n";
+					return undef;
+				}
+
+				my $key = 0;
+
+				if (exists($field_info->{key})) {
+					my $key_val = $field_info->{key};
+
+					if ($key_val =~ /^\s*(y|yes|true|1)\s*$/i) {
+						$key = 1;
+						push(@keys, $index);
+					} elsif ($key_val =~ /^\s*(n|no|false|0)\s*$/i) {
+						$key = 0;
+					} else {
+						print STDERR "Key attribute of layout field '$field_id' has invalid value of '$key_val'. Must be 1 or 0.\n";
+						return undef;
+					}
+				}
+
+				my $ignore = 0;
+
+				if (exists($field_info->{ignore})) {
+					my $ignore_val = $field_info->{ignore};
+
+					if ($ignore_val =~ /^\s*(y|yes|true|1)\s*$/i) {
+						$ignore = 1;
+					} elsif ($ignore_val =~ /^\s*(n|no|false|0)\s*$/i) {
+						$ignore = 0;
+					} else {
+						print STDERR "Ignore attribute of layout field '$field_id' has invalid value of '$ignore_val'. Must be 1 or 0.\n";
+						return undef;
+					}
+				}
+
+				$field_config->{$index} = {
+					id => $field_id,
+					ignore => $ignore,
+					encrypted => 0,
+					name => $field_id,
+					key => $key
+				};
+			}
+
+			my $min_field_num = min(keys %{$field_config});
+
+			if ($min_field_num != 0) {
+				print STDERR "Field num 1 is missing in layout!\n";
+				return undef;
+			}
+
+			my $max_field_num = max(keys %{$field_config});
+
+			if (defined($num_expected_fields) && $max_field_num > $num_expected_fields) {
+				print STDERR "Max field # defined in layout is $max_field_num, but declared num_fields is $num_expected_fields !\n";
+				return undef;
+			}
+
+			if (! defined($num_expected_fields)) {
+				$num_expected_fields = $max_field_num;
+				$layout->{num_fields} = $max_field_num;
+			}
+
+			my $width = length($num_expected_fields);
+
+			for(my $i = 1; $i <= $num_expected_fields; $i++) {
+
+				if (! exists($field_config->{$i})) {
+
+					my $id = sprintf("field_%0${width}d", $i + 1);
+
+					$field_config->{$i} = {
+						id => $id,
+						ignore => 0,
+						encrypted => 0,
+						name => $id,
+						key => 0
+					};
+				};
+			}
+
+			delete $layout->{field};
+			$layout->{fields} = $field_config;
+		}
+	}
+
+	$ref->{keys} = \@keys;
+
+#	print "config is good\n";
+#print Dumper $ref;
+	return $ref;
+}
+
+sub _normalize_fname($) {
+  my $fname = shift;
+	my $re = basename($fname, '.gz');
+	$re =~ s/\d/D/g;
+
+	return $re;
+}
+
+# find similarly-named file on $search_dir that was created prior to $current_file
+sub get_previous_file($$) {
+  my ($search_dir, $current_file) = @_;
+
+	my $file_re = _normalize_fname($current_file);
+	my $curr_file_stat = stat($current_file);
+	my $curr_file_mtime = $curr_file_stat->mtime;
+
+	my @candidate_files = ();
+	opendir(DIR, $search_dir) || die "$PGM: ERROR: Cannot open directory $search_dir to search for previous file : $!\n";
+
+	while ($_ = readdir DIR) {
+		my $full_fname = "${search_dir}/$_";
+		my $stat = stat($full_fname);
+		my $orig_fname = $full_fname;
+
+		my $fname = _normalize_fname($_);
+		next if ($fname !~ /^$file_re$/);
+
+		next if ($stat->mtime >= $curr_file_mtime);
+
+		push(@candidate_files, { fname => $orig_fname, mtime => $stat->mtime });
+	}
+
+	return undef if (! @candidate_files);
+
+	foreach my $file (sort { $b->{mtime} <=> $a->{mtime} } @candidate_files) {
+		return $file->{fname};
+	}
+}
+
+
+my (@cmd_keys, $cmd_delimiter, @input1, @input2, $cmd_num_fields, $config_file, $num_sample_records, $decrypt_type, $cmd_min_num_fields, $cmd_header_regex, $cmd_trailer_regex, $input2_dir);
+
+my $show_exclusive_keys = 0;
+my $show_duplicate_keys = 0;
+my @cmd_ignore_regex = ();
+
+if (scalar(@ARGV) == 0) {
+	print "This is $PGM, v$VERSION, $VERSION_DATE, Copyright $VERSION_COPYRIGHT\n\n";
+
+	&Usage();
+	exit(1);
+}
+
+my @cmd_ignore_fields = ();
+my @cmd_decrypt_fields = ();
+
+GetOptions(
+            'key=i@' => \@cmd_keys,
+						'delimiter=s' => \$cmd_delimiter,
+						'input1=s@' => \@input1,
+						'input2=s@' => \@input2,
+						'input2-dir=s' => \$input2_dir,
+						'num-fields=i' => \$cmd_num_fields,
+						'config=s' => \$config_file,
+						'num-sample-records=i' => \$num_sample_records,
+						'ignore-field=i@' => \@cmd_ignore_fields,
+						'decrypt-field=i@' => \@cmd_decrypt_fields,
+						'decrypt-type=s' => \$decrypt_type,
+						'min-num-fields=i' => \$cmd_min_num_fields,
+						'header-regex=s' => \$cmd_header_regex,
+						'trailer-regex=s' => \$cmd_trailer_regex,
+						'ignore-regex=s@' => \@cmd_ignore_regex,
+						'disable-decryption' => \$DISABLE_DECRYPTION,
+						'top-diffs=i' => \$TOP_DIFF_COMBINATIONS_TO_SHOW,
+						'-show-exclusive-keys' => \$show_exclusive_keys,
+						'-show-duplicate-keys' => \$show_duplicate_keys,
+						'-xsd=s' => \$REQUESTED_XSD
+) || exit(1);
+
+my @config_opts = ();
+push(@config_opts, config_file => $config_file) if (defined($config_file));
+push(@config_opts, delimiter => $cmd_delimiter) if (defined($cmd_delimiter));
+push(@config_opts, num_fields => $cmd_num_fields) if (defined($cmd_num_fields));
+push(@config_opts, min_num_fields => $cmd_min_num_fields) if (defined($cmd_min_num_fields));
+push(@config_opts, header_regex => $cmd_header_regex) if (defined($cmd_header_regex));
+push(@config_opts, trailer_regex => $cmd_trailer_regex) if (defined($cmd_trailer_regex));
+push(@config_opts, ignore_regex => \@cmd_ignore_regex) if (@cmd_ignore_regex);
+push(@config_opts, ignore_fields => \@cmd_ignore_fields) if (@cmd_ignore_fields);
+push(@config_opts, decrypt_fields => \@cmd_decrypt_fields) if (@cmd_decrypt_fields);
+push(@config_opts, keys => \@cmd_keys) if (@cmd_keys);
+
+my $all_config_info = &get_config(@config_opts);
+
+die "Could not get config info!\n" if (! defined($all_config_info));
+
+my $layout = $all_config_info->{'layout'};
+my $autoqa;
+$autoqa = $all_config_info->{'autoqa'} if (exists($all_config_info->{'autoqa'}));
+
+my $supp_config_info = {};
+
+$supp_config_info->{min_num_fields} = $layout->{min_num_fields};
+$supp_config_info->{num_fields} = $layout->{num_fields};
+
+if (defined($layout->{header_regex})) {
+	$supp_config_info->{ignore_regex}->{$layout->{header_regex}} = 'header';
+}
+
+if (defined($layout->{trailer_regex})) {
+	$supp_config_info->{ignore_regex}->{$layout->{trailer_regex}} = 'trailer';
+}
+
+if (defined($layout->{ignore})) {
+	foreach my $ignore_regex_id (keys %{$layout->{ignore}}) {
+		$supp_config_info->{ignore_regex}->{$layout->{ignore}->{$ignore_regex_id}->{regex}} = "$ignore_regex_id";
+	}
+}
+
+#if (scalar(@{$layout->{ignore}}) >= 1) {
+#	foreach my $regex (@ignore_regex) {
+#		$supp_config_info->{ignore_regex}->{$regex} = "ignored via regex $regex";
+#	}
+#}
+
+my $delimiter = $layout->{delimiter};
+
+print "Field delimiter = $delimiter\n\n";
+
+if ((scalar(@input1) == 0) && (scalar(@input2) == 0)) {
+	if (scalar(@ARGV) == 0) {
+		&Usage;
+		exit(1);
+	}
+
+	if (scalar(@ARGV) == 2) {
+		@input1 = (shift @ARGV);
+		@input2 = (shift @ARGV);
+	} elsif (scalar(@ARGV) == 1) {
+		@input1 = (shift @ARGV);
+	} else {
+		die "$PGM: ERROR: Must specify 1 or 2 file names when not using -input1 or -input2 parameters\n";
+	}
+} else {
+	if (scalar(@input1) == 0) {
+		if (scalar(@ARGV) == 0) {
+			die "$PGM: ERROR: Missing -input1 parameter\n";
+		}
+
+		@input1 = @ARGV;
+		@ARGV = ();
+	} elsif (scalar(@input2) == 0) {
+
+		if (! defined($input2_dir)) {
+			if (scalar(@ARGV) == 0) {
+				die "$PGM: ERROR: Missing -input2 or -input2-dir parameter\n";
+			}
+
+			@input2 = @ARGV;
+			@ARGV = ();
+		} else {
+			if (scalar(@ARGV) >= 1) {
+				die "$PGM: ERROR: Extra -input2 file names cannot be specified when using the -input2-dir parameter\n";
+			}
+		}
+	}
+}
+
+if (scalar(@input2) == 0) {
+	if (defined($input2_dir)) {
+		if (scalar(@input1) == 1) {
+			my $input2_file = get_previous_file($input2_dir, $input1[0]);
+
+			if (defined($input2_file)) {
+				print "Found previous (input2) file $input2_file\n";
+				@input2 = ($input2_file);
+			} else {
+				die "$PGM: ERROR: Could not determine or find input2 (previous) file in directory $input2_dir\n";
+			}
+		} else {
+			die "$PGM: ERROR: Cannot specify more than one -input1 file when using the -input2-dir option\n";
+		}
+	} else {
+		die "$PGM: ERROR: No -input2 file was specified and -input2-dir option was not used\n";
+	}
+}
+
+my $config_info = $all_config_info->{layout}->{fields};
+
+our $IGNORE_INDEX;
+foreach my $i (keys %{$config_info}) {
+	$IGNORE_INDEX->{$i} = 1 if (exists($config_info->{$i}->{ignore}) && $config_info->{$i}->{ignore});
+}
+
+#print Dumper $config_info;
+#print Dumper $IGNORE_INDEX;
+
+foreach my $fname (@input1, @input2) {
+	if (! -f $fname) {
+		die "$PGM: ERROR: File '$fname' does not exist!\n";
+	}
+}
+
+print "Input 1 files: " . join(' ', @input1) . "\n";
+print "Input 2 files: " . join(' ', @input2) . "\n";
+
+my @keys = @{$layout->{KEYS}};
+
+my $sort_key_spec = join(' ', map { "-k $_,$_" } @keys);
+my $sort_command = "LANG=POSIX sort -t '$delimiter' $sort_key_spec";
+print "Files will be sorted via '$sort_command'\n\n";
+
+my $input1_file_list = join(' ', @input1);
+my $num_input1_gz_files = grep(/[.]gz$/, @input1);
+my ($read_cmd1, $read_cmd2);
+
+if ($num_input1_gz_files == scalar(@input1)) {
+	$read_cmd1 = "gunzip -c $input1_file_list | $sort_command |";
+} elsif ($num_input1_gz_files == 0) {
+	$read_cmd1 = "$sort_command $input1_file_list |";
+} else {
+	die "$PGM: ERROR: Some files for -input1 are gzip compressed and others are uncompressed, which is unsupported. All -input1 files must be gzipped or uncompressed.\n";
+}
+
+my $input2_file_list = join(' ', @input2);
+my $num_input2_gz_files = grep(/[.]gz$/, @input2);
+
+if ($num_input2_gz_files == scalar(@input2)) {
+	$read_cmd2 = "gunzip -c $input2_file_list | $sort_command |";
+} elsif ($num_input2_gz_files == 0) {
+	$read_cmd2 = "$sort_command $input2_file_list |";
+} else {
+	die "$PGM: ERROR: Some files for -input2 are gzip compressed and others are uncompressed, which is unsupported. All -input2 files must be gzipped or uncompressed.\n";
+}
+
+#print Dumper $supp_config_info->{ignore_regex};
+
+if (keys %{$supp_config_info->{ignore_regex}}) {
+	my $ignore_re = join('|', (keys %{$supp_config_info->{ignore_regex}}));
+	$read_cmd1 .= " egrep -v '$ignore_re' |";
+	$read_cmd2 .= " egrep -v '$ignore_re' |";
+}
+
+print "read command 1 = $read_cmd1\n";
+print "read command 2 = $read_cmd2\n\n";
+
+our $INPUT1 = 'input1';
+our $INPUT2 = 'input2';
+
+$INPUT1 = basename($input1[0]) if (@input1 == 1);
+$INPUT2 = basename($input2[0]) if (@input2 == 1);
+
+if ($INPUT1 eq $INPUT2) {
+	$INPUT1 = $input1[0];
+	$INPUT2 = $input2[0];
+}
+
+if (@input1 > 1 || @input2 > 1) {
+	print "input1 files: $input1_file_list\n";
+	print "input2 files: $input2_file_list\n";
+	print "\n";
+}
+
+our $INPUT1_LENGTH = length($INPUT1);
+our $INPUT2_LENGTH = length($INPUT2);
+
+my ($F1, $F2);
+
+$F1->{read_cmd} = "$read_cmd1";
+open($F1->{fh}, $F1->{read_cmd}) || die "$PGM: ERROR: could not sort input1 files '$input1_file_list' : $!\n";
+
+$F1->{id} = 'input1';
+$F1->{alt_id} = $INPUT1;
+$F1->{file_list} = $input1_file_list;
+$F1->{diff_max_rec_num} = 0;
+
+$F2->{read_cmd} = "$read_cmd2";
+open($F2->{fh}, $F2->{read_cmd}) || die "$PGM: ERROR: could not sort -input2 files '$input2_file_list' : $!\n";
+
+$F2->{id} = 'input2';
+$F2->{alt_id} = $INPUT2;
+$F2->{file_list} = $input2_file_list;
+$F2->{diff_max_rec_num} = 0;
+
+sub get_rec($$$) {
+  my ($f_object, $delim, $supp_config_info) = @_;
+	my $fh = $f_object->{fh};
+
+#	if (eof($fh)) {
+#		return undef;
+#	}
+
+	my (@data, $min_num_fields);
+
+	if (exists($supp_config_info->{min_num_fields})) {
+		$min_num_fields = $supp_config_info->{min_num_fields};
+	}
+
+#	my ($regexes, $line_type, $regex);
+	my $line_type;
+
+#	if (exists($supp_config_info->{ignore_regex})) {
+#		$regexes = $supp_config_info->{ignore_regex};
+#	}
+
+	while (<$fh>) {
+		$_ =~ s/\r?\n$//o;
+
+		$f_object->{debug_recnum}++;
+#print $f_object->{file_list} . " debug_recnum = " . $f_object->{debug_recnum} . "\n";
+		@data = split(/[$delim]/o, $_, -1);
+#print "debug: got " . scalar(@data) . " fields\n";
+		$line_type = undef;
+
+#		if (defined($regexes)) {
+#			foreach $regex (keys %{$regexes}) {
+#				if ($_ =~ /$regex/) {
+#					$line_type = $regexes->{$regex};
+#					last;
+#				}
+#			}
+#		}
+
+		if (! defined($line_type)) {
+			$f_object->{counted_lines}++;
+
+			if (defined($min_num_fields) && (scalar(@data) < $min_num_fields)) {
+				$line_type = 'short';
+			}
+		}
+
+		$line_type = 'record' if (! defined($line_type));
+
+
+		if ($line_type ne 'record') {
+			$f_object->{skipped}->{$line_type}++;
+			print "...Skipping the following '$line_type' record in " . $f_object->{alt_id} . " :\n";
+			print $_;
+			print "\n\n";
+			next;
+		}
+
+		$f_object->{recnum}++;
+#print $f_object->{file_list} . " recnum = " . $f_object->{recnum} . "\n";
+
+		return { data => \@data, recnum => $f_object->{recnum}, debug_recnum => $f_object->{debug_recnum}};
+	}
+
+	return undef;
+}
+
+
+sub compare_keys($$$) {
+	my ($rec1_object, $rec2_object, $keys) = @_;
+
+	if (! defined($rec1_object)) {
+		if (! defined($rec2_object)) {
+			die "$PGM: ERROR: compare_keys() was given two undefined records!\n";
+		}
+		return 1;
+	} elsif (! defined($rec2_object)) {
+
+		return -1;
+	}
+
+	my $rec1 = $rec1_object->{data};
+	my $rec2 = $rec2_object->{data};
+
+	foreach my $key_index (@{$keys}) {
+		$cmp_result = $rec1->[$key_index - 1] cmp $rec2->[$key_index - 1];
+		return $cmp_result if ($cmp_result != 0);
+	}
+
+	return 0; # keys were equal
+}
+
+
+sub is_populated($) {
+	return 1 if (defined($_[0]) && ($_[0] ne ''));
+	return 0;
+}
+
+sub values_equal($$) {
+
+	#no warnings 'uninitialized';
+
+	if ($_[0] eq $_[1]) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+
+sub compare_recs($$$$$) {
+  my ($rec1_object, $rec2_object, $proper_last_index, $comp_info, $config_info) = @_;
+	my $rec1 = $rec1_object->{data};
+	my $rec2 = $rec2_object->{data};
+
+	my $last_rec1_index = $#{$rec1};
+	my $last_rec2_index = $#{$rec2};
+
+	#my @indexes = sort { $b <=> $a } ($proper_last_index, $last_rec1_index, $last_rec2_index);
+	my $last_index = max($proper_last_index, $last_rec1_index, $last_rec2_index);
+	#my $last_index = $indexes[0];
+
+	if ($last_rec1_index < $proper_last_index) {
+		$comp_info->{input1}->{shortrec}++;
+	} elsif ($last_rec1_index > $proper_last_index) {
+		$comp_info->{input1}->{longrec}++;
+	}
+
+	if ($last_rec2_index < $proper_last_index) {
+		$comp_info->{input2}->{shortrec}++;
+	} elsif ($last_rec2_index > $proper_last_index) {
+		$comp_info->{input2}->{longrec}++;
+	}
+
+	my $num_fields_to_compare;
+  my $found_difference = 0;
+	my ($rec1_value, $rec2_value);
+
+	for (my $i = 0; $i <= $last_index; $i++) {
+
+		#next if (defined($config_info) && exists($config_info->{$i}) && ($config_info->{$i}->{ignore}));
+		next if (exists($IGNORE_INDEX->{$i}));
+
+		$num_fields_to_compare = 0;
+
+		if ($i <= $last_rec1_index) {
+			$rec1_value = $rec1->[$i];
+
+#			if (&is_populated($rec1_value)) {
+			if ($rec1_value ne '') {
+				$comp_info->{input1}->{fields}->{$i}->{populated}++;
+			} else {
+				$comp_info->{input1}->{fields}->{$i}->{empty}++;
+			}
+
+			if ($i > $proper_last_index) {
+				$comp_info->{input1}->{fields}->{$i}->{longrec}++;
+			}
+
+			$num_fields_to_compare++;
+		} elsif ($i <= $proper_last_index) {
+			$comp_info->{input1}->{fields}->{$i}->{shortrec}++;
+		}
+
+		if ($i <= $last_rec2_index) {
+			$rec2_value = $rec2->[$i];
+
+#			if (&is_populated($rec2_value)) {
+			if ($rec2_value ne '') {
+				$comp_info->{input2}->{fields}->{$i}->{populated}++;
+			} else {
+				$comp_info->{input2}->{fields}->{$i}->{empty}++;
+			}
+
+			if ($i > $proper_last_index) {
+				$comp_info->{input2}->{fields}->{$i}->{longrec}++;
+			}
+
+			$num_fields_to_compare++;
+		} elsif ($i <= $proper_last_index) {
+			$comp_info->{input2}->{fields}->{$i}->{shortrec}++;
+		}
+
+		if ($num_fields_to_compare == 2) {
+#			if (&values_equal($rec1_value, $rec2_value)) {
+			if ($rec1_value eq $rec2_value) {
+				if (defined($rec1_value) && (length($rec1_value) > 0)) {
+					$comp_info->{fields}->{$i}->{popmatch}->{count}++;
+				} else {
+					$comp_info->{fields}->{$i}->{emptymatch}->{count}++;
+				}
+
+				$comp_info->{fields}->{$i}->{totalmatch}->{count}++;
+			} else {
+
+				$comp_info->{fields}->{$i}->{differ} = {} if (! exists($comp_info->{fields}->{$i}->{differ}));
+				my $differ_ref = $comp_info->{fields}->{$i}->{differ};
+
+				$differ_ref->{count}++;
+				$differ_ref->{values}->{$rec1_value}->{$rec2_value}->{count}++;
+
+				if (! exists($differ_ref->{values}->{$rec1_value}->{$rec2_value}->{i1recnum})) {
+					$differ_ref->{values}->{$rec1_value}->{$rec2_value}->{i1recnum} = $rec1_object->{recnum};
+					$differ_ref->{values}->{$rec1_value}->{$rec2_value}->{i2recnum} = $rec2_object->{recnum};
+				}
+
+				$found_difference = 1;
+			}
+		} else {
+			$found_difference = 1;
+		}
+	}
+
+	$comp_info->{input1}->{num_fields}->{$last_rec1_index + 1}++;
+	$comp_info->{input2}->{num_fields}->{$last_rec2_index + 1}++;
+
+	my ($rec_length_category, $rec_diff_category);
+
+	if ($last_rec1_index == $last_rec2_index) {
+		if ($last_rec1_index == $proper_last_index) {
+			$rec_length_category = 'proper';
+		} elsif ($last_rec1_index < $proper_last_index) {
+			$rec_length_category = 'short';
+		} else {
+			$rec_length_category = 'long';
+		}
+	} else {
+		$rec_length_category = 'improper';
+	}
+
+	if ($found_difference) {
+		$rec_diff_category = 'differ';
+	} else {
+		$rec_diff_category = 'match';
+	}
+
+	my $rec_category = "${rec_length_category}${rec_diff_category}";
+
+	$comp_info->{recmatchstats}->{summary}->{$rec_category}++;
+	$comp_info->{recmatchstats}->{total}++;
+
+# example translations of above increment:
+#	$comp_info->{shortmatch}++;
+#	$comp_info->{longmatch}++;
+#	$comp_info->{propermatch}++;
+#	$comp_info->{anymatch}++;
+#	$comp_info->{shortdiffer}++;
+#	$comp_info->{longdiffer}++;
+#	$comp_info->{properdiffer}++;
+#	$comp_info->{improperdiffer}++;
+
+	$comp_info->{recmatchstats}->{detail}->{$rec_diff_category}->{$last_rec1_index}->{$last_rec2_index}++;
+
+	if ($rec_diff_category eq 'match') {
+		$comp_info->{recmatchstats}->{summary}->{anymatch}++;
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+
+sub print_key($$) {
+  my ($rec_object, $keys) = @_;
+	my $rec = $rec_object->{data};
+
+	return join(', ', map { $rec->[$_ - 1] } @{$keys}) . ", recnum = " . $rec_object->{recnum};
+}
+
+
+sub print_debug_key($$) {
+  my ($rec_object, $keys) = @_;
+	my $rec = $rec_object->{data};
+#print Dumper $rec_object;
+	return "'" . join("', '", map { $rec->[$_ - 1] } @{$keys}) . "', debug recnum = " . $rec_object->{debug_recnum};
+}
+
+sub print_rec($) {
+  my $rec_object = $_[0];
+  my $rec_out = '';
+
+	my $rec = $rec_object->{data};
+
+	for (my $i = 0; $i <= $#{$rec}; $i++) {
+		$rec_out .= sprintf("%03d: %s\n", $i, $rec->[$i]);
+	}
+
+	return $rec_out;
+}
+
+
+sub print_rec_pair($$;$$) {
+  my ($rec1_object, $rec2_object, $config_info, $decrypt_type) = @_;
+	my $rec1 = $rec1_object->{data};
+	my $rec2 = $rec2_object->{data};
+  my $last_index;
+
+	if (scalar(@{$rec1}) > scalar(@{$rec2})) {
+		$last_index = $#{$rec1};
+	} else {
+		$last_index = $#{$rec2};
+	}
+
+	my $max_field_id_length = 0;
+  my $field_id;
+
+	if (defined($config_info)) {
+		foreach my $field_num (keys %{$config_info}) {
+			$field_id = undef;
+
+			if (exists($config_info->{$field_num}->{name})) {
+				$field_id = $config_info->{$field_num}->{name};
+			}
+
+			$field_id = sprintf('%03d', $field_num + 1) if (! defined($field_id));
+			$field_id =~ s/\s+$//;
+
+			$config_info->{$field_num}->{display_id} = $field_id;
+
+			if (length($field_id) > $max_field_id_length) {
+				$max_field_id_length = length($field_id);
+			}
+		}
+	}
+
+	my $max_field_value1_length = 0;
+	my $max_field_value2_length = 0;
+	my ($i, $len);
+
+	for($i = 0; $i <= $last_index; $i++) {
+		if ($i <= $#{$rec1}) {
+			$len = length(&print_diff_value($rec1->[$i], $i, $config_info, $decrypt_type));
+
+			if ($len > $max_field_value1_length) {
+				$max_field_value1_length = $len;
+			}
+		}
+
+		if ($i <= $#{$rec2}) {
+			$len = length(&print_diff_value($rec2->[$i], $i, $config_info, $decrypt_type));
+
+			if ($len > $max_field_value2_length) {
+				$max_field_value2_length = $len;
+			}
+		}
+	}
+
+	my $display_id;
+
+	$max_field_value1_length = $INPUT1_LENGTH if ($INPUT1_LENGTH > $max_field_value1_length);
+	$max_field_value2_length = $INPUT2_LENGTH if ($INPUT1_LENGTH > $max_field_value2_length);
+
+	$max_field_value1_length += 2;
+	$max_field_value2_length += 2;
+
+	$max_field_id_length = max(5, $max_field_id_length); # accounts for "Field" header
+	$max_field_id_length = min($MAX_ID_LENGTH, $max_field_id_length);
+
+	my ($line, $diff_tag);
+
+	no warnings 'uninitialized';
+	printf "%-${max_field_id_length}.${max_field_id_length}s %-${max_field_value1_length}.${max_field_value1_length}s    %-${max_field_value2_length}.${max_field_value2_length}s\n", 'Field', $INPUT1, $INPUT2;
+	printf "%-${max_field_id_length}.${max_field_id_length}s %-${max_field_value1_length}.${max_field_value1_length}s    %-${max_field_value2_length}.${max_field_value2_length}s\n", '-' x $max_field_id_length, '-' x $max_field_value1_length, '-' x $max_field_value2_length;
+
+	for($i = 0; $i <= $last_index; $i++) {
+		if (defined($config_info) && exists($config_info->{$i}->{display_id})) {
+			$display_id = sprintf("%-${max_field_id_length}.${max_field_id_length}s", $config_info->{$i}->{display_id});
+		} else {
+			$display_id = sprintf('%03d', $i + 1);
+		}
+
+		if ($rec1->[$i] ne $rec2->[$i]) {
+			$diff_tag = '!=';
+		} else {
+			$diff_tag = '  ';
+		}
+
+		$line = sprintf("${display_id} %-${max_field_value1_length}.${max_field_value1_length}s ${diff_tag} %-${max_field_value2_length}.${max_field_value2_length}s", &print_diff_value($rec1->[$i], $i, $config_info, $decrypt_type),  &print_diff_value($rec2->[$i], $i, $config_info, $decrypt_type));
+
+		$line =~ s/\s+$//;
+
+		print "${line}\n";
+	}
+}
+
+
+sub setup_decryption($) {
+  my $decrypt_type = shift;
+
+	if (! defined($decrypt_type)) {
+		print "$PGM: ERROR: setup_decryption() was not provided a decrypt_type\n";
+		return 0;
+	}
+
+	my $test_value = 'ME_MUST_WORK';
+	my $errno;
+
+	if ($decrypt_type =~ /^\s*WK\s*$/i) {
+
+		my $hostname = NDCEncrypt::Get_Current_Hostname();
+
+		if (&Std_Encryption_Init("INTERNAL")) {
+			#print "Succeeded Initialization on $hostname\n";
+		} else {
+			print "Failed decryption initialization on $hostname\n";
+			return 0;
+		}
+
+		&Std_Encryption_Die_On_Error(0);
+
+		my $encrypted_data = Std_Encryption_Encrypt($test_value);
+		eval "$errno = BLUELITE::Deid::Std_Encryption::Std_Encryption_Errno";
+
+		if (!defined($encrypted_data)) {
+			printf ("ERROR: %s - %s\n", $errno, &Std_Encryption_Errmsg);
+			return 0;
+		}
+
+		my $clear_data = Std_Encryption_Decrypt($encrypted_data);
+		eval "$errno = BLUELITE::Deid::Std_Encryption::Std_Encryption_Errno";
+
+		if (!defined($clear_data)) {
+			printf ("$PGM: Decryption error: %s - %s\n", $errno, &Std_Encryption_Errmsg);
+			return 0;
+		}
+
+		if ($clear_data ne $test_value) {
+			print "$PGM: Decryption error: encrypted test value does not decrypt to original value!\n";
+			return 0;
+		}
+
+		return 1;
+	} else {
+		print "$PGM: ERROR: setup_decryption() was provided a unsupported decrypt_type of '$decrypt_type'\n";
+	}
+
+	return 0;
+}
+
+
+
+my $last_proper_index = $layout->{num_fields} - 1;
+my $rec_count = 0;
+my $num_records_compared = 0;
+my (@data, $key_compare, $prev_rec1, $prev_rec2, $rec1_dupe, $rec2_dupe, $key, $debug_key);
+my $comp_info = {};
+my $prev_rec1_was_dupe = 0;
+my $prev_rec2_was_dupe = 0;
+
+my $rec1 = &get_rec($F1, $delimiter, $supp_config_info);
+my $rec2 = &get_rec($F2, $delimiter, $supp_config_info);
+
+while (defined($rec1) || defined($rec2)) {
+
+	$rec1_dupe = 0;
+	$rec2_dupe = 0;
+
+	if (&compare_keys($rec1, $prev_rec1, \@keys) == 0) {
+		print "key is duplicate in $INPUT1: " . &print_key($rec1, \@keys) . "\n" if ($show_duplicate_keys);
+
+		$rec1_dupe = 1;
+	}
+
+	if (&compare_keys($rec2, $prev_rec2, \@keys) == 0) {
+		print "key is duplicate in $INPUT2: " . &print_key($rec2, \@keys) . "\n" if ($show_duplicate_keys);
+
+		$rec2_dupe = 1;
+	}
+
+
+	# if both were dupes, then we'll optimistically presume that these could be
+	# the same records, so this condition will fail and we'll see if the keys
+	# match (below this if). if only 1 was a dupe, then we'll skip on to it's
+	# next record. if neither is a dupe, then don't skip, just proceed by
+	# comparing keys to see if we need to compare records.
+
+	if ((! $rec1_dupe) || (! $rec2_dupe)) {
+		if ($rec1_dupe) {
+			$prev_rec1 = $rec1;
+			$rec1 = &get_rec($F1, $delimiter, $supp_config_info);
+			$comp_info->{keystats}->{input1_dupes}->{count}++ if (! $prev_rec1_was_dupe);
+			$prev_rec1_was_dupe = 1;
+			next;
+		} elsif ($rec2_dupe) {
+			$prev_rec2 = $rec2;
+			$rec2 = &get_rec($F2, $delimiter, $supp_config_info);
+			$comp_info->{keystats}->{input2_dupes}->{count}++ if (! $prev_rec2_was_dupe);
+			$prev_rec2_was_dupe = 1;
+			next;
+		}
+	}
+
+	$key_compare = &compare_keys($rec1, $rec2, \@keys);
+
+	if ($key_compare == 0) {
+		#print "key matched: " . &print_key($rec1, \@keys) . "\n";
+
+		if ($rec1_dupe) {
+			$comp_info->{keystats}->{input1_dupes}->{count}++;
+		}
+
+		if (! &compare_recs($rec1, $rec2, $last_proper_index, $comp_info, $config_info)) {
+			$F1->{diff_max_rec_num} = $F1->{recnum};
+			$F2->{diff_max_rec_num} = $F2->{recnum};
+		}
+
+		$prev_rec1 = $rec1;
+		$rec1 = &get_rec($F1, $delimiter, $supp_config_info);
+
+		if ($rec2_dupe) {
+			$comp_info->{keystats}->{input2_dupes}->{count}++;
+		}
+
+		$prev_rec2 = $rec2;
+		$rec2 = &get_rec($F2, $delimiter, $supp_config_info);
+
+		$comp_info->{keystats}->{input1_keys}->{count}++ if (! $rec1_dupe);
+		$comp_info->{keystats}->{input2_keys}->{count}++ if (! $rec2_dupe);
+
+		$num_records_compared++;
+
+		if ((! $rec1_dupe) && (! $rec2_dupe)) {
+			$comp_info->{keystats}->{all_keys}->{count}++;
+			$comp_info->{keystats}->{shared_keys}->{count}++;
+		}
+	} elsif ($key_compare == -1) {
+		$key = &print_key($rec1, \@keys);
+		$debug_key = &print_debug_key($rec1, \@keys);
+
+		if ($rec1_dupe) {
+			$comp_info->{keystats}->{input1_exclusive_dupes}->{count}++;
+			$comp_info->{keystats}->{input1_exclusive_dupes}->{keys}->{$key}->{count}++;
+			push(@{$comp_info->{keystats}->{input1_exclusive_dupes}->{keys}->{$key}->{recs}}, { %$rec1 });
+
+			#print "key is duplicated in input1, but not in input2: " . &print_key($rec1, \@keys) . "\n";
+		} else {
+			$comp_info->{keystats}->{input1_exclusive_keys}->{count}++;
+			$comp_info->{keystats}->{input1_exclusive_keys}->{keys}->{$key}->{count}++;
+			$comp_info->{keystats}->{input1_exclusive_keys}->{debug_keys}->{$debug_key}->{count}++;
+			$comp_info->{keystats}->{input1_keys}->{count}++;
+			$comp_info->{keystats}->{all_keys}->{count}++;
+			#print "key missing from input2: " . &print_key($rec1, \@keys) . "\n";
+		}
+
+		if ($rec1_dupe) {
+			$comp_info->{keystats}->{input1_dupes}->{count}++;
+		}
+
+		$prev_rec1 = $rec1;
+		$rec1 = &get_rec($F1, $delimiter, $supp_config_info);
+
+	} elsif ($key_compare == 1) {
+		$key = &print_key($rec2, \@keys);
+		$debug_key = &print_debug_key($rec2, \@keys);
+
+		if ($rec2_dupe) {
+			$comp_info->{keystats}->{input2_exclusive_dupes}->{count}++;
+			$comp_info->{keystats}->{input2_exclusive_dupes}->{keys}->{$key}->{count}++;
+			push(@{$comp_info->{keystats}->{input2_exclusive_dupes}->{keys}->{$key}->{recs}}, { %$rec2 });
+
+			#print "key is duplicated in input2, but not in input1: " . &print_key($rec2, \@keys) . "\n";
+		} else {
+			$comp_info->{keystats}->{input2_exclusive_keys}->{count}++;
+			$comp_info->{keystats}->{input2_exclusive_keys}->{keys}->{$key}->{count}++;
+			$comp_info->{keystats}->{input2_exclusive_keys}->{debug_keys}->{$debug_key}->{count}++;
+			$comp_info->{keystats}->{input2_keys}->{count}++;
+			$comp_info->{keystats}->{all_keys}->{count}++;
+			#print "key missing from input1: " . &print_key($rec2, \@keys) . "\n";
+		}
+
+		if ($rec2_dupe) {
+			$comp_info->{keystats}->{input2_dupes}->{count}++;
+		}
+
+		$prev_rec2 = $rec2;
+		$rec2 = &get_rec($F2, $delimiter, $supp_config_info);
+	} else {
+		die "$PGM: ERROR: compare_keys() returned an unsupported result of '$key_compare'!\n";
+	}
+
+	$prev_rec1_was_dupe = $rec1_dupe;
+	$prev_rec2_was_dupe = $rec2_dupe;
+
+	$rec_count++;
+
+	if ($rec_count % 100000 == 0) {
+		print STDERR "analyzed $rec_count records ...\n";
+	}
+
+	last if (defined($num_sample_records) && ($num_records_compared >= $num_sample_records));
+}
+
+print STDERR "analyzed $rec_count records (total)\n";
+
+close($F1->{fh}) || die "$PGM: ERROR: sort command for $INPUT1 failed\n";
+close($F2->{fh}) || die "$PGM: ERROR: sort command for $INPUT2 failed\n";
+
+
+sub pct($;$) {
+
+	my ($val, $places);
+
+	if (defined($_[0])) {
+		$val = $_[0];
+	} else {
+		return undef;
+	}
+
+	if (defined($_[1])) {
+		$places = $_[1];
+	} else {
+		$places = 2;
+	}
+
+ 	return sprintf("%.${places}f", $val * 100);
+}
+
+
+our $CAN_DECRYPT;
+
+sub do_decrypt($$) {
+  my ($value, $decrypt_type) = @_;
+
+	if ($decrypt_type =~ /^\s*WK\s*$/i) {
+		return Std_Encryption_Decrypt($value);
+	} else {
+		die "$PGM: ERROR: do_decrypt() was given an unsupported decryption type of '$decrypt_type'\n";
+	}
+}
+
+
+sub print_diff_value($$$;$) {
+  my ($value, $index, $config_info, $decrypt_type) = @_;
+	my $raw_value;
+	my $suffix_text = '';
+
+	if (defined($config_info) && exists($config_info->{$index}) && exists($config_info->{$index}->{encrypted})) {
+		if (($config_info->{$index}->{encrypted} eq 'Y') && (! $DISABLE_DECRYPTION)) {
+
+			if (! defined($CAN_DECRYPT)) {
+				if (setup_decryption($decrypt_type)) {
+					$CAN_DECRYPT = 1;
+				} else {
+					$CAN_DECRYPT = 0;
+
+					no warnings 'uninitialized';
+
+					print "Warning: At least one field (" . $config_info->{$index}->{name} . ") is defined as being encrypted, but decryption is not working. decrypt_type = '$decrypt_type'. Proceeding without decryption capability..\n";
+				}
+			}
+
+			if ($CAN_DECRYPT) {
+				$raw_value = do_decrypt($value, $decrypt_type);
+
+				no warnings 'uninitialized';
+				$suffix_text = "  {{decrypted='$raw_value'}}";
+			}
+		}
+	}
+
+	no warnings 'uninitialized';
+
+	return "'${value}'${suffix_text}";
+}
+
+
+sub stat2file($) {
+  my $stat = shift;
+
+	if ($stat =~ /^input([12])_(.+)$/) {
+		my $prefix;
+
+		if ($1 == 1) {
+			$prefix = $INPUT1;
+		} else {
+			$prefix = $INPUT2;
+		}
+
+		return "$prefix $2";
+	}
+
+	return $stat;
+}
+
+my $AutoQA_Failures = 0;
+
+my $stat;
+
+print "\n";
+print "Record key stats:\n\n";
+#print Dumper $comp_info->{keystats};
+
+foreach $stat (sort { $comp_info->{keystats}->{$b}->{count} <=> $comp_info->{keystats}->{$a}->{count} } keys %{$comp_info->{keystats}}) {
+
+	my $comment = '';
+	my $actual_pct = $comp_info->{keystats}->{$stat}->{count} / $comp_info->{keystats}->{all_keys}->{count};
+
+	if (defined($autoqa)) {
+		if (exists($autoqa->{keys})) {
+			if ($stat =~ /^input([12])_exclusive_keys$/) {
+				my $input_num = $1;
+
+				if (exists($autoqa->{keys}->{exclusive})) {
+
+					my $exclusive_param = "max_i${input_num}";
+
+					if (exists($autoqa->{keys}->{exclusive}->{$exclusive_param})) {
+						my $result;
+						my $max_pct = pct2dec($autoqa->{keys}->{exclusive}->{$exclusive_param});
+
+						if ($actual_pct > $max_pct) {
+							$result = 'FAILED';
+							$AutoQA_Failures++;
+						} else {
+							$result = 'passed';
+						}
+
+						$comment = "$result AutoQA (Max allowed=" . pct($max_pct) . '%) ';
+					}
+				}
+			}
+		}
+	}
+
+	printf "%-43s : %9d  %6s%%  %s\n",
+		stat2file($stat),
+		$comp_info->{keystats}->{$stat}->{count},
+		pct($actual_pct),
+		$comment
+		;
+}
+
+if ($show_exclusive_keys) {
+  #$comp_info->{keystats}->{input1_exclusive_keys}->{keys}->{$key}->{count}++;
+
+	print "\n";
+
+	foreach my $input_exclusive (qw/input1_exclusive_keys input2_exclusive_keys/) {
+		print "Listing of $input_exclusive:\n";
+		print "---------------------------------\n";
+
+		if (! exists($comp_info->{keystats}->{$input_exclusive})) {
+			print "{no exclusive keys}\n\n";
+			next;
+		}
+
+		foreach my $key (keys %{$comp_info->{keystats}->{$input_exclusive}->{debug_keys}}) {
+			print "${key}\n";
+		}
+
+		print "\n\n";
+	}
+}
+
+
+sub max_dupes_check($$$$) {
+  my ($autoqa, $tag, $uniqueness, $input) = @_;
+	my $failed = 0;
+
+	if (defined($autoqa) && exists($autoqa->{keys}) && exists($autoqa->{keys}->{duplicate})) {
+		if (exists($autoqa->{keys}->{duplicate}->{$tag})) {
+			my $result;
+			my $max_pct = pct2dec($autoqa->{keys}->{duplicate}->{$tag});
+
+			if (defined($uniqueness) && ((1 - $uniqueness) > $max_pct)) {
+				$result = 'FAILED';
+				$failed = 1;
+			} else {
+				$result = 'passed';
+			}
+
+			print "$input $result AutoQA (Max duplicates allowed = " . pct($max_pct) . "% )\n";
+		}
+	}
+
+	return $failed;
+}
+
+sub check_short($$$$) {
+  my ($num_skipped, $total_lines, $thresh_key, $autoqa) = @_;
+
+	if (
+		exists($autoqa->{file}) &&
+		exists($autoqa->{file}->{record}) &&
+		exists($autoqa->{file}->{record}->{$thresh_key})
+		) {
+
+#		print "num_skipped = $num_skipped\n";
+#		print "ttl = $total_lines\n";
+#		print " n / t = " . ($num_skipped / $total_lines) . "\n";
+#		print "thresh = " . $autoqa->{file}->{record}->{$thresh_key} . "\n";
+#		print "pct2dec(thresh) = " . pct2dec($autoqa->{file}->{record}->{$thresh_key}) . "\n";
+
+		if (
+			$num_skipped &&
+			($total_lines > 0) &&
+			($num_skipped / $total_lines > pct2dec($autoqa->{file}->{record}->{$thresh_key}))
+			) {
+			return (1, "FAILED AutoQA ($thresh_key allowed = " .$autoqa->{file}->{record}->{$thresh_key} . ")");
+		} else {
+			return (0, "passed AutoQA ($thresh_key allowed = " . $autoqa->{file}->{record}->{$thresh_key} . ")");
+		}
+	}
+
+	return (0, undef);
+}
+
+
+my $print_spec = "%-19.19s  %${INPUT1_LENGTH}.${INPUT1_LENGTH}s  %${INPUT2_LENGTH}.${INPUT2_LENGTH}s\n";
+
+print "\n\nSkipped line stats:\n";
+printf $print_spec, '', $INPUT1, $INPUT2;
+printf $print_spec, '----------------------------', '-' x $INPUT1_LENGTH , '-' x $INPUT2_LENGTH;
+
+my $skipped_types;
+map { $skipped_types->{$_} = undef } (keys %{$F1->{skipped}}) if (exists($F1->{skipped}));
+map { $skipped_types->{$_} = undef } (keys %{$F2->{skipped}}) if (exists($F2->{skipped}));
+
+
+my $f1_counted_lines = 0;
+$f1_counted_lines = $F1->{counted_lines} if (exists($F1->{counted_lines}));
+
+my $f2_counted_lines = 0;
+$f2_counted_lines = $F2->{counted_lines} if (exists($F2->{counted_lines}));
+my @comment1 = ();
+my @comment2 = ();
+
+foreach my $skipped_type (keys %{$skipped_types}) {
+  no warnings 'uninitialized';
+
+	my $f1_skipped = 0;
+	$f1_skipped = $F1->{skipped}->{$skipped_type} if (exists($F1->{skipped}->{$skipped_type}));
+
+	my $f2_skipped = 0;
+	$f2_skipped = $F2->{skipped}->{$skipped_type} if (exists($F2->{skipped}->{$skipped_type}));
+
+	my $failed;
+
+	if ($skipped_type eq 'short') {
+		my ($failed, $comment1) = check_short($f1_skipped, $f1_counted_lines, 'max_short_i1', $autoqa);
+
+		$AutoQA_Failures++ if ($failed);
+		push(@comment1, $comment1) if (defined($comment1));
+
+		my $comment2;
+		($failed, $comment2) = check_short($f2_skipped, $f2_counted_lines, 'max_short_i2', $autoqa);
+
+		$AutoQA_Failures++ if ($failed);
+		push(@comment2, $comment2) if (defined($comment2));
+	}
+
+	printf $print_spec, $skipped_type, $f1_skipped, $f2_skipped;
+}
+
+printf $print_spec, 'total counted lines', $f1_counted_lines, $f2_counted_lines;
+
+print "\n";
+
+print join("\n", map { "$INPUT1 $_" } @comment1) . "\n" if (@comment1);
+print join("\n", map { "$INPUT2 $_" } @comment2) . "\n" if (@comment2);
+
+print "\n\nUnskipped data record stats:\n";
+
+my $unique_i1 = $comp_info->{keystats}->{input1_keys}->{count} / $F1->{recnum} if (exists($F1->{recnum}));
+my $unique_i2 = $comp_info->{keystats}->{input2_keys}->{count} / $F2->{recnum} if (exists($F2->{recnum}));
+
+$print_spec = "%-30.30s  %${INPUT1_LENGTH}.${INPUT1_LENGTH}s  %${INPUT2_LENGTH}.${INPUT2_LENGTH}s\n";
+
+{
+
+no warnings 'uninitialized';
+
+printf $print_spec, '', $INPUT1, $INPUT2;
+printf $print_spec, '----------------------------', '-' x $INPUT1_LENGTH , '-' x $INPUT2_LENGTH;
+printf $print_spec, 'data records', $F1->{recnum}, $F2->{recnum};
+printf $print_spec, 'unique keys', $comp_info->{keystats}->{input1_keys}->{count}, $comp_info->{keystats}->{input2_keys}->{count};
+printf $print_spec, 'data record uniqueness', pct($unique_i1) . '%', pct($unique_i2) . '%';
+print "\n";
+
+}
+
+$AutoQA_Failures++ if max_dupes_check($autoqa, 'max_i1', $unique_i1, $INPUT1);
+$AutoQA_Failures++ if max_dupes_check($autoqa, 'max_i2', $unique_i2, $INPUT2);
+
+print "\n\nRecord-level stats for $num_records_compared record comparisons:\n\n";
+
+foreach $stat (keys %{$comp_info->{recmatchstats}->{summary}}) {
+
+	my $actual_pct = $comp_info->{recmatchstats}->{summary}->{$stat} / $num_records_compared;
+	my $comment = '';
+
+	if (($stat eq 'propermatch') && defined($autoqa) && exists($autoqa->{file}) && exists($autoqa->{file}->{record}) && exists($autoqa->{file}->{record}->{max_diff}) ) {
+		my $max_record_diff = pct2dec($autoqa->{file}->{record}->{max_diff});
+		my $result;
+
+		if ((1 - $actual_pct) > $max_record_diff) {
+			$result = 'FAILED';
+			$AutoQA_Failures++;
+		} else {
+			$result = 'passed';
+		}
+
+		$comment = "$result AutoQA (Record max_diff allowed = " . pct($max_record_diff) . "% )\n";
+	}
+
+	printf "%15s : %9d  %6s%%  %s\n",
+		$stat,
+		$comp_info->{recmatchstats}->{summary}->{$stat},
+		pct($actual_pct),
+		$comment
+		;
+}
+
+print "\n";
+print "Field-count stats:\n";
+
+print "\n";
+printf "%-10.10s  \%${INPUT1_LENGTH}.${INPUT1_LENGTH}s \%${INPUT2_LENGTH}.${INPUT2_LENGTH}s %9.9s %8.8s\n", '', '#', '#', 'Num', '%';
+printf "%-10.10s  \%${INPUT1_LENGTH}.${INPUT1_LENGTH}s \%${INPUT2_LENGTH}.${INPUT2_LENGTH}s %9.9s %8.8s\n", '', 'fields', 'fields', 'Records', 'Records';
+printf "%-10.10s  \%${INPUT1_LENGTH}.${INPUT1_LENGTH}s \%${INPUT2_LENGTH}.${INPUT2_LENGTH}s %9.9s %8.8s\n", '', $INPUT1, $INPUT2, '', '';
+printf "%-10.10s  \%${INPUT1_LENGTH}.${INPUT1_LENGTH}s \%${INPUT2_LENGTH}.${INPUT2_LENGTH}s %9.9s %8.8s\n", '', '-' x $INPUT1_LENGTH, '-' x $INPUT2_LENGTH, '-------', '-------';
+
+foreach my $match_diff_tag (keys %{$comp_info->{recmatchstats}->{detail}}) {
+	# $comp_info->{recmatchstats}->{detail}->{$rec_diff_category}->{$last_rec1_index}->{$last_rec2_index}++;
+
+	foreach my $i1_num_fields (keys %{$comp_info->{recmatchstats}->{detail}->{$match_diff_tag}}) {
+		foreach my $i2_num_fields (keys %{$comp_info->{recmatchstats}->{detail}->{$match_diff_tag}->{$i1_num_fields}}) {
+			printf "%-10.10s: \%${INPUT1_LENGTH}d \%${INPUT2_LENGTH}d %9d %7s%%\n",
+				$match_diff_tag,
+				$i1_num_fields + 1,
+				$i2_num_fields + 1,
+				$comp_info->{recmatchstats}->{detail}->{$match_diff_tag}->{$i1_num_fields}->{$i2_num_fields},
+				pct($comp_info->{recmatchstats}->{detail}->{$match_diff_tag}->{$i1_num_fields}->{$i2_num_fields} / $comp_info->{recmatchstats}->{total});
+		}
+	}
+}
+
+my $popmatch = 0;
+my $emptymatch = 0;
+my $differ = 0;
+
+foreach my $index (keys %{$comp_info->{fields}}) {
+
+	if (exists($comp_info->{fields}->{$index}->{popmatch})) {
+		$popmatch += $comp_info->{fields}->{$index}->{popmatch}->{count};
+	}
+
+	if (exists($comp_info->{fields}->{$index}->{emptymatch})) {
+		$emptymatch += $comp_info->{fields}->{$index}->{emptymatch}->{count};
+	}
+
+	if (exists($comp_info->{fields}->{$index}->{differ})) {
+		$differ += $comp_info->{fields}->{$index}->{differ}->{count};
+	}
+}
+
+my $total_comparisons = $popmatch + $emptymatch + $differ;
+
+if ($total_comparisons > 0) {
+
+	my $comment = '';
+	my $overall_match = ($popmatch + $emptymatch) / $total_comparisons;
+
+	if (defined($autoqa) && exists($autoqa->{file}) && exists($autoqa->{file}->{all_attr}) && exists($autoqa->{file}->{all_attr}->{max_diff})) {
+		my $max_all_attr_diff = pct2dec($autoqa->{file}->{all_attr}->{max_diff});
+		my $result;
+
+		if ((1 - $overall_match) > $max_all_attr_diff) {
+			$result = 'FAILED';
+			$AutoQA_Failures++;
+		} else {
+			$result = 'passed';
+		}
+
+		$comment = "$result AutoQA (all_attr max_diff allowed=" . pct($max_all_attr_diff) . '%) ';
+	}
+
+	print "\nField comparison summary stats:\n\n";
+	printf "%-7.7s  %-9.9s  %-7.7s\n", 'Overall', 'Populated', 'Empty';
+	printf "%-7.7s  %-9.9s  %-7.7s\n", 'match %', 'match %', 'match %';
+	printf "%-7.7s  %-9.9s  %-7.7s\n", '-------', '---------', '-------';
+	printf "%7.7s  %9.9s  %7.7s  %s\n", pct($overall_match), pct($popmatch / $total_comparisons), pct($emptymatch / $total_comparisons), $comment;
+} else {
+	print "WARNING: No field comparisons could be performed because there are NO matching keys between the input sets!\n";
+	print "This is a serious key definition or key content issue.\n";
+	print "Potential reasons for this include:\n";
+	print "   - Trailing space differences in key field values between the input sets (e.g. input1 has them, input2 does not)\n";
+	print "   - Numeric key field with different # of decimal places between input sets\n";
+	print "   - A timestamp field is used as part of the key and the time zone or date is different between input sets\n";
+	print "   - A key field has values truncated to different lengths between input sets\n";
+	print "   - The input sets have different scrubbing or formatting applied to the key fields\n";
+}
+
+my $field_ref;
+
+print "\n\n";
+
+no warnings 'uninitialized';
+
+sub get_id($$$) {
+  my ($index, $comp_info, $config_info) = @_;
+
+	my $field_ref = $comp_info->{fields}->{$index};
+	my $field_id = undef;
+
+	if (defined($config_info)) {
+		if (exists($config_info->{$index}->{name})) {
+			$field_id = $config_info->{$index}->{name};
+		}
+	}
+
+	$field_id = sprintf('%03d', $index + 1) if (! defined($field_id));
+
+	return $field_id;
+}
+
+
+my ($diffs, $diff_index, $num_diff_combinations_shown, $field_id, $id_len, $diff1_val, $diff2_val, @report_out);
+my $max_id_len = 0;
+
+push(@report_out, "\nSummary of fields with differences (most to least):\n\n");
+
+foreach my $index (keys %{$comp_info->{fields}}) {
+	$field_ref = $comp_info->{fields}->{$index};
+
+	next if (! exists($field_ref->{differ}));
+
+	$field_id = get_id($index, $comp_info, $config_info);
+	$id_len = length($field_id);
+
+	$max_id_len = $id_len if ($id_len > $max_id_len);
+}
+
+$max_id_len = max(5, $max_id_len); # accounts for the "Field" heading being length 5
+$max_id_len = min($MAX_ID_LENGTH, $max_id_len);
+
+$print_spec = "%-${max_id_len}.${max_id_len}s %8s %7s %7s %6s %6s \%${INPUT1_LENGTH}s  \%${INPUT2_LENGTH}s %s\n",
+
+push(@report_out, sprintf($print_spec, 'Field', '#', '#', 'Overall', 'Empty', 'AutoQA', $INPUT1, $INPUT2, 'AutoQA'));
+push(@report_out, sprintf($print_spec, 'id', 'diff', 'diff', 'match', 'match', 'Max', 'population', 'population', 'comment'));
+push(@report_out, sprintf($print_spec, '', 'Records', 'Pairs', 'rate %', 'rate %', 'diff %', '%', '%', ''));
+push(@report_out, sprintf($print_spec, '-' x $max_id_len, '--------', '-------', '-------', '-----', '------', '-' x $INPUT1_LENGTH, '-' x $INPUT2_LENGTH, '-' x 19));
+
+
+foreach my $index (sort { $comp_info->{fields}->{$a}->{totalmatch}->{count} <=> $comp_info->{fields}->{$b}->{totalmatch}->{count} } keys %{$comp_info->{fields}}) {
+	$field_ref = $comp_info->{fields}->{$index};
+
+	next if (! exists($field_ref->{differ}));
+
+	my $diff_count = 0;
+	my $diff_pairs = 0;
+
+	foreach my $i1_val (keys %{$field_ref->{differ}->{values}}) {
+		foreach my $i2_val (keys %{$field_ref->{differ}->{values}->{$i1_val}}) {
+			$diff_count += $field_ref->{differ}->{values}->{$i1_val}->{$i2_val}->{count};
+			$diff_pairs++;
+		}
+	}
+
+	$field_id = get_id($index, $comp_info, $config_info);
+
+	my $comment = '';
+	my $qa_max_diff_pct;
+	$qa_max_diff_pct = $config_info->{$index}->{qa_max_diff_pct} if (exists($config_info->{$index}->{qa_max_diff_pct}));
+
+	if (defined($qa_max_diff_pct)) {
+
+		my $actual_diff_pct = ($num_records_compared - $field_ref->{totalmatch}->{count}) / $num_records_compared;
+
+		if ($actual_diff_pct > $qa_max_diff_pct) {
+			$comment = 'FAILED ';
+			$AutoQA_Failures++;
+		} else {
+			$comment = 'passed ';
+		}
+
+		$comment .= '(' . pct($actual_diff_pct, 1) . '% diff)';
+	}
+
+	my $max_diff_pct;
+	$max_diff_pct = $config_info->{$index}->{qa_max_diff_pct} if (exists($config_info->{$index}->{qa_max_diff_pct}));
+
+	push(@report_out, sprintf($print_spec,
+		$field_id,
+		$diff_count,
+		$diff_pairs,
+		pct($field_ref->{totalmatch}->{count} / $num_records_compared),
+		#pct($field_ref->{popmatch}->{count} / $num_records_compared),
+		pct($field_ref->{emptymatch}->{count} / $num_records_compared),
+		pct($max_diff_pct),
+		pct($comp_info->{input1}->{fields}->{$index}->{populated} / $num_records_compared),
+		pct($comp_info->{input2}->{fields}->{$index}->{populated} / $num_records_compared),
+		$comment
+		)
+	);
+}
+
+push(@report_out, "\n\nDetailed examples of differing field values:\n\n");
+
+foreach my $index (sort { $comp_info->{fields}->{$a}->{totalmatch}->{count} <=> $comp_info->{fields}->{$b}->{totalmatch}->{count} } keys %{$comp_info->{fields}}) {
+	$field_ref = $comp_info->{fields}->{$index};
+
+	next if (! exists($field_ref->{differ}));
+
+	$field_id = get_id($index, $comp_info, $config_info);
+	my $id_len = max(5, length($field_id));
+	$max_id_len = min($MAX_ID_LENGTH, $max_id_len);
+
+	push(@report_out, "\n");
+
+	$print_spec = "%-${id_len}.${id_len}s   %7s %9s %6s  \%${INPUT1_LENGTH}s  \%${INPUT2_LENGTH}s\n",
+
+	push(@report_out, sprintf($print_spec, 'Field', 'Overall', 'Populated', 'Empty', $INPUT1, $INPUT2));
+	push(@report_out, sprintf($print_spec, 'id', 'match', 'match', 'match', 'population', 'population'));
+	push(@report_out, sprintf($print_spec, '', 'rate %', 'rate %', 'rate %', '%', '%'));
+	push(@report_out, sprintf($print_spec, '-' x $id_len, '-------', '---------', '-----', '-' x $INPUT1_LENGTH, '-' x $INPUT2_LENGTH));
+
+	push(@report_out, sprintf($print_spec,
+		$field_id,
+		pct($field_ref->{totalmatch}->{count} / $num_records_compared),
+		pct($field_ref->{popmatch}->{count} / $num_records_compared),
+		pct($field_ref->{emptymatch}->{count} / $num_records_compared),
+		pct($comp_info->{input1}->{fields}->{$index}->{populated} / $num_records_compared),
+		pct($comp_info->{input2}->{fields}->{$index}->{populated} / $num_records_compared))
+		)
+		;
+
+	$diffs = {};
+	$diff_index = 0;
+
+	foreach my $i1_val (keys %{$field_ref->{differ}->{values}}) {
+		foreach my $i2_val (keys %{$field_ref->{differ}->{values}->{$i1_val}}) {
+
+			$diffs->{$diff_index} = { i1 => $i1_val, i2 => $i2_val, count => $field_ref->{differ}->{values}->{$i1_val}->{$i2_val}->{count}};
+
+			$diff_index++;
+		}
+	}
+
+	my ($prefix_word, $num_diff_combinations_to_show);
+
+	if ($diff_index < $TOP_DIFF_COMBINATIONS_TO_SHOW) {
+		$prefix_word = 'all';
+		$num_diff_combinations_to_show = $diff_index;
+	} else {
+		$prefix_word = 'top';
+		$num_diff_combinations_to_show = $TOP_DIFF_COMBINATIONS_TO_SHOW;
+	}
+
+	push(@report_out, "\nShowing $prefix_word $num_diff_combinations_to_show differing value pairs..\n\n");
+
+	$num_diff_combinations_shown = 0;
+
+	foreach $diff_index (sort { $diffs->{$b}->{count} <=> $diffs->{$a}->{count} } keys %{$diffs}) {
+
+		push(@report_out, "Value pair difference # " . ($num_diff_combinations_shown + 1) . ":\n");
+
+		$diff1_val = $diffs->{$diff_index}->{i1};
+		push(@report_out, "$INPUT1 value: " . &print_diff_value($diff1_val, $index, $config_info, $decrypt_type) . "\n");
+
+		$diff2_val = $diffs->{$diff_index}->{i2};
+
+		push(@report_out, "$INPUT2 value: " . &print_diff_value($diff2_val, $index, $config_info, $decrypt_type) . "\n");
+
+		push(@report_out, sprintf("%s difference ranking: %s%% (seen in %d records)\n\n", $field_id, pct($diffs->{$diff_index}->{count} / $field_ref->{differ}->{count}), $diffs->{$diff_index}->{count}));
+
+		push(@report_out, "Example record:\n\n");
+
+		push(@report_out, "<<display_rec input1 " . $field_ref->{differ}->{values}->{$diff1_val}->{$diff2_val}->{i1recnum} . " input2 " . $field_ref->{differ}->{values}->{$diff1_val}->{$diff2_val}->{i2recnum}  . ">>\n");
+
+		push(@report_out, "\n");
+
+		$num_diff_combinations_shown++;
+		last if ($num_diff_combinations_shown >= $TOP_DIFF_COMBINATIONS_TO_SHOW);
+	}
+}
+
+
+my ($display_recs, $report_line, $input_source_a, $rec_num_a, $input_source_b, $rec_num_b, $rec);
+
+foreach $report_line (@report_out) {
+	if ($report_line =~ /^<<display_rec\s+(input[12])\s+(\d+)\s+(input[12])\s+(\d+)\s*>>\s*$/) {
+		($input_source_a, $rec_num_a, $input_source_b, $rec_num_b) = ($1, $2, $3, $4);
+
+		$display_recs->{$input_source_a}->{$rec_num_a} = {};
+		$display_recs->{$input_source_b}->{$rec_num_b} = {};
+	}
+}
+
+if (defined($display_recs)) {
+
+	foreach my $fobject ($F1, $F2) {
+
+		delete $fobject->{recnum};
+		open($fobject->{fh}, $fobject->{read_cmd}) || die "$PGM: ERROR: could not sort " . $fobject->{id} . " files '" . $fobject->{file_list} . "' : $!\n";
+
+		while ($rec = &get_rec($fobject, $delimiter, $supp_config_info)) {
+
+			next if ($fobject->{recnum} > $fobject->{diff_max_rec_num}); # changed last to next to avoid pipe error on close
+
+			if (exists($display_recs->{$fobject->{id}}->{$fobject->{recnum}})) {
+				$display_recs->{$fobject->{id}}->{$fobject->{recnum}} = { %{$rec} };
+			}
+		}
+
+		close($fobject->{fh}) || die "$PGM: ERROR: sort command failed\n";
+	}
+}
+
+foreach $report_line (@report_out) {
+	if ($report_line =~ /^<<display_rec\s+(input[12])\s+(\d+)\s+(input[12])\s+(\d+)\s*>>\s*$/) {
+		($input_source_a, $rec_num_a, $input_source_b, $rec_num_b) = ($1, $2, $3, $4);
+
+		#print $report_line;
+		print_rec_pair($display_recs->{$input_source_a}->{$rec_num_a}, $display_recs->{$input_source_b}->{$rec_num_b}, $config_info, $decrypt_type);
+
+	} else {
+		print $report_line;
+	}
+}
+
+my $exit_code = 0;
+
+my $minutes = (time - $start_time) / 60;
+printf "\nReport completed in %.1f minutes.\n", $minutes;
+
+if ($AutoQA_Failures) {
+	print "\nEncountered $AutoQA_Failures AutoQA failures.\n";
+	$exit_code = 1;
+}
+
+print "Exiting with exit code $exit_code\n";
+exit($exit_code);
+

@@ -1,0 +1,704 @@
+#!/usr/bin/perl
+
+# test_txnset: Test the DS::NCPDP::TxnSet module
+#
+# 5/15/2009 - Version 1.0
+# Initial release
+#
+# 5/26/2009 - Version 1.1
+# Input txns are now displayed in same order as they appeared in the xml config file
+#
+# 5/28/2009 - Version 1.2
+# Added is_orph_rev status indicator to *txns output
+#
+# 5/29/2009 - Version 1.3
+# Changed is_orph_rev status indicator to did_reverse_accepted_txns
+# Added did_reverse_pc_txns status indicator
+#
+# 10/30/2012 - Version 1.62
+# Removed "ordered => 1" parameter from various method calls. The order_direction parameter now suffices.
+#
+
+
+use XML::Simple;
+use Data::Dumper;
+use DS::NCPDP::TxnSet;
+
+use warnings;
+use strict;
+
+our $PGM = $0;
+$PGM =~ s/.*\///g;
+
+our $VERSION = '1.62';
+
+if (scalar(@ARGV) == 0) {
+	print "$PGM, version $VERSION\n";
+	print "Usage 1: $PGM config_file.xml\n";
+	print "Usage 2: $PGM -s     {generates a simple sample xml config file}\n";
+	exit(1);
+}
+
+
+sub check_config($) {
+  my $cfg = shift;
+
+	if (! exists($cfg->{scenario})) {
+		die "$PGM: ERROR: unsupported xml structure: You must have at least 1 <scenario name='myscenario'> tag\n";
+	}
+
+	my $ref = ref($cfg->{scenario});
+
+	if ($ref ne 'HASH') {
+		die "$PGM: ERROR: unsupported xml structure: scenario key points to a $ref instead of a HASH\n";
+	}
+
+	my ($lc_scenario_config, $found_valid, $lc_net_config_param);
+
+	foreach my $scenario (keys %{$cfg->{scenario}}) {
+		$ref = ref($scenario);
+
+		if ($ref ne '') {
+			die "$PGM: ERROR: unsupported xml structure: there was a problem with one of the scenarios (got $ref instead of SCALAR)\n";
+		}
+
+		$ref = ref($cfg->{scenario}->{$scenario});
+
+		if ($ref ne 'HASH') {
+			die "$PGM: ERROR: unsupported xml structure: '$scenario' scenario points to a $ref instead of a HASH\n";
+		}
+
+		foreach my $scenario_config (keys %{$cfg->{scenario}->{$scenario}}) {
+			$ref = ref($scenario_config);
+
+			if ($ref ne '') {
+				die "$PGM: ERROR: unsupported xml structure: one of the parameters for the '$scenario' scenario is a $ref instead of a SCALAR\n";
+			}
+
+			$lc_scenario_config = lc($scenario_config);
+
+			if ($lc_scenario_config eq 'net_configure') {
+
+				$ref = ref($cfg->{scenario}->{$scenario}->{$scenario_config});
+
+				if ($ref ne 'HASH') {
+					die "$PGM: ERROR: unsupported xml structure: the $scenario_config parameter of the $scenario scenario points to a $ref instead of a HASH\n";
+				}
+
+				foreach my $net_config_param (keys %{$cfg->{scenario}->{$scenario}->{$scenario_config}}) {
+					$ref = ref($net_config_param);
+
+					if ($ref ne '') {
+						die "$PGM: ERROR: unsupported xml structure: one of the $lc_scenario_config parameters for the '$scenario' scenario is a $ref instead of a SCALAR\n";
+					}
+
+					$ref = ref($cfg->{scenario}->{$scenario}->{$scenario_config}->{$net_config_param});
+
+					if ($ref ne '') {
+						die "$PGM: ERROR: unsupported xml structure: The $scenario_config parameter '$net_config_param parameter' is a $ref instead of a SCALAR\n";
+					}
+
+					$lc_net_config_param = lc($net_config_param);
+					$found_valid = 0;
+
+					foreach my $valid_net_config_param (qw/claim_status remove is_dispensed/) {
+						if ($lc_net_config_param eq $valid_net_config_param) {
+							$found_valid = 1;
+							last;
+						}
+					}
+
+					if (! $found_valid) {
+						die "$PGM: ERROR: The $scenario_config parameter '$net_config_param' for scenario '$scenario' is not recognized\n";
+					}
+				}
+			} elsif ($lc_scenario_config eq 'loop') {
+
+				$ref = ref($cfg->{scenario}->{$scenario}->{$scenario_config});
+
+				if ($ref ne '') {
+					die "$PGM: ERROR: unsupported xml structure: the $scenario_config parameter of the $scenario scenario points to a $ref instead of a SCALAR\n";
+				}
+			} elsif ($lc_scenario_config eq 'set') {
+				$ref = ref($cfg->{scenario}->{$scenario}->{$scenario_config});
+
+				if ($ref ne 'HASH') {
+					die "$PGM: ERROR: unsupported xml structure: the $scenario_config parameter of the $scenario scenario points to a $ref instead of a HASH\n";
+				}
+
+				foreach my $net_config_param (keys %{$cfg->{scenario}->{$scenario}->{$scenario_config}}) {
+					$ref = ref($net_config_param);
+
+					if ($ref ne '') {
+						die "$PGM: ERROR: unsupported xml structure: one of the $lc_scenario_config parameters for the '$scenario' scenario is a $ref instead of a SCALAR\n";
+					}
+
+					$ref = ref($cfg->{scenario}->{$scenario}->{$scenario_config}->{$net_config_param});
+
+					if ($ref ne 'HASH') {
+						die "$PGM: ERROR: unsupported xml structure: The $scenario_config parameter '$net_config_param parameter' is a '$ref' instead of a HASH reference\n";
+					}
+				}
+			} else {
+				die "$PGM: ERROR: Found unrecognized '$scenario_config' tag under scenario '$scenario'\n";
+			}
+		}
+	}
+
+	if (! exists($cfg->{set})) {
+		die "$PGM: ERROR: unsupported xml structure: You must have at least 1 <set name='my set'> tag\n";
+	}
+
+	$ref = ref($cfg->{set});
+
+	if ($ref ne 'HASH') {
+		die "$PGM: ERROR: unsupported xml structure: set key points to a $ref instead of a HASH\n";
+	}
+
+	foreach my $set (keys %{$cfg->{set}}) {
+
+		$ref = ref($cfg->{set}->{$set});
+
+		if ($ref ne 'HASH') {
+			die "$PGM: ERROR: unsupported xml structure: the '$set' set points to a $ref instead of a HASH\n";
+		}
+
+		if (! exists($cfg->{set}->{$set}->{txn})) {
+			die "$PGM: ERROR: unsupported xml structure: there are no txns defined for the '$set' set\n";
+		}
+
+		$ref = ref($cfg->{set}->{$set}->{txn});
+
+		if ($ref ne 'ARRAY') {
+			die "$PGM: ERROR: unsupported xml structure: the txn tree points to a $ref instead of a HASH in the '$set' set\n";
+		}
+
+		foreach my $txnh (@{$cfg->{set}->{$set}->{txn}}) {
+			$ref = ref($txnh);
+
+			if ($ref ne 'HASH') {
+				die "$PGM: ERROR: unsupported xml structure: the txn tree points to a $ref instead of a HASH in the '$set' set\n";
+			}
+
+			my $txn_key = $txnh->{key};
+
+			foreach my $attr (keys %{$txnh}) {
+				$ref = ref($attr);
+
+				if ($ref ne '') {
+					die "$PGM: ERROR: unsupported xml structure: an attribute of txn key $txn_key in '$set' set is a $ref reference instead of a SCALAR\n";
+				}
+
+				$ref = ref($txnh->{$attr});
+
+				if ($ref ne '') {
+					die "$PGM: ERROR: unsupported xml structure: the '$attr' attribute of txn key $txn_key in '$set' set is a $ref reference instead of a SCALAR\n";
+				}
+			}
+		}
+	}
+}
+
+sub pair_attributes(@) {
+	my @attr_text = ();
+
+	no warnings 'uninitialized';
+
+	for(my $i = 0; $i <= $#_; $i += 2) {
+		push(@attr_text, $_[$i] . '=' . $_[$i + 1]);
+	}
+
+	return join(', ', @attr_text);
+}
+
+
+sub indent($) {
+	return '  ' x $_[0];
+}
+
+sub display_fill_key($$$) {
+  my ($set, $key, $level) = @_;
+
+	my $is_net;
+
+	if (grep { $_ eq $key } $set->net_fill_keys) {
+		$is_net = 1;
+	} else {
+		$is_net = 0;
+	}
+
+	print indent($level) . pair_attributes(
+		fill_key => $key,
+		is_dispensed => $set->is_dispensed(fill_key => $key),
+		is_net => $is_net
+	) . "\n";
+}
+
+
+sub display_claim_key($$$) {
+  my ($set, $key, $level) = @_;
+
+	my $is_net;
+
+	if (grep { $_ eq $key } $set->net_claim_keys) {
+		$is_net = 1;
+	} else {
+		$is_net = 0;
+	}
+
+	print indent($level) . pair_attributes(
+		claim_key => $key,
+		final_status => $set->current_claim_status(claim_key => $key),
+		is_net => $is_net
+	) . "\n";
+}
+
+
+
+sub display_txn_set($$) {
+  my ($set, $level) = @_;
+	my ($rev_by_txn, $rev_by, $dupe_of_txn, $dupe_of, $time_value, @record_set);
+
+	foreach my $txn (@{$set}) {
+
+		$time_value = $txn->txn_timestamp;
+
+		if (ref($time_value) eq 'DateTime') {
+			$time_value = $txn->txn_timestamp->strftime('%Y%m%d %H%M%S.%6N');
+		}
+
+		$dupe_of = $txn->duplicate_of;
+
+		if (defined($dupe_of)) {
+			$dupe_of_txn = $dupe_of->txn_key;
+		} else {
+			$dupe_of_txn = '';
+		}
+
+		$rev_by = $txn->reversed_by;
+
+		if (defined($rev_by)) {
+			$rev_by_txn = $rev_by->txn_key;
+		} else {
+			$rev_by_txn = '';
+		}
+
+		push(@record_set, [
+			txn_key => $txn->txn_key,
+      time => $time_value,
+      epharm_id => $txn->effective_pharmacy_id,
+			dos => $txn->date_of_svc,
+			fill => $txn->fill_number,
+			'rx#' => $txn->rx_number,
+			bin => $txn->bin,
+      txn_code => $txn->txn_code,
+      resp => $txn->txn_response_status,
+      e_resp => $txn->effective_status,
+      is_rej => $txn->is_rejected,
+      is_dup => $txn->is_duplicate,
+      is_rev => $txn->is_reversed,
+      rev_acc_txns => $txn->did_reverse_accepted_txns,
+      rev_pc_txns => $txn->did_reverse_pc_txns,
+      clm_stat => $txn->final_claim_status,
+      last_clm_txn => $txn->is_last_claim_txn,
+      first_clm_txn => $txn->is_first_claim_txn,
+			is_net => $txn->is_net_txn,
+      dup_of => $dupe_of_txn,
+      dupes => join(', ', map { $_->txn_key } $txn->duplicate_txns(order_direction => 'ASC')),
+      rev_by => $rev_by_txn,
+      txn_rev => join(', ', map { $_->txn_key } $txn->reversed_txns(order_direction => 'ASC'))
+			]
+		);
+	}
+
+	display_set(\@record_set, $level);
+	print "\n";
+}
+
+
+sub display_set($$) {
+  my ($record_set, $level) = @_;
+
+	my @max_length = ();
+	my @heading1 = ();
+	my @heading2 = ();
+	my $i;
+
+	foreach my $otxn (@{$record_set}) {
+
+		@heading1 = ();
+
+		for($i = 0; $i < scalar(@{$otxn}); $i += 2) {
+
+			no warnings 'uninitialized';
+
+			if (length($otxn->[$i]) > $max_length[$i]) {
+				$max_length[$i] = length($otxn->[$i]);
+			}
+
+			if (length($otxn->[$i + 1]) > $max_length[$i]) {
+				$max_length[$i] = length($otxn->[$i + 1]);
+			}
+
+			push(@heading1, $otxn->[$i]);
+		}
+	}
+
+	my $print_fmt;
+
+	for(my $i = 0; $i <= $#max_length; $i += 2) {
+		$print_fmt .= '%' . $max_length[$i] . '.' . $max_length[$i] . 's ';
+		push(@heading2, '-' x $max_length[$i]);
+	}
+
+	$print_fmt .= "\n";
+
+	print indent($level);
+	printf($print_fmt, @heading1);
+	print indent($level);
+	printf($print_fmt, @heading2);
+
+	my @vals;
+
+	foreach my $otxn (@{$record_set}) {
+		@vals = ();
+
+		for($i = 1; $i < scalar(@{$otxn}); $i += 2) {
+			push(@vals, $otxn->[$i]);
+		}
+
+		print indent($level);
+
+		no warnings 'uninitialized';
+
+		printf($print_fmt, @vals);
+	}
+}
+
+sub key_type($) {
+  my $method = shift;
+
+	if ($method =~ /claim_keys$/i) {
+		return 'claim_key';
+	} elsif ($method =~ /fill_keys$/i) {
+		return 'fill_key';
+	} elsif ($method =~ /txns$/i) {
+		return 'txn';
+	} else {
+		die "$PGM: ERROR: loop method '$method' is not recognized!\n";
+	}
+}
+
+
+sub show_set($$$) {
+  my ($set, $original_txns, $loop_methods) = @_;
+
+	if (! defined($set)) {
+		die "$PGM: ERROR: show_net_txns(): no txn set was provided!\n";
+	}
+
+	my $num_levels = scalar(@{$loop_methods});
+
+	if ($num_levels == 0) {
+		die "$PGM: ERROR: show_net_txns(): no loop methods were provided for the set\n";
+	}
+
+	if ($num_levels > 3) {
+		die "$PGM: ERROR: show_net_txns(): " . scalar(@{$loop_methods}) . " loop methods were requested, but max supported is 3!\n";
+	}
+
+	my $method1 = $loop_methods->[0];
+	my $key1_type = key_type($method1);
+	my $display_sub1 = 'display_' . key_type($method1);
+	my @method1_opts = ();
+
+	if ($method1 =~ /txns$/i) {
+		@method1_opts = (order_direction => 'ASC');
+	}
+
+	my ($method2, $method3, $display_sub2, $display_sub3, $key2_type, $key3_type, @method2_opts, @method3_opts);
+
+	if ($num_levels >= 2) {
+		if ($method1 =~ /txns$/i) {
+			die "ERROR: $PGM: show_set(): The $method1 loop method can only be the last (innermost) loop used!\n";
+		}
+
+		$method2 = $loop_methods->[1];
+		$key2_type = key_type($method2);
+		$display_sub2 = "display_$key2_type";
+
+		if ($method2 =~ /txns$/i) {
+			@method2_opts = (order_direction => 'ASC');
+		}
+	}
+
+	if ($num_levels >= 3) {
+		if ($method1 =~ /txns$/i) {
+			die "ERROR: $PGM: show_set(): The $method1 loop method can only be the last (innermost) loop used!\n";
+		}
+
+		if ($method2 =~ /txns$/i) {
+			die "ERROR: $PGM: show_set(): The $method2 loop method can only be the last (innermost) loop used!\n";
+		}
+
+		$method3 = $loop_methods->[2];
+		$key3_type = key_type($method3);
+		$display_sub3 = "display_$key3_type";
+
+		if ($method3 =~ /txns$/i) {
+			@method3_opts = (order_direction => 'ASC');
+		}
+	}
+
+	my ($thing1, $thing2, $thing3);
+
+	print "input txns:\n";
+
+	display_set($original_txns, 0);
+
+	print "\n$method1:\n";
+
+	if ($num_levels == 1) {
+		if ($method1 =~ /txns$/i) {
+			display_txn_set($set->$method1(@method1_opts), 1);
+		} else {
+			foreach $thing1 ($set->$method1(@method1_opts)) {
+				eval " $display_sub1(\$set, \$thing1, 1); " || die;
+			}
+		}
+	} elsif ($num_levels == 2) {
+
+		foreach $thing1 ($set->$method1(@method1_opts)) {
+			eval " $display_sub1(\$set, \$thing1, 1); " || die;
+
+			print "\n" . indent(1) . "$method2:\n";
+
+			if ($method2 =~ /txns$/i) {
+				display_txn_set($set->$method2($key1_type => $thing1, @method2_opts), 2);
+			} else {
+				foreach $thing2 ($set->$method2($key1_type => $thing1, @method2_opts)) {
+					 eval " $display_sub2(\$set, \$thing2, 2); " || die;
+				}
+			}
+		}
+
+	} elsif ($num_levels == 3) {
+
+		foreach $thing1 ($set->$method1(@method1_opts)) {
+			eval " $display_sub1(\$set, \$thing1, 1); " || die;
+
+			print "\n" . indent(1) . "$method2:\n";
+
+			foreach $thing2 ($set->$method2($key1_type => $thing1, @method2_opts)) {
+				eval " $display_sub2(\$set, \$thing2, 2); " || die;
+
+				print "\n" . indent(2) . "$method3:\n";
+
+				if ($method3 =~ /txns$/i) {
+					display_txn_set($set->$method3($key2_type => $thing2, @method3_opts), 3);
+				} else {
+					foreach $thing3 ($set->$method3($key2_type => $thing2, @method3_opts)) {
+						eval " $display_sub3(\$set, \$thing3, 3); " || die;
+					}
+				}
+			}
+		}
+
+	}
+
+	#print "\n";
+
+}
+
+sub print_sample_config() {
+
+	print "<test>
+
+    <scenario name='dispensed rrd'>
+      <net_configure>
+        <remove>rejects,reversed,duplicates</remove>
+        <claim_status>paid,captured</claim_status>
+      </net_configure>
+
+      <loop>fill_keys,claim_keys,txns</loop>
+      <set name='simple reversals'/>
+    </scenario>
+
+    <set name='simple reversals'>
+        <txn key='A' tstamp='1' rstatus='P' txn_code='B1' pharm_id='1838291837' alt_pharm_id='0000' dos='20090125' fill='02' rx='3388' bin='382912' />
+        <txn key='B' tstamp='2' rstatus='A' txn_code='B2' pharm_id='1838291837' alt_pharm_id='0001' dos='20090125' fill='' rx='3388' bin='382912' />
+        <txn key='C' tstamp='3' rstatus='P' txn_code='B1' pharm_id='1838291837' alt_pharm_id='0001' dos='20090125' fill='02' rx='3388' bin='382912' />
+        <txn key='D' tstamp='1' rstatus='P' txn_code='B1' pharm_id='1838291837' alt_pharm_id='0000' dos='20090125' fill='02' rx='3388' bin='531629' />
+        <txn key='E' tstamp='2' rstatus='R' txn_code='B1' pharm_id='1838291837' alt_pharm_id='0001' dos='20090125' fill='02' rx='3388' bin='531629' />
+        <txn key='F' tstamp='3' rstatus='P' txn_code='B1' pharm_id='1838291837' alt_pharm_id='0001' dos='20090125' fill='02' rx='3388' bin='531629' />
+        <txn key='G' tstamp='4' rstatus='A' txn_code='B2' pharm_id='1838291837' alt_pharm_id='0001' dos='20090125' fill='02' rx='3388' bin='531629' />
+    </set>
+
+</test>\n";
+
+}
+
+
+if (($ARGV[0] eq '-s') && (scalar(@ARGV) == 1)) {
+	print_sample_config;
+	exit(0);
+}
+
+
+my $config_file = $ARGV[0];
+
+if (! -f $config_file) {
+	die "$PGM: ERROR: Config file $config_file does not exist!\n";
+}
+
+if (! -r $config_file) {
+	die "$PGM: ERROR: No permission to read config file $config_file\n";
+}
+
+my $cfg;
+my @default_loop_methods = qw/fill_keys claim_keys txns/;
+
+my $valid_loop_methods = {
+	txns => 1,
+	net_txns => 1,
+	claim_keys => 1,
+	net_claim_keys => 1,
+	fill_keys => 1,
+	net_fill_keys => 1
+};
+
+
+eval { $cfg = XMLin($config_file, KeyAttr => { scenario => 'name', set => 'name' }, ForceArray => ['scenario', 'set', 'txn'] ) };
+
+if (! defined($cfg)) {
+	die "$PGM: ERROR: Unable to parse xml config file $config_file: $@\n";
+}
+
+check_config($cfg);
+
+my @original_txns;
+
+foreach my $scenario (keys %{$cfg->{scenario}}) {
+	@original_txns = ();
+
+
+	if (! exists($cfg->{scenario}->{$scenario}->{set})) {
+		print "Warning: no set configured for this scenario. Skipping this scenario..\n";
+		next;
+	}
+
+	my @set_names = (keys %{$cfg->{scenario}->{$scenario}->{set}});
+
+	if (scalar(@set_names) > 1) {
+		die "$PGM: ERROR: The '$scenario' scenario refers to more than 1 set, but only 1 set name per scenario is supported at this time!\n";
+	} elsif (scalar(@set_names) == 0) {
+		print "Warning: The '$scenario' scenario does not refer to a set name. Skipping this scenario..\n";
+		next;
+	}
+
+	my $set_name = $set_names[0];
+
+	if (! exists($cfg->{set}->{$set_name})) {
+		print "Warning: set '$set_name' was referenced by the '$scenario' scenario, but it was not defined. Skipping this scenario..\n";
+		next;
+	}
+
+	print "SCENARIO NAME: $scenario\n";
+	print "   Net config: " . pair_attributes(%{$cfg->{scenario}->{$scenario}->{net_configure}}) . "\n";
+	print "      Looping: " . $cfg->{scenario}->{$scenario}->{loop} . "\n";
+	print "          Set: $set_name\n\n";
+
+	my $set = DS::NCPDP::TxnSet->new;
+
+	if (exists($cfg->{scenario}->{$scenario}->{net_configure})) {
+		my $net_config = $cfg->{scenario}->{$scenario}->{net_configure};
+
+		if (exists($net_config->{claim_status})) {
+			$set->net_configure(claim_status => [split(/[^a-z\d_]+/i, $net_config->{claim_status})]);
+		}
+
+		if (exists($net_config->{remove})) {
+			$set->net_configure(remove => [split(/[^a-z\d_]+/i, $net_config->{remove})]);
+		}
+
+		if (exists($net_config->{is_dispensed})) {
+			$set->net_configure(is_dispensed => $net_config->{is_dispensed});
+		}
+	}
+
+	my @loop_methods = ();
+
+	if (exists($cfg->{scenario}->{$scenario}->{loop})) {
+		@loop_methods = split(/[^a-z_]+/i, $cfg->{scenario}->{$scenario}->{loop});
+	} else {
+		@loop_methods = @default_loop_methods;
+	}
+
+	foreach my $loop_method (@loop_methods) {
+		$loop_method = lc($loop_method);
+
+		if (! exists($valid_loop_methods->{$loop_method})) {
+			die "$PGM: ERROR: Loop method '$loop_method' is not recognized in scenario '$scenario'!\n";
+		}
+	}
+
+	foreach my $txnh (@{$cfg->{set}->{$set_name}->{txn}}) {
+
+		my @txn_attributes = ();
+		my $txn = undef;
+		my $txn_key = $txnh->{key};
+
+		foreach my $attr (keys %{$txnh}) {
+
+			my $value = $txnh->{$attr};
+
+			if ($attr =~ /^t.*stamp$/i) {
+				push(@txn_attributes, txn_timestamp => $value);
+			} elsif ($attr =~ /^bin/i) {
+				push(@txn_attributes, bin => $value);
+			} elsif ($attr =~ /^rx/i) {
+				push(@txn_attributes, rx_number => $value);
+			} elsif ($attr =~ /^alt.*pharm/i) {
+				push(@txn_attributes, alt_pharmacy_id => $value);
+			} elsif ($attr =~ /r.*status$/i) {
+				push(@txn_attributes, txn_response_status => $value);
+			} elsif ($attr =~ /^fill/i) {
+				push(@txn_attributes, fill_number => $value);
+			} elsif ($attr =~ /^d.*o.*s/i) {
+				push(@txn_attributes, date_of_svc => $value);
+			} elsif ($attr =~ /^pharm.*id$/i) {
+				push(@txn_attributes, pharmacy_id => $value);
+			} elsif ($attr =~ /^t.*[xc].*n.*code$/i) {
+				push(@txn_attributes, txn_code => $value);
+			} elsif ($attr =~ /^key$/i) {
+				push(@txn_attributes, txn_key => $value);
+			} else {
+				die "$PGM: ERROR: Attribute '$attr' is not recognized for txn key $txn_key of the $set_name set!\n";
+			}
+		}
+
+		eval { $txn = $set->add_txn(@txn_attributes) };
+
+		if (! defined($txn)) {
+			die "$PGM: ERROR: txn key $txn_key could not be added to the $set_name set: $@\n";
+		}
+
+		push(@original_txns, \@txn_attributes);
+
+	}	# foreach txn in this scenario's set
+
+	show_set($set, \@original_txns, \@loop_methods);
+
+	my @not_nettable_txns = $set->cannot_net_txns;
+
+	if (scalar(@not_nettable_txns) >= 1) {
+		print "Not-nettable txns:\n";
+		display_set([map {[txn_key => $_->txn_key, reason => $_->cannot_net_reason]} @not_nettable_txns], 1);
+	}
+
+	print "\n";
+}	# foreach scenario
+
+
+#print Dumper $cfg;
+

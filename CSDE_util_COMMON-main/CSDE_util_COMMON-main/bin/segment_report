@@ -1,0 +1,540 @@
+
+Segment Pricing (11) - TRANSACTION
+==================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  111-AM    Segment Identification                     2                                                    
+  477-BE    Professional Service Fee Submitted         8                                                    
+  409-D9    Ingredient Cost Submitted                  8                                                    
+  412-DC    Dispensing Fee Submitted                   8                                                    
+  423-DN    Basis Of Cost Determination                2                                                    
+  426-DQ    Usual and Customary Charge                 8                                                    
+  430-DU    Gross Amount Due                           8                                                    
+  433-DX    Patient Paid Amount Submitted              8                                                    
+  438-E3    Incentive Amount Submitted                 8                                                    
+  482-GE    Percentage Sales Tax Amount Submitted      8                                                    
+  478-H7    Other Amount Claimed Submitted Count       1                                                    
+  479-H8    Other Amount Claimed Submitted Qualifier   2     R                                              
+  480-H9    Other Amount Claimed Submitted             8     R                                              
+  481-HA    Flat Sales Tax Amount Submitted            8                                                    
+  483-HE    Percentage Sales Tax Rate Submitted        7                                                    
+  484-JE    Percentage Sales Tax Basis Submitted       2                                                    
+
+
+Segment Response Status (21) - TRANSACTION
+==========================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  546-4F    Rejected Field Occurrence Indicator        2     R                                              
+  547-5F    Approved Message Code Count                1                                                    
+  339-6C    Other Payer ID Qualifier                   2     R      Coord of Benefits (05)                  
+  548-6F    Approved Message Code                      3     R                                              
+  340-7C    Other Payer ID                             10    R      Coord of Benefits (05)                  
+  549-7F    Help Desk Phone Number Qualifier           2                                                    
+  550-8F    Help Desk Phone Number                     18                                                   
+  111-AM    Segment Identification                     2                                                    
+  112-AN    Transaction Response Status                1                                                    
+  501-F1    Header Response Status                     1            Response Header (RS)                    
+  503-F3    Authorization Number                       20           Prior Auth (12)                         
+  510-FA    Reject Count                               2                                                    
+  511-FB    Reject Code                                3     R                                              
+  526-FQ    Additional Message Information             200                                                  
+  880-K5    Transaction Reference Number               10           Claim (07)                              
+  991-MH    Other Payer Processor Control Number       10    R      Insurance (04)                          
+  992-MJ    Other Payer Group ID                       15    R      Insurance (04)                          
+  355-NT    Other Payer ID Count                       1                                                    
+  356-NU    Other Payer Cardholder ID                  20    R      Insurance (04)                          
+
+
+Segment Coord of Benefits (05) - TRANSACTION
+============================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  337-4C    Coordination of Benefits/Other Payments    1                                                    
+  338-5C    Other Payer Coverage Type                  2     R                                              
+  471-5E    Other Payer Reject Count                   2                                                    
+  339-6C    Other Payer ID Qualifier                   2     R      Response Status (21)                    
+  472-6E    Other Payer Reject Code                    3     R                                              
+  340-7C    Other Payer ID                             10    R      Response Status (21)                    
+  111-AM    Segment Identification                     2                                                    
+  431-DV    Other Payer Amount Paid                    8     R                                              
+  443-E8    Other Payer Date                           8     R                                              
+  341-HB    Other Payer Amount Paid Count              1                                                    
+  342-HC    Other Payer Amount Paid Qualifier          2     R                                              
+  351-NP    Other Payer-Patient Responsibility Amoun   1     R                                              
+  352-NQ    Other Payer-Patient Responsibility Amoun   10    R                                              
+  353-NR    Other Payer-Patient Responsibility Amoun   1                                                    
+
+
+Segment User Tranmission Header (UT) - TRANSMISSION
+===================================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+
+
+Segment Response Prior Auth (26) - TRANSACTION
+==============================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  111-AM    Segment Identification                     2                                                    
+  498-PR    Prior Authorization Processed Date         8                                                    
+  498-PS    Prior Authorization Effective Date         8                                                    
+  498-PT    Prior Authorization Expiration Date        8                                                    
+  498-PW    Prior Authorization Number Of Refills Au   2                                                    
+  498-PX    Prior Authorization Quantity Accumulated   10                                                   
+  498-PY    Prior Authorization Number-Assigned        11           Prior Auth (12)                         
+  498-RA    Prior Authorization Quantity               10                                                   
+  498-RB    Prior Authorization Dollars Authorized     8                                                    
+
+
+Segment Insurance (04) - TRANSMISSION
+=====================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  336-8C    Facility ID                                10                                                   
+  111-AM    Segment Identification                     2                                                    
+  301-C1    Group ID                                   15           Response Insurance (25)                 
+  302-C2    Cardholder ID                              20                                                   
+  303-C3    Person Code                                3                                                    
+  306-C6    Patient Relationship Code                  1                                                    
+  309-C9    Eligibility Clarification Code             1                                                    
+  312-CC    Cardholder First Name                      12                                                   
+  313-CD    Cardholder Last Name                       15                                                   
+  314-CE    Home Plan                                  3                                                    
+  524-FO    Plan ID                                    8            Response Insurance (25)                 
+  990-MG    Other Payer Processor Control Number       6                                                    
+  991-MH    Other Payer Processor Control Number       10           Response Status (21)                    
+  992-MJ    Other Payer Group ID                       15           Response Status (21)                    
+  356-NU    Other Payer Cardholder ID                  20           Response Status (21)                    
+
+
+Segment Pharmacy Provider (02) - TRANSACTION
+============================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  111-AM    Segment Identification                     2                                                    
+  444-E9    Provider ID                                15                                                   
+  465-EY    Provider ID Qualifier                      2                                                    
+
+
+Segment Response Claim (22) - TRANSACTION
+=========================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  551-9F    Preferred Product Count                    1                                                    
+  111-AM    Segment Identification                     2                                                    
+  552-AP    Preferred Product ID Qualifier             2     R                                              
+  553-AR    Preferred Product ID                       19    R                                              
+  554-AS    Preferred Product Incentive                8     R                                              
+  555-AT    Preferred Product Copay Incentive          8     R                                              
+  556-AU    Preferred Product Description              40    R                                              
+  402-D2    Prescription/ Service Reference Number     7            Claim (07)                              
+  455-EM    Prescription/ Service Reference Number Q   1            Claim (07)                              
+
+
+Segment DUR PPS (08) - TRANSACTION
+==================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  473-7E    DUR/PPS Code Counter                       1     R                                              
+  474-8E    DUR/PPS Level Of Effort                    2     R                                              
+  111-AM    Segment Identification                     2                                                    
+  439-E4    Reason For Service Code                    2     R      Response DUR PPS (24)                   
+  440-E5    Professional Service Code                  2     R                                              
+  441-E6    Result of Service Code                     2     R                                              
+  476-H6    DUR Co-Agent ID                            19    R                                              
+  475-J9    DUR Co-Agent ID Qualifier                  2     R                                              
+
+
+Segment Prescriber (03) - TRANSACTION
+=====================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  467-1E    Prescriber Location Code                   3                                                    
+  468-2E    Primary Care Provider ID Qualifier         2                                                    
+  470-4E    Primary Care Provider Last Name            15                                                   
+  111-AM    Segment Identification                     2                                                    
+  411-DB    Prescriber ID                              15                                                   
+  421-DL    Primary Care Provider ID                   15                                                   
+  427-DR    Prescriber Last Name                       15                                                   
+  466-EZ    Prescriber ID Qualifier                    2                                                    
+  469-H5    Primary Care Provider Location Code        3                                                    
+  498-PM    Prescriber Phone Number                    10                                                   
+
+
+Segment Response Pricing (23) - TRANSACTION
+===========================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  111-AM    Segment Identification                     2                                                    
+  557-AV    Tax Exempt Indicator                       1                                                    
+  558-AW    Flat Sales Tax Amount Paid                 8                                                    
+  559-AX    Percentage Sales Tax Amount Paid           8                                                    
+  560-AY    Percentage Sales Tax Rate Paid             7                                                    
+  561-AZ    Percentage Sales Tax Basis Paid            2                                                    
+  505-F5    Patient Pay Amount                         8                                                    
+  506-F6    Ingredient Cost Paid                       8                                                    
+  507-F7    Dispensing Fee Paid                        8                                                    
+  509-F9    Total Amount Paid                          8                                                    
+  512-FC    Accumulated Deductible Amount              8                                                    
+  513-FD    Remaining Deductible Amount                8                                                    
+  514-FE    Remaining Benefit Amount                   8                                                    
+  517-FH    Amount Applied To Periodic Deductible      8                                                    
+  518-FI    Amount Of Copay/Coinsurance                8                                                    
+  519-FJ    Amount Attributed To Product Selection     8                                                    
+  520-FK    Amount Exceeding Periodic Benefit Maximu   8                                                    
+  521-FL    Incentive Amount Paid                      8                                                    
+  522-FM    Basis Of Reimbursement Determination       2                                                    
+  523-FN    Amount Attributed To Sales Tax             8                                                    
+  346-HH    Basis Of Calculation-Dispensing Fee        2                                                    
+  347-HJ    Basis Of Calculation-Copay                 2                                                    
+  348-HK    Basis Of Calculation-Flat Sales Tax        2                                                    
+  349-HM    Basis Of Calculation-Percentage Sales Ta   2                                                    
+  562-J1    Professional Service Fee Paid              8                                                    
+  563-J2    Other Amount Paid Count                    1                                                    
+  564-J3    Other Amount Paid Qualifier                2     R                                              
+  565-J4    Other Amount Paid                          8     R                                              
+  566-J5    Other Payer Amount Recognized              8                                                    
+  571-NZ    Amount Attributed to Processor Fee         8                                                    
+
+
+Segment Narrative (16) - TRANSACTION
+====================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  111-AM    Segment Identification                     2                                                    
+  390-BM    Narrative Message                          200                                                  
+
+
+Segment Clinical (13) - TRANSACTION
+===================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  111-AM    Segment Identification                     2                                                    
+  424-DO    Diagnosis Code                             15    R                                              
+  495-H1    Measurement Time                           4     R                                              
+  496-H2    Measurement Dimension                      2     R                                              
+  497-H3    Measurement Unit                           2     R                                              
+  499-H4    Measurement Value                          15    R                                              
+  491-VE    Diagnosis Code Count                       1                                                    
+  492-WE    Diagnosis Code Qualifier                   2     R                                              
+  493-XE    Clinical Information Counter               1     R                                              
+  494-ZE    Measurement Date                           8     R                                              
+
+
+Segment Workers Comp (06) - TRANSACTION
+=======================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  111-AM    Segment Identification                     2                                                    
+  315-CF    Employer Name                              30                                                   
+  316-CG    Employer Street Address                    30                                                   
+  317-CH    Employer City Address                      20                                                   
+  318-CI    Employer State/ Province Address           2                                                    
+  319-CJ    Employer Zip/ Postal Zone                  15                                                   
+  320-CK    Employer Phone Number                      10                                                   
+  321-CL    Employer Contact Name                      30                                                   
+  327-CR    Carrier ID                                 10                                                   
+  434-DY    Date Of Injury                             8                                                    
+  435-DZ    Claim/Reference ID                         30                                                   
+
+
+Segment Response Header (RS) - TRANSMISSION
+===========================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  102-A2    Version/Release Number                     2            Request Header (RQ)                     
+  103-A3    Transaction Code                           2            Request Header (RQ)                     
+  109-A9    Transaction Count                          1            Request Header (RQ)                     
+  201-B1    Service Provider ID                        15           Request Header (RQ)                     
+  202-B2    Service Provider ID Qualifier              2            Request Header (RQ)                     
+  401-D1    Date Of Service                            8            Request Header (RQ)                     
+  501-F1    Header Response Status                     1            Response Status (21)                    
+
+
+Segment Response Insurance (25) - TRANSMISSION
+==============================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  545-2F    Network Reimbursement ID                   10                                                   
+  111-AM    Segment Identification                     2                                                    
+  301-C1    Group ID                                   15           Insurance (04)                          
+  524-FO    Plan ID                                    8            Insurance (04)                          
+  568-J7    Payer ID Qualifier                         2                                                    
+  569-J8    Payer ID                                   10                                                   
+
+
+Segment Patient (01) - TRANSMISSION
+===================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  334-1C    Smoker/Non-Smoker Code                     1                                                    
+  335-2C    Pregnancy Indicator                        1                                                    
+  384-4X    Patient Residence                          2                                                    
+  111-AM    Segment Identification                     2                                                    
+  304-C4    Date Of Birth                              8                                                    
+  305-C5    Patient Gender Code                        1                                                    
+  307-C7    Place of Service                           2                                                    
+  310-CA    Patient First Name                         12                                                   
+  311-CB    Patient Last Name                          15                                                   
+  322-CM    Patient Street Address                     30                                                   
+  323-CN    Patient City Address                       20                                                   
+  324-CO    Patient State/Province Address             2                                                    
+  325-CP    Patient Zip/Postal Zone                    15                                                   
+  326-CQ    Patient Phone Number                       10                                                   
+  331-CX    Patient ID Qualifier                       2                                                    
+  332-
+  333-CZ    Employer ID                                15                                                   
+  350-HN    Patient E-Mail Address                     80                                                   
+
+
+Segment Legacy Request (3Q) - TRANSACTION
+=========================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  404-D4    Metric Quantity                            5                                                    
+  410-DA    Sales Tax                                  12                                                   
+  416-DG    Prior Authorization/Medical Certificatio   12                                                   
+  422-DM    Clinic ID Number                           5                                                    
+  425-DP    Drug Type                                  1                                                    
+  428-DS    Postage Amount Claimed                     4                                                    
+  432-DW    Basis Of Days Supply Determination         1                                                    
+  437-E2    Alternate Product Code                     13                                                   
+  508-F8    Sales Tax Paid                             6            Legacy Response (3S)                    
+  515-FF    Postage Amount Paid                        4                                                    
+  516-FG    Drug Description                           30                                                   
+
+
+Segment Prior Auth (12) - TRANSACTION
+=====================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  111-AM    Segment Identification                     2                                                    
+  503-F3    Authorization Number                       20           Response Status (21)                    
+  498-PA    Request Type                               1                                                    
+  498-PB    Request Period Date-Begin                  8                                                    
+  498-PC    Request Period Date-End                    8                                                    
+  498-PD    Basis Of Request                           2                                                    
+  498-PE    Authorized Representative First Name       12                                                   
+  498-PF    Authorized Representative Last Name        15                                                   
+  498-PG    Authorized Representative Street Address   30                                                   
+  498-PH    Authorized Representative City Address     20                                                   
+  498-PJ    Authorized Representative State/Province   2                                                    
+  498-PK    Authorized Representative Zip/Postal Zon   15                                                   
+  498-PP    Prior Authorization Supporting Documenta   500                                                  
+  498-PY    Prior Authorization Number-Assigned        11           Response Prior Auth (26)                
+
+
+Segment Response Message (20) - TRANSMISSION
+============================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  111-AM    Segment Identification                     2                                                    
+  504-F4    Message                                    200          Legacy Response (3S)                    
+
+
+Segment Additional Documentation (14) - TRANSACTION
+===================================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  369-2Q    Additional Documentation Type ID           3                                                    
+  370-2R    Length Of Need                             3                                                    
+  371-2S    Length of Need Qualifier                   2                                                    
+  372-2T    Prescriber/Supplier Date Signed            8                                                    
+  373-2U    Request Status                             1                                                    
+  374-2V    Request Period Begin Date                  8                                                    
+  375-2W    Request Period Recert/Revised Date         8                                                    
+  376-2X    Supporting Documentation                   65                                                   
+  377-2Z    Question Number/Letter Count               2                                                    
+  378-4B    Question Number/Letter                     3     R                                              
+  379-4D    Question Percent Response                  5     R                                              
+  380-4G    Question Date Response                     8     R                                              
+  381-4H    Question Dollar Amount Response            11    R                                              
+  382-4J    Question Numeric Response                  11    R                                              
+  383-4K    Question Alphanumeric Response             30    R                                              
+  111-AM    Segment Identification                     2                                                    
+
+
+Segment Facility (15) - TRANSACTION
+===================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  364-2J    Prescriber First Name                      12                                                   
+  365-2K    Prescriber Street Address                  30                                                   
+  366-2M    Prescriber City Address                    20                                                   
+  367-2N    Prescriber State/Province Address          2                                                    
+  368-2P    Prescriber ZIP/Postal Zone                 15                                                   
+  385-3Q    Facility Name                              30                                                   
+  386-3U    Facility Street Address                    30                                                   
+  387-3V    Facility State/Province Address            2                                                    
+  388-5J    Facility City Address                      20                                                   
+  389-6D    Facility ZIP/Postal Address                15                                                   
+  111-AM    Segment Identification                     2                                                    
+
+
+Segment User Request Info (UQ) - TRANSMISSION
+=============================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+
+
+Segment Legacy Response (3S) - TRANSACTION
+==========================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  504-F4    Message                                    200          Response Message (20)                   
+  508-F8    Sales Tax Paid                             6            Legacy Request (3Q)                     
+  525-FP    DUR Response Data                          160                                                  
+  535-FZ    DUR Overflow                               1                                                    
+
+
+Segment Legacy Header Request (3H) - TRANSMISSION
+=================================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  105-A5    Payment Processor ID                       10                                                   
+  106-A6    Terminal ID                                7                                                    
+  107-A7    System ID                                  7                                                    
+  329-CT    Patient SSN                                9                                                    
+
+
+Segment Claim (07) - TRANSACTION
+================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  600-28    Unit Of Measure                            2                                                    
+  111-AM    Segment Identification                     2                                                    
+  308-C8    Other Coverage Code                        2                                                    
+  330-CW    Alternate ID                               20                                                   
+  402-D2    Prescription/ Service Reference Number     7            Response Claim (22)                     
+  403-D3    Fill Number                                2                                                    
+  405-D5    Days Supply                                3                                                    
+  406-D6    Compound Code                              1                                                    
+  407-D7    Product/Service ID                         19                                                   
+  408-D8    Dispense As Written (DAW)/ Product Selec   1                                                    
+  414-DE    Date Prescription Written                  8                                                    
+  415-DF    Number of Refills Authorized               2                                                    
+  418-DI    Level Of Service                           2                                                    
+  419-DJ    Prescription Origin Code                   1                                                    
+  420-DK    Submission Clarification Code              2     R                                              
+  429-DT    Unit Dose Indicator                        1                                                    
+  436-E1    Product/Service ID Qualifier               2                                                    
+  442-E7    Quantity Dispensed                         10                                                   
+  445-EA    Originally Prescribed Product/Service Co   19                                                   
+  446-EB    Originally Prescribed Quantity             10                                                   
+  453-EJ    Originally Prescribed Product/Service ID   2                                                    
+  454-EK    Scheduled Prescription ID Number           12                                                   
+  455-EM    Prescription/ Service Reference Number Q   1            Response Claim (22)                     
+  456-EN    Associated Prescription/Service Referenc   7                                                    
+  457-EP    Associated Prescription/Service Date       8                                                    
+  459-ER    Procedure Modifier Code                    2     R                                              
+  460-ET    Quantity Prescribed                        10                                                   
+  461-EU    Prior Authorization Type Code              2                                                    
+  462-EV    Prior Authorization Number Submitted       11                                                   
+  463-EW    Intermediary Authorization Type ID         2                                                    
+  464-EX    Intermediary Authorization ID              11                                                   
+  343-HD    Dispensing Status                          1                                                    
+  344-HF    Quantity Intended To Be Dispensed          10                                                   
+  345-HG    Days Supply Intended To Be Dispensed       3                                                    
+  880-K5    Transaction Reference Number               10           Response Status (21)                    
+  357-NV    Delay Reason Code                          2                                                    
+  354-NX    Submission Clarification Code Count        1                                                    
+  458-SE    Procedure Modifier Code Count              2                                                    
+
+
+Segment Response DUR PPS (24) - TRANSACTION
+===========================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  111-AM    Segment Identification                     2                                                    
+  439-E4    Reason For Service Code                    2     R      DUR PPS (08)                            
+  527-FR    Drug Conflict Code                         2     R                                              
+  528-FS    Clinical Significance Code                 1     R                                              
+  529-FT    Other Pharmacy Indicator                   1     R                                              
+  530-FU    Previous Date of Fill                      8     R                                              
+  531-FV    Quantity Of Previous Fill                  10    R                                              
+  532-FW    Database Indicator                         1     R                                              
+  533-FX    Other Prescriber Indicator                 1     R                                              
+  544-FY    DUR Free Text Message                      30    R                                              
+  567-J6    DUR/PPS Response Code Counter              1     R                                              
+  570-NS    DUR Additional Text                        100   R                                              
+
+
+Segment User Response Info (US) - TRANSMISSION
+==============================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+
+
+Segment Compound (10) - TRANSACTION
+===================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  111-AM    Segment Identification                     2                                                    
+  447-EC    Compound Ingredient Component Count        2                                                    
+  448-ED    Compound Ingredient Quantity               10    R                                              
+  449-EE    Compound Ingredient Drug Cost              8     R                                              
+  450-EF    Compound Dosage Form Description Code      2                                                    
+  451-EG    Compound Dispensing Unit Form Indicator    1                                                    
+  452-EH    Compound Route of Administration           2                                                    
+  488-RE    Compound Product ID Qualifier              2     R                                              
+  489-TE    Compound Product ID                        19    R                                              
+  490-UE    Compound Ingredient Basis of Cost Determ   2     R                                              
+
+
+Segment Coupon (09) - TRANSACTION
+=================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  111-AM    Segment Identification                     2                                                    
+  485-KE    Coupon Type                                2                                                    
+  486-ME    Coupon Number                              15                                                   
+  487-NE    Coupon Value Amount                        8                                                    
+
+
+Segment Request Header (RQ) - TRANSMISSION
+==========================================
+
+  NCPDP ID  Field Name                                 Width Repeat Other Segments                          
+  --------  ----------                                 ----- ------ --------------                          
+  101-A1    BIN Number                                 6                                                    
+  102-A2    Version/Release Number                     2            Response Header (RS)                    
+  103-A3    Transaction Code                           2            Response Header (RS)                    
+  104-A4    Processor Control Number                   10                                                   
+  109-A9    Transaction Count                          1            Response Header (RS)                    
+  110-AK    Software Vendor/Certification ID           10                                                   
+  201-B1    Service Provider ID                        15           Response Header (RS)                    
+  202-B2    Service Provider ID Qualifier              2            Response Header (RS)                    
+  401-D1    Date Of Service                            8            Response Header (RS)                    
+
+

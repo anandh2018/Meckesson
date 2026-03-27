@@ -1,0 +1,40 @@
+
+if [ ! -d "$DS_BASE_DIR" ]
+  then
+		echo "ERROR: DS_BASE_DIR environment variable is '$DS_BASE_DIR', which is not an existing directory"
+		exit 1
+fi
+
+
+for FILE in $*
+do
+echo "Decrypting $FILE"
+
+echo $FILE | grep "[.]pgp$" > /dev/null
+
+if [ $? != 0 ]
+then
+	echo "File appears not to be a pgp file"
+	exit 1
+fi
+
+NEW_FILE=`echo $FILE | sed "s/[.]pgp//"`
+
+#gpg --quiet --no-tty --no-permission-warning --passphrase-fd 0 --skip-verify --decrypt $FILE < /ds/gnupg/.pp > $NEW_FILE
+cat /ds/gnupg/.pp | gpg --batch --quiet --no-tty --no-permission-warning --passphrase-fd 0 --decrypt --no $FILE > $NEW_FILE
+
+RET=$?
+
+echo $RET
+
+if [ $RET != 0 ]
+then
+	echo "Error ($RET) decrypting $FILE "
+else
+  rm -f $FILE
+fi 
+
+done
+
+exit 200
+

@@ -1,0 +1,1514 @@
+#!/usr/bin/perl
+
+eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
+
+# fact_rx_load_rh: Load RelayHealth pharmacy network data into Data Services data warehouse
+#
+# Author: J. Hess, RelayHealth
+#
+# Version history:
+#
+# 4/2/2008 - Version 1.0
+# - Initial release
+#
+# 4/4/2008 - Version 1.0.1
+# - Added -patient-match-type option
+#
+# 4/8/2008 - Version 1.0.2
+# - Added DIM_PHARM_CACHE_THRESHOLD parameter to NCPDP parser constructor, because
+# tests showed that the process runs faster with a large value than the default of 100
+# that exists in the parser. (i.e. select-per-unique pharmacy faster than pulling back all
+# pharmacies). This was tested for a single auditlog file.
+#
+# 4/30/2008 - Version 1.0.3
+# - Added -log-file parameter to Patient dimension constructor
+#
+# 5/7/2008 - Version 1.0.4
+# - Added optional -patient-debug-filename and -patient-debug-tablename parameters
+#
+# 5/14/2008 - Version 1.0.5
+# - Added optional -patient-input-size parameter
+#
+# 5/16/2008 - Version 1.0.6
+# - Add system_id parameter to patient dimension capture call
+# - Remove payer_id_qualifier from patient dimension capture call
+# - Concatenate literal 'BIN' and payer values for payer parameter in patient dimension capture call
+#
+# 5/18/2008 - Version 1.0.7
+# - Added -patient-bulk-size parameter
+#
+# 5/19/2008 - Version 1.0.8
+# - Added post_date parameters to ->capture() calls of fact_rx_trans and fact_rx_cob objects
+#
+# 5/20/2008 - Version 1.0.9
+# - Changed txn_num parameter in capture() calls to txn_id
+# - Remove literal 'BIN' prefix from payer parameter in patient dimension capture call
+#
+# 5/21/2008 - Version 1.0.10
+# - Changed $DEFAULT_DIMENSION_SCHEMA to 'DIM_TEST'
+# - Changed $DEFAULT_FACT_SCHEMA to 'DW_TEST'
+# - $post_date is now dynamically derived upon each iteration of main parse_next_transaction() loop (in case multiple audit logs are being processed)
+#
+# 5/22/2008 - Version 1.1
+# - Added the following parameters:
+#   -patient-schema
+#   -dimension-schema
+#   -fact-schema
+# - Added -schema-suffix parameter (for conviently setting all 3 schemas above w/one parameter)
+# - Removed -patient-mode parameter (replaced by new parameters above)
+# - Added -db-instance parameter
+# - Password for patient schema is now obtained from the appropriate environment variable and
+#   passed in to the Patient constructor (along with patient schema and database instance).
+# - Removed instance_id parameter derivation. It is no longer needed or passed into patient constructor,
+#   since global temp tables are now used by Patient package.
+#
+# 5/23/2008 - Version 1.1.1
+# - Added -log-to-file option
+# - Added -log-filename option
+# - Added -keep-log option
+# 
+# 5/26/2008 - Version 1.1.2
+# - Added -log-dir option
+#
+# 5/27/2008 - Version 1.1.3
+# - Using -log-dir option now implies -log-to-file option
+#
+# 5/28/2008 - Version 1.1.4
+# - Check for no cmd-line parameters (to display usage) BEFORE constructing any objects
+# - Removed -db-instance parameter. It is now parsed from patient schema connection string.
+# - The -patient-bulk-size option now defaults to 50
+# - The -patient-input-size option now defaults to 1000
+# - The -patient-log-level option now defaults to WARN
+# - The -pharmacy-include option now limits caching to pharmacies in the file (instead of all pharmacies).
+#   This improves performance when this option is used and pharmacy list is small compared to all pharmacies.
+# - Corrected -patient-reporting option name in Usage display.
+# - Changed -patient-reporting and -load-debug options to be argumentless (intellectual wimps)
+# - Removed -debug-capture option
+#
+# 5/29/2008 - Version 1.1.5
+# - The db_instance and db_password parameters are no longer derived or passed in to the
+#   Patient.pm constructor, since the constructor now derives them based on db_username
+#   (via the new get_connection_info() function in BLUELITE::Database).
+# - Removed response status filter from NCPDP parser so that all statuses are included. Previously,
+#   only approved, captured, and paid txns were included.
+# - Added reversals to NCPDP txn type filter.
+# - Renamed -txn-limit option to -txn-parse-limit.
+#
+# 6/30/2008 - Version 1.2
+# - Added BLUELITE::Job package support (via new -app-id and -worker-id command line options)
+# to accomodate daily production processing.
+# Note: -app_id is an alias for -app-id; likewise for -worker_id.
+# - Invalid command-line options now cause status code 88 to be returned and command-line usage to be displayed.
+# - Removed potential for 'illegal division by zero' when calculating throughput capture stat
+#
+# 7/8/2008 - Version 1.5
+# - Added support for skipping patient matching (via command-line option -patient-match-type NONE)
+#
+# 7/21/2008 - Version 1.6
+# - Changed -schema-suffix option to -env option (environment), to take advantage of more general method
+# of specifying schema sets (via Functional.pm and Fact.pm new/config methods). Explicit schema names
+# are still supported via -dimension-schema, -patient-schema, and -fact-schema options, which override
+# -env option.
+#
+# 9/15/2008 - Version 1.7
+# - Added -fact-commit-interval option
+# - By default, logfile name now uses worker id for filename prefix instead of auditlog filename when
+# worker-id option is used.
+#
+# 9/16/2008 - Version 1.71
+# - Fixed bug that prevented emails from being sent when mydie() is called. The email() function was
+# missing.
+#
+# 9/19/2008 - Version 1.72
+# - Added BEGIN{} section that initializes $EXIT_SUCCESS and $EXIT_FAILURE, to avoid 'uninitialized value'
+# perl warning if script dies VERY early in execution.
+#
+# 10/6/2008 - Version 1.73
+# - Added call to $WORKER->txn_processed() to set total rows inserted for the worker
+#
+# 10/16/2008 - Version 1.74
+# - Added "$!" error info to "Unhandled exception" message in END block
+#
+# 10/29/2008 - Version 1.75
+# - Auto-generated logfile name now includes process id (i.e. $$). This was done because the log file
+# for failed processes was getting overwritten by a subsequent successful retry of the same worker,
+# which made it nearly impossible to determine why it failed the first time.
+#
+# 10/29/2008 - Version 1.76
+# - Added PDC 17 to the list of default PDCs
+#
+# 02/12/2010 - Version 1.77 (Surjit Sahoo)
+# - Added -post-date command line option to facilitate reload of auditlog history
+# - To manage command-line-args better, completely remove code supporting multiple auditlog files.
+# - Added -help command-line option to display verbose command-line usage
+#
+# 03/29/2010 - Version 1.78 (Surjit Sahoo)
+# - Fixed a bug that always added the log_file option to Patient Dimension constructor options.
+#
+# 3/29/2012 - Version 1.79 (John Hess)
+# - Repeating scalar values are now truncated to 1024 total bytes before insert to avoid "value too large" error.
+#
+# 9/4/2012 - Version 1.79b (John Hess)
+# - Fixed bug in regular expression in retrieve_scalar_numeric_columns that allowed "1+" to pass as a valid
+# numeric value, which, finally after billions of rows, caused database INSERTion failure.
+#
+
+
+our $VERSION_NUMBER = '1.79b';
+our $VERSION_DATE = '09/4/2012';
+our $COPYRIGHT = '2008-2012';
+our $COMPANY = 'RelayHealth';
+
+use BLUELITE::NCPDP::Parser;
+use BLUELITE::DataRights;
+
+use DS::DW::Fact::RxTrans;
+use DS::DW::Fact::RxCOB;
+
+use DS::Dimension::Functional::Std::BinPCN;
+use DS::Dimension::Functional::Std::Rx;
+use DS::Dimension::Functional::Std::RxCost;
+use DS::Dimension::Functional::Std::Drug;
+use DS::Dimension::Functional::Std::Pharmacy;
+use DS::Dimension::Functional::Std::Tandem;
+use DS::Dimension::Functional::EMI::Provider;
+use DS::Dimension::Functional::EMI::Patient;
+use BLUELITE::Dimension::Address;
+use BLUELITE::Database qw(get_connection_info schema);
+use BLUELITE::Job;
+
+use Getopt::Long;
+use Sys::Hostname;
+
+use Data::Dumper;
+use Date::Calc;
+
+use strict;
+use warnings;
+
+our ($DEBUG, $WORKER, $FAILURE_EMAIL, $EXIT_SUCCESS, $EXIT_FAILURE);
+
+BEGIN {
+	our $EXIT_SUCCESS = 0; # default
+	our $EXIT_FAILURE = 80; # default
+}
+
+my @DEFAULT_PRODUCT_CODES = (12, 39, 17);
+
+my $SOURCE_ID = 'R';	# This script for loading RelayHealth Rx switch data
+
+our $PGM;
+$PGM = $0;
+$PGM =~ s|.*/||g;
+
+our $DEFAULT_APP_ID = $PGM;
+our $APP_ID;
+
+our $PATIENT_SYSTEMCODE = 'R';
+our $PATIENT_REPORTING_SWITCH;
+our $PARSER_LOG_LEVEL = 'ERROR';
+our $patient_debug_filename;
+our $patient_debug_tablename;
+our $PATIENT_INPUT_SIZE = 1000;
+our $PATIENT_BULK_SIZE = 50;
+our $DEFAULT_PDC_TEXT = join(',', @DEFAULT_PRODUCT_CODES);
+our $INCLUDE_VERBOTEN = 'false';
+our $PATIENT_LOG_LEVEL = 'WARN';
+our $DEFAULT_ENV = 'TEST';
+our $PATIENT_MATCH_TYPE = 'bulk';
+our $INCLUSION_PHARMACIES;
+
+our $LOGDIR;
+our $LOGFILE;
+our $LOG_TO_FILE = 0;
+our $KEEP_LOG = 0;
+
+
+sub email(%) {
+  my %option = @_;
+
+  my $mail = new Mail::SendEasy( smtp => $ENV{DEFAULT_SMTP_SERVER});
+
+  if (! defined($mail) ) {
+    print STDERR "Unable to establish a SMTP connection to " . $ENV{DEFAULT_SMTP_SERVER} . " . Cannot send email.\n";
+    return undef;
+  }
+
+  if (exists($option{msg}) && ! exists($option{html})) {
+    $option{html} = $option{msg};
+    $option{html} =~ s/\n/<br>/g;
+  }
+
+  my $status = $mail->send(
+    from => 'DataServicesNotification@relayhealth.com',
+    from_title => 'RelayHealth Data Services',
+    %option
+  );
+
+  if (! $status) {
+    print STDERR $mail->error . "\n";
+    return undef;
+  }
+
+  return 1;
+}
+
+
+our $MYDIE_CALLED = 0;
+
+sub mydie(;$) {
+
+  return undef if ($MYDIE_CALLED);
+
+  $MYDIE_CALLED = 1;
+
+  my $message = shift;
+  my $exit_code;
+
+  if (defined($message)) {
+    chomp($message);
+    $message = "$PGM: ERROR: $message";
+  }
+
+  if (defined($WORKER)) {
+    $message .= "\nWorker ID = " . $WORKER->worker_id . ".\n" if (defined($WORKER->worker_id));
+
+    if ($WORKER->status('FAILED')) {
+    	$EXIT_FAILURE = $WORKER->worker_exit;
+    } else {
+      $message .= "\n$PGM: ERROR: Unable to update status of worker id " . $WORKER->worker_id . " to FAILED\n";
+		}
+  }
+
+  print STDERR $message . "\n";
+
+  if (defined($FAILURE_EMAIL)) {
+
+		my $app_id;
+
+		if (defined($APP_ID)) {
+			$app_id = $APP_ID;
+		} else {
+			$app_id = $DEFAULT_APP_ID;
+		}
+
+    email(
+      to => $FAILURE_EMAIL,
+      subject => $app_id . ' worker extraction process FAILED',
+      msg => $message
+    );
+  }
+
+  exit($EXIT_FAILURE);
+}
+
+
+#our $MYEXIT_CALLED = 0;
+
+sub myexit() {
+
+#  return undef if ($MYEXIT_CALLED);
+#
+#  $MYEXIT_CALLED = 1;
+
+  if (defined($WORKER)) {
+		$EXIT_SUCCESS = $WORKER->worker_exit if (defined($WORKER->worker_exit));
+
+    if (! ($WORKER->status('COMPLETED'))) {
+      print STDERR "$PGM: ERROR: Unable to update status of worker id " . $WORKER->worker_id . " to COMPLETED\n";
+      $WORKER->status('FAILED');  # might not work, but we can try
+      exit(1);
+    }
+
+		$EXIT_SUCCESS = $WORKER->worker_exit if (defined($WORKER->worker_exit));
+	}
+
+  unlink($LOGFILE) if ($LOG_TO_FILE && ! $KEEP_LOG);
+
+	$EXIT_SUCCESS = 0 if (! defined($EXIT_SUCCESS));
+  exit($EXIT_SUCCESS);
+}
+
+
+
+sub sum_numeric($) {
+	my ($number, $number_sum);
+
+	foreach $number (@{$_[0]}) {
+		$number_sum += $number if (defined($number));
+	}
+
+	if (defined($number_sum)) {
+		return $number_sum;
+	} else {
+		return undef;
+	}
+}
+
+
+sub zip5($) {
+	return undef if (! defined($_[0]));
+
+	if ($_[0] =~ /^[^\d]*(\d\d\d\d\d)/) {
+		return $1;
+	} else {
+		return undef;
+	}
+}
+
+sub valid_date($) {
+	my $date = shift;
+
+	return (defined $date &&
+	($date =~ /^(\d{4})(\d\d)(\d\d)$/) &&
+	Date::Calc::check_date($1, $2, $3));
+}
+
+our $PHARM_INFO;
+
+sub pharmacy_info() {
+	return $PHARM_INFO if (defined($PHARM_INFO));
+
+	$DEBUG && print "loading DIM_ADDRESS info..\n";
+
+	my $time = time;
+
+	my $dim_address = BLUELITE::Dimension::Address->new || die "$PGM: pharmacy_info(): Could not obtain a BLUELITE::Dimension::Address object\n";
+
+	my @search_parms = (latest_date => 1, customer_type => ['P', 'N'], select_attributes => ['customer_num', 'zip']);
+	push(@search_parms, customer_num => $INCLUSION_PHARMACIES) if (defined($INCLUSION_PHARMACIES));
+
+	my $result = $dim_address->search(@search_parms);
+	my ($id, $zip);
+	my $pharmacies_cached = 0;
+
+	foreach my $row (@{$result}) {
+		$id = $row->{ATTRIBUTE}->{customer_num};
+		$zip = zip5($row->{ATTRIBUTE}->{zip});
+
+		if (! exists($PHARM_INFO->{$id})) {
+			if (defined($zip)) {
+				$PHARM_INFO->{$id}->{zip5} = $zip;
+				$pharmacies_cached++;
+			}
+		}
+	}
+
+	my $elapsed = time - $time;
+
+	$DEBUG && print "done loading DIM_ADDRESS info for $pharmacies_cached pharmacy IDs in $elapsed seconds..\n";
+
+	return $PHARM_INFO;
+}
+
+sub pharmacy_zip($) {
+  my $pharm_id = $_[0];
+
+	return undef if (! exists(pharmacy_info->{$pharm_id}));
+	return undef if (! exists(pharmacy_info->{$pharm_id}->{zip5}));
+
+	return pharmacy_info->{$pharm_id}->{zip5};
+}
+
+sub Usage {
+	my $verbose = shift;
+
+	if ($verbose) {
+		print "\nThis is $PGM, v$VERSION_NUMBER, $VERSION_DATE, Copyright $COPYRIGHT, $COMPANY\n";
+	}
+
+	print "\n";
+	print "Usage 1: $PGM [-options] auditlog_file\n";
+	print "Usage 2: $PGM [-options] -app-id job_app_id -worker-id #\n";
+	print "Usage 3: $PGM [-options] -post-date CCYYMMDD\n";
+	print "\n";
+
+	if ($verbose) {
+
+		print "OPTION                                DEFAULT\n";
+		print "-----------------------               --------------------\n";
+		print "-app-id app_id                        \n";
+		print "-worker-id #                          \n";
+		print "-post-date post_date                  \n";
+		print "-env TEST|QA|PROD                     $DEFAULT_ENV\n";
+		print "-fact-schema schema                   \n";
+		print "-fact-commit-interval #               \n";
+		print "-dimension-schema schema              \n";
+		print "-patient-systemcode code              $PATIENT_SYSTEMCODE\n";
+		print "-patient-input-size #                 $PATIENT_INPUT_SIZE\n";
+		print "-patient-bulk-size #                  $PATIENT_BULK_SIZE\n";
+		print "-patient-log-level level              $PATIENT_LOG_LEVEL\n";
+		print "-patient-match-type none|bulk|single  $PATIENT_MATCH_TYPE\n";
+		print "-patient-reporting                    \n";
+		print "-patient-debug-filename filename      \n";
+		print "-patient-debug-tablename tablename    \n";
+		print "-pdc-include pdc1[,pdc2..]            $DEFAULT_PDC_TEXT\n";
+		print "-pharmacy-include filename            \n";
+		print "-include-verboten true|false          $INCLUDE_VERBOTEN\n";
+		print "-load-debug                           \n";
+		print "-txn-parse-limit #                    {no limit}\n";
+		print "-parser-log-level level               $PARSER_LOG_LEVEL\n";
+		print "-log-to-file                          {logs to STDOUT/STDERR}\n";
+		print "-log-filename filename                {auto-derived}\n";
+		print "-log-dir directory                    {current directory}\n";
+		print "-keep-log                             {kept on failure only}\n";
+		print "-exit-success #                       $EXIT_SUCCESS {ignored for Usage 2}\n";
+		print "-exit-failure #                       $EXIT_FAILURE {ignored for Usage 2}\n";
+		print "-failure-email email_address          \n";
+		print "\n";
+
+	} else {
+		print "Use -help for detailed usage information\n";
+	}
+
+}
+
+
+our ($AL_FILE_OBJ, $AL_FILE_ID_INFO, $AL_FILE_PD_INFO);
+
+sub al_file_name_to_id($$) {
+  my ($fname, $dbh) = @_;
+
+  if (! defined($AL_FILE_OBJ)) {
+		$AL_FILE_OBJ = BLUELITE::TandemSwitchAuditLog::File->new(dbh => $dbh) || die "$PGM: ERROR: could not obtain BLUELITE::TandemSwitchAuditLog::File object\n";
+	}
+
+	if (! exists($AL_FILE_ID_INFO->{$fname})) {
+		my $alfile_id = $AL_FILE_OBJ->id(auditlog_name => $fname);
+
+		die "$PGM: ERROR: could not obtain auditlog file id for auditlog file '$fname'\n" if (! defined($alfile_id));
+
+		$AL_FILE_ID_INFO->{$fname} = $alfile_id;
+	}
+
+	return $AL_FILE_ID_INFO->{$fname};
+}
+
+sub al_file_id_to_post_date($$) {
+  my ($id, $dbh) = @_;
+
+  if (! defined($AL_FILE_OBJ)) {
+		$AL_FILE_OBJ = BLUELITE::TandemSwitchAuditLog::File->new(dbh => $dbh) || die "$PGM: ERROR: could not obtain BLUELITE::TandemSwitchAuditLog::File object\n";
+	}
+
+	if (! exists($AL_FILE_PD_INFO->{$id})) {
+		my $alfile_pd = $AL_FILE_OBJ->process_date(auditlog_id => $id);
+
+		die "$PGM: ERROR: could not obtain auditlog file id for auditlog file id '$id'\n" if (! defined($alfile_pd));
+
+		$AL_FILE_PD_INFO->{$id} = $alfile_pd;
+	}
+
+	return $AL_FILE_PD_INFO->{$id};
+}
+
+sub al_file_name_to_post_date($$) {
+  my ($al_file_name, $dbh) = @_;
+
+	return al_file_id_to_post_date(al_file_name_to_id($al_file_name, $dbh), $dbh);
+}
+
+sub al_files_to_post_dates(@$) {
+	my (@alfiles, $dbh) = @_;
+
+	my ($alfile, $post_date, %post_dates);
+
+	foreach $alfile (@alfiles) {
+
+		die "$PGM: ERROR: auditlog file name '$alfile' does not exist\n" if (! -f $alfile);
+		$post_date = al_file_name_to_post_date($alfile, $dbh) or
+			die "$PGM: ERROR: could not obtain auditlog post_date for auditlog file '$alfile'\n";
+		$post_dates{$post_date}++;
+
+	}
+
+	return keys %post_dates;
+}
+
+
+sub get_scalar($$;$) {
+  my ($pt, $field, $seg) = @_;
+
+	if (defined($seg)) {
+		return $pt->get_value(FIELD_ID => $field, SEGMENT_ID => $seg);
+	} else {
+		return $pt->get_value(FIELD_ID => $field);
+	}
+}
+
+
+# REPEATING NUMERIC FIELDS (sum them up)
+
+sub retrieve_repeating_numeric_values($$) {
+  my ($pt, $column_meta) = @_;
+  my ($numeric_values, $summed_value);
+	my @field_values = ();
+
+	foreach my $col (@{$column_meta}) {
+		$numeric_values = [$pt->get_value(field_id => $col->{field}, segment_id => $col->{segment})];
+		$summed_value = sum_numeric($numeric_values);
+
+		if (defined($summed_value)) {
+			push(@field_values, $col->{column} => $summed_value);
+		} else {
+			push(@field_values, $col->{column} => undef);
+		}
+	}
+
+	return @field_values;
+}
+
+sub list2csv($$@) {
+  my $temp_ret_value = '';
+  my $ret_value = '';
+  my $iteration_num = 0;
+  my ($delim, $max_length) = (shift, shift);
+
+  foreach my $val (@_) {
+    $iteration_num++;
+    $temp_ret_value = $ret_value;
+
+    if (length($temp_ret_value) > 0) {
+      $temp_ret_value .= "${delim}${val}";
+    } else {
+      $temp_ret_value = "${val}";
+    }
+
+    if (length($temp_ret_value) <= $max_length) {
+      $ret_value = $temp_ret_value;
+    }
+
+    last if (length($ret_value) >= $max_length);
+  }
+
+  $ret_value = substr($_[0], 0, $max_length) if (@_ && (length($ret_value) == 0));
+
+  return $ret_value;
+}
+
+
+# REPEATING SCALAR FIELDS (concatenate them)
+
+sub retrieve_repeating_scalar_values($$) {
+  my ($pt, $column_meta) = @_;
+  my (@values, $scalar, @scalar_values);
+  my @field_values = ();
+
+	foreach my $col (@{$column_meta}) {
+		@values = $pt->get_value(field_id => $col->{field}, segment_id => $col->{segment});
+
+		if (scalar(@values) == 0) {
+			push(@field_values, $col->{column} => undef);
+			next;
+		}
+
+		@scalar_values = ();
+
+		foreach $scalar (@values) {
+			push(@scalar_values, $scalar) if (defined($scalar) && ($scalar !~ /^\s*$/));
+		}
+
+		if (scalar(@scalar_values) >= 1) {
+			push(@field_values, $col->{column} => list2csv('|', 1024, @scalar_values));
+		} else {
+			push(@field_values, $col->{column} => undef);
+		}
+	}
+
+	return @field_values;
+}
+
+sub retrieve_scalar_varchar_values($$) {
+  my ($pt, $column_meta) = @_;
+  my @field_values = ();
+
+	foreach my $col (@{$column_meta}) {
+		push(@field_values, $col->{column} => $pt->get_value(field_id => $col->{field}, segment_id => $col->{segment}));
+	}
+
+	return @field_values;
+}
+
+
+# SCALAR NUMERIC FIELDS (grab when valid number)
+
+sub retrieve_scalar_numeric_columns($$) {
+  my ($pt, $column_meta) = @_;
+  my $num;
+  my @field_values = ();
+
+	foreach my $col (@{$column_meta}) {
+		$num = $pt->get_value(field_id => $col->{field}, segment_id => $col->{segment});
+
+		if (defined($num) && ($num =~ /\d/) && ($num =~ /^\s*[-+]?\s*\d*[.]?\d*\s*$/)) {
+			push(@field_values, $col->{column} => $num);
+		} else {
+			push(@field_values, $col->{column} => undef);
+		}
+	}
+
+	return @field_values;
+}
+
+
+sub lookup_gid($$;@) {
+  my $dim_obj = $_[0];
+	my @lookup_params;
+
+	if (ref($_[1]) eq '') {
+		@lookup_params = @_[1..$#_];	# everything beyond the 1st param
+	} else {
+		my $pt = $_[1];
+
+		my $pkg_suffix = ref($dim_obj);
+		$pkg_suffix =~ s/^.*:://;
+
+		if ($pkg_suffix eq 'Drug') {
+			@lookup_params = (
+				ndc11 => get_scalar($pt, 'D7', '07')
+			);
+		} elsif ($pkg_suffix eq 'Provider') {
+			@lookup_params = (
+				prescriber_id => get_scalar($pt, 'DB', '03'),
+				prescriber_id_qual => get_scalar($pt, 'EZ', '03')
+			);
+		} elsif ($pkg_suffix eq 'Rx') {
+			@lookup_params = (
+					compound_code =>  get_scalar($pt, 'D6', '07'),
+					compound_type => get_scalar($pt, 'G1', '07'),
+					daw_code => get_scalar($pt, 'D8', '07'),
+					level_of_service => get_scalar($pt, 'DI', '07'),
+					ndc_qual => get_scalar($pt, 'E1', '07'),
+					other_coverage_code => get_scalar($pt, 'C8', '07'),
+					origin_code => get_scalar($pt, 'DJ', '07'),
+					pregnancy_ind => get_scalar($pt, '2C', '01'),
+					smoker_code => get_scalar($pt, '1C', '01'),
+					spcl_pkg_ind => get_scalar($pt, 'DT', '07'),
+					unit_of_measure => get_scalar($pt, '28', '07')
+			);
+		} elsif ($pkg_suffix eq 'RxCost') {
+			@lookup_params = (
+					amt_prod_sel_qual => get_scalar($pt, 'MQ', '23'),
+					basis_calc_coins => get_scalar($pt, '4V', '23'),
+					basis_calc_copay => get_scalar($pt, 'HJ', '23'),
+					basis_calc_disp_fee => get_scalar($pt, 'HH', '23'),
+					basis_calc_flat_sales_tax => get_scalar($pt, 'HK', '23'),
+					basis_calc_pct_sales_tax => get_scalar($pt, 'HM', '23'),
+					basis_cost_determination => get_scalar($pt, 'DN', '11'),
+					basis_reimb_determination => get_scalar($pt, 'FM', '23')
+			);
+		} elsif ($pkg_suffix eq 'Tandem') {
+			@lookup_params = (
+					itb_alternate_id => get_scalar($pt, 'ITB_AID', 'UT'),
+					itb_audit_wtag => get_scalar($pt, 'ITB_AUDIT_WTAG', 'UT'),
+					itb_destination_id => get_scalar($pt, 'ITB_DID', 'UT'),
+					itb_select_destination => get_scalar($pt, 'ITB_SELECT_DEST', 'UT'),
+					itb_source_id => get_scalar($pt, 'ITB_SID', 'UT'),
+					itb_timeout_id => get_scalar($pt, 'ITB_TID', 'UT'),
+					itb_timeout => get_scalar($pt, 'ITB_TIMEOUT', 'UT'),
+					request_bin => get_scalar($pt, 'REQ_BIN', 'UQ'),
+					request_flag => get_scalar($pt, 'REQ_FLAG', 'UQ'),
+					request_forward_flag => get_scalar($pt, 'REQ_FORWARD_FLAG', 'UQ'),
+					request_neg_nabp_flag => get_scalar($pt, 'REQ_NEG_NABP_FLAG', 'UQ'),
+					request_req_type => get_scalar($pt, 'REQ_REQ_TYPE', 'UQ'),
+					request_source_id => get_scalar($pt, 'REQ_SID', 'UQ'),
+					request_spcl_billing_flag => get_scalar($pt, 'REQ_SPECIAL_BILLING_FLAG', 'UQ'),
+					request_third_party => get_scalar($pt, 'REQ_THIRD_PARTY', 'UQ'),
+					request_timeout_flag => get_scalar($pt, 'REQ_TIMEOUT_FLAG', 'UQ'),
+					response_dg_reject_flag => get_scalar($pt, 'REP_DG_REJECT_FLAG', 'US'),
+					response_flag => get_scalar($pt, 'REP_FLAG', 'US'),
+					response_overflow_flag => get_scalar($pt, 'REP_OVERFLOW_FLAG', 'US'),
+					response_produr => get_scalar($pt, 'REP_PRODUR', 'US'),
+					response_source_id => get_scalar($pt, 'REP_SID', 'US'),
+					response_third_party => get_scalar($pt, 'REP_THIRD_PARTY', 'US'),
+					response_timeout_flag => get_scalar($pt, 'REP_TIMEOUT_FLAG', 'US'),
+					tail_next_bin_code => get_scalar($pt, 'TAIL_NEXT_BIN_CODE', 'US'),
+					tail_source_id => get_scalar($pt, 'TAIL_SID', 'US')
+			);
+		} else {
+			die "$PGM: ERROR: lookup_gid(): Don't know how to lookup GIDs for " . ref($dim_obj) . " objects\n";
+		}
+	}
+
+	return $dim_obj->lookup_gid(@lookup_params);
+}
+
+
+sub dim_capture($$;@) {
+  my ($dim_obj, $pt, @capture_params) = @_;
+
+	my $pkg_suffix = ref($dim_obj);
+	$pkg_suffix =~ s/^.*:://;
+
+	if ($pkg_suffix eq 'Patient') {
+		push(@capture_params,
+			hospital_id => undef,
+			patient_lid => undef,
+			partition_value => undef,
+			patient_first_name => get_scalar($pt, 'CA', '01'),
+			patient_last_name => get_scalar($pt, 'CB', '01'),
+			date_of_birth => get_scalar($pt, 'C4', '01'),
+			gender_code => get_scalar($pt, 'C5', '01'),
+			patient_street_address => get_scalar($pt, 'CM', '01'),
+			patient_city => get_scalar($pt, 'CN', '01'),
+			patient_state => get_scalar($pt, 'CO', '01'),
+			patient_zip => get_scalar($pt, 'CP', '01'),
+			patient_phone => get_scalar($pt, 'CQ', '01'),
+			insured_cardholder_id => get_scalar($pt, 'C2', '04'),
+			insured_person_code => get_scalar($pt, 'C3', '04'),
+			patient_relationship_code => get_scalar($pt, 'C6', '04'),
+			prescriber_id => get_scalar($pt, 'DB', '03'),
+			system_id => $PATIENT_SYSTEMCODE
+		);
+
+	} else {
+		die "$PGM: ERROR: dim_capture(): Don't know how to do capture for " . ref($dim_obj) . " objects\n";
+	}
+
+	$dim_obj->capture(@capture_params);
+}
+
+
+sub get_cob($$) {
+  my ($pt, $cob_occurence) = @_;
+  my @cob_field_values = ();
+
+	{
+
+	no warnings;
+
+	my $other_payer_coverage_type = $pt->get_value(FIELD_ID => '5C', SEGMENT_ID => '05', occurence => $cob_occurence);
+	push(@cob_field_values, s05_5c_othr_payer_coverage_typ => $other_payer_coverage_type);
+
+	my $payer_id_qual = $pt->get_value(FIELD_ID => '6C', SEGMENT_ID => '05', occurence => $cob_occurence);
+	push(@cob_field_values, s05_6c_othr_payer_id_qual => $payer_id_qual);
+
+	my $payer_id = $pt->get_value(FIELD_ID => '7C', SEGMENT_ID => '05', occurence => $cob_occurence);
+	push(@cob_field_values, s05_7c_othr_payer_id => $payer_id);
+
+	my $date = $pt->get_value(FIELD_ID => 'E8', SEGMENT_ID => '05', occurence => $cob_occurence);
+	push(@cob_field_values, s05_e8_othr_payer_dte => $date);
+
+	my @other_amts_paid = $pt->get_value(FIELD_ID => 'DV', SEGMENT_ID => '05', occurence => $cob_occurence);
+	my $other_amts_paid_sum = sum_numeric(\@other_amts_paid);
+	push(@cob_field_values, s05_dv_drv_othr_payer_amt => $other_amts_paid_sum);
+
+	my @patient_amts = $pt->get_value(FIELD_ID => 'NQ', SEGMENT_ID => '05', occurence => $cob_occurence);
+	my $patient_amt_sum = sum_numeric(\@patient_amts);
+	push(@cob_field_values, s05_nq_drv_othr_payer_pat_amt => $patient_amt_sum);
+
+	}
+
+	my @rejects = $pt->get_value(FIELD_ID => '6E', SEGMENT_ID => '05', occurence => $cob_occurence);
+	my @reject_values = ();
+
+	foreach my $reject (@rejects) {
+		push(@reject_values, $reject) if (defined($reject) && ($reject !~ /^\s*$/));
+	}
+
+	push(@cob_field_values, s05_6e_drv_othr_payer_reject => join('|', @reject_values));
+
+	for(my $i = 1; $i <= $#cob_field_values; $i += 2) {
+		return @cob_field_values if (defined($cob_field_values[$i]));
+	}
+
+	return ();
+}
+
+sub get_pdc_list($) {
+  my $pdc_text = shift;
+
+	die "get_pdc_list(): pdc_text parameter is not defined!\n" if (! defined($pdc_text));
+	die "get_pdc_list(): pdc_text parameter is empty!\n" if (length($pdc_text) == 0);
+
+  my @pdc_list = split(/[^\dA-Z]+/, uc($pdc_text));
+
+	die "get_pdc_list(): Could not understand pdc_text parameter of '$pdc_text'!\n" if (scalar(@pdc_list) == 0);
+
+	my @return_pdc_list = ();
+
+	foreach my $pdc (@pdc_list) {
+		die "get_pdc_list(): Invalid product delivery code of '$pdc' in pdc_text parameter of '$pdc_text'\n" if ($pdc !~ /^[\dA-Z]+$/);
+		push(@return_pdc_list, $pdc);
+	}
+
+	return @return_pdc_list;
+}
+
+
+sub contract_included($$$$$$$) {
+	my ($contract_obj, $pdc_list, $pharm_npi, $pharm_nabp, $post_date, $pid, $bin) = @_;
+
+	foreach my $pdc (@{$pdc_list}) {
+		# check for inclusion
+
+		{
+			no warnings;
+
+			if (($pdc eq 'ALL') || $contract_obj->is_usable(criteria => { pdc => $pdc, post_date => $post_date, pid => $pid, bin => $bin, pharm_npi => $pharm_npi, nabp => $pharm_nabp})) {
+				#print "debug c: included via pdc '$pdc'\n";
+				return 1;
+			}
+
+			# return 1 if (($pdc eq 'ALL') || $contract_obj->is_usable(criteria => { pdc => $pdc, post_date => $post_date, pid => $pid, bin => $bin, pharm_npi => $pharm_npi, nabp => $pharm_nabp}));
+		}
+	}
+
+#print "debug c: excluded\n";
+
+	# not included
+	return 0;
+}
+
+
+sub print_insert_stats($$) {
+  my ($fact_obj, $elapsed_secs) = @_;
+
+	my $inserted_rows_per_sec;
+
+	if ($elapsed_secs) {
+		$inserted_rows_per_sec = sprintf('%.0f', $fact_obj->inserted_rows / $elapsed_secs);
+	} else {
+		$inserted_rows_per_sec = 'n/a';
+	}
+
+	print 'insert stats: ' . join(', ',
+		'table = ' . $fact_obj->fact_table_name,
+		"elapsed_secs = $elapsed_secs",
+		'inserted_rows = ' . $fact_obj->inserted_rows,
+		"inserted_rows/sec = $inserted_rows_per_sec",
+		'duplicate_rows = ' . $fact_obj->duplicate_rows,
+		'failed_rows = ' . $fact_obj->failed_rows
+		) . "\n";
+}
+
+
+
+############ MAIN ############
+
+autoflush STDOUT 1; 
+
+my ($auditlog_file, $worker_id, $post_date, $capture_message);
+my ($env, $dimension_schema, $fact_schema, $fact_commit_interval);
+my ($pdc_text, $pharmacy_inclusion_file, $txn_parse_limit);
+
+if (! eval { GetOptions(
+		'help' => sub { Usage(1); exit($EXIT_SUCCESS) },
+
+		'app-id|app_id=s' => \$APP_ID,
+		'worker-id|worker_id=i' => \$worker_id,
+
+		'post-date|post_date=i' => \$post_date,
+
+		'env=s' => \$env,
+		'fact-schema=s' => \$fact_schema,
+		'fact-commit-interval=i' => \$fact_commit_interval,
+		'dimension-schema=s' => \$dimension_schema,
+
+		#'patient-schema=s' => \$patient_schema,
+		'patient-systemcode=s' => \$PATIENT_SYSTEMCODE,
+		'patient-log-level=s' => \$PATIENT_LOG_LEVEL,
+		'patient-debug-filename=s' => \$patient_debug_filename,
+		'patient-debug-tablename=s' => \$patient_debug_tablename,
+		'patient-input-size=i' => \$PATIENT_INPUT_SIZE,
+		'patient-bulk-size=i' => \$PATIENT_BULK_SIZE,
+		'patient-match-type=s' => \$PATIENT_MATCH_TYPE,
+		'patient-reporting' => \$PATIENT_REPORTING_SWITCH,
+
+		'pdc-include=s' => \$pdc_text,
+		'pharmacy-include=s' => \$pharmacy_inclusion_file,
+		'include-verboten=s' => \$INCLUDE_VERBOTEN,
+
+		'load-debug' => \$DEBUG,
+		'parser-log-level=s' => \$PARSER_LOG_LEVEL,
+		'txn-parse-limit=i' => \$txn_parse_limit,
+
+		'log-dir=s' => \$LOGDIR,
+		'log-to-file' => \$LOG_TO_FILE,
+		'log-filename=s' => \$LOGFILE,
+		'keep-log' => \$KEEP_LOG,
+
+		'exit-success=i' => \$EXIT_SUCCESS,
+		'exit-failure=i' => \$EXIT_FAILURE,
+		'failure-email=s' => \$FAILURE_EMAIL,
+) }) {
+	&Usage;
+	exit($EXIT_FAILURE);
+}
+
+# validate correct usage
+
+my $usage1  = (scalar(@ARGV) >= 1);
+my $usage2a = (defined $APP_ID);
+my $usage2b = (defined $worker_id);
+my $usage3  = (defined $post_date);
+
+if ((  $usage1 && ! $usage2a && ! $usage2b && ! $usage3) ||
+		(! $usage1 &&   $usage2a &&   $usage2b && ! $usage3) ||
+		(! $usage1 && ! $usage2a && ! $usage2b &&   $usage3)) {
+} else {
+
+	print STDERR "$PGM: ERROR: Invalid usage\n";
+	Usage;
+
+	exit($EXIT_FAILURE);
+
+}
+
+# validate command-line options
+
+if (scalar(@ARGV) >= 1) {
+
+	if (scalar(@ARGV) > 1) {
+		mydie "More than 1 auditlog file (@ARGV) specified, but only 1 is supported";
+	}
+
+	#@alfiles = @ARGV;
+	$auditlog_file = $ARGV[0];
+
+	$capture_message = "AUDITLOG file $auditlog_file";
+
+} elsif (defined $worker_id) {
+
+	$WORKER = BLUELITE::Job->new(worker_id => $worker_id, app_id => $APP_ID);
+
+	if (! defined($WORKER)) {
+		mydie "Unable to obtain a BLUELITE::Job object for worker_id = '$worker_id', app_id = '$APP_ID'";
+	}
+
+	$WORKER->status('PROCESSING') || mydie "Unable to set status of worker id $worker_id to PROCESSING";
+	$FAILURE_EMAIL = $WORKER->failure_email if (! defined($FAILURE_EMAIL));
+
+	#@alfiles = ( $WORKER->data_source_fname );
+	$auditlog_file = $WORKER->data_source_fname;
+
+	$capture_message = "WORKER ID $worker_id";
+
+} elsif (defined $post_date) {
+
+	if (! valid_date($post_date)) {
+		mydie "Invalid post_date ($post_date). Specify a valid date in CCYYMMDD format";
+	}
+
+	$capture_message = "POST DATE $post_date";
+}
+
+#if (! @alfiles) {
+#	mydie "No auditlog files to process";
+#}
+
+if (defined($auditlog_file) && (! -f $auditlog_file)) {
+	mydie "auditlog file '$auditlog_file' does not exist";
+}
+
+# parse rest of the command-line options
+
+$DEBUG = 0 if (! defined($DEBUG));
+
+$LOG_TO_FILE = 1 if (defined($LOGFILE));
+
+if (! defined($LOGFILE)) {
+
+	if (defined($worker_id)) {
+
+		$LOGFILE = "${worker_id}.$$.log";
+
+	} elsif (defined $auditlog_file) {
+
+		$LOGFILE = $auditlog_file;
+		$LOGFILE =~ s|.*/||g;
+		$LOGFILE =~ s|[.].*$||;
+		$LOGFILE .= '.log';
+
+	} elsif (defined $post_date) {
+
+		$LOGFILE = "${post_date}.$$.log";
+
+	}
+
+}
+
+$LOG_TO_FILE = 1 if (defined($LOGDIR));
+
+if ($LOG_TO_FILE) {
+	if (defined($LOGDIR) && ($LOGFILE !~ /\//)) {
+		$LOGFILE = $LOGDIR . '/' . $LOGFILE;
+	}
+
+	if (-t 1) {
+		print "Note: Sending STDOUT, STDERR, and patient-match logger output to log file '$LOGFILE'\n";
+	}
+
+	open(STDOUT, "> $LOGFILE") || die "ERROR: Could not redirect STDOUT to log file '$LOGFILE': $!\n";
+	open(STDERR, ">> $LOGFILE") || die "ERROR: Could not redirect STDERR to log file '$LOGFILE': $!\n";
+
+	#push(@dim_patient_options, log_file => $LOGFILE);
+}
+
+if (defined($pharmacy_inclusion_file)) {
+
+	open(PHARMACIES, $pharmacy_inclusion_file) || die "$PGM: Could not open pharmacy inclusion file '$pharmacy_inclusion_file': $!\n";
+	@{$INCLUSION_PHARMACIES} = <PHARMACIES>;
+	chomp(@{$INCLUSION_PHARMACIES});
+	close(PHARMACIES);
+
+	die "$PGM: No pharmacies found in pharmacy inclusion file '$pharmacy_inclusion_file'\n" if (scalar(@{$INCLUSION_PHARMACIES}) == 0);
+	$DEBUG && print scalar(@{$INCLUSION_PHARMACIES}) . " pharmacies found in pharmacy inclusion file '$pharmacy_inclusion_file'\n";
+
+}
+
+$env = $DEFAULT_ENV if (! defined($env));
+
+# setup fact object constructor options
+
+my @fact_options = ();
+
+if (defined($fact_schema)) {
+	push(@fact_options, schema => $fact_schema);
+} elsif (defined($env)) {
+	push(@fact_options, env => $env);
+} else {
+	mydie "-fact-schema or -env must be defined!";
+}
+
+$DEBUG && print "Fact constructor options: " . join(', ', @fact_options) . "\n";
+
+# obtain fact objects
+
+my $fact_rx_cob = DS::DW::Fact::RxCOB->new(@fact_options) || die "$PGM: Cannot get DS::DW::Fact::RxCOB object\n";
+my $fact_rx_trans = DS::DW::Fact::RxTrans->new(@fact_options, dbh => $fact_rx_cob->dbh) || die "$PGM: Cannot get DS::DW::Fact::RxTrans object\n";
+
+if (defined($fact_commit_interval)) {
+
+	$DEBUG && print "Setting fact commit interval to $fact_commit_interval\n";
+	$fact_rx_trans->commit_interval($fact_commit_interval);
+	$fact_rx_cob->commit_interval($fact_commit_interval);
+
+}
+
+# designate which fact fields are optional in capture calls
+
+$fact_rx_trans->optional_capture_fields(qw/patient_lid/);
+
+
+# setup dimension constructor options
+
+my @dim_schema_option = ();
+
+if (defined($dimension_schema)) {
+	push(@dim_schema_option, schema => $dimension_schema);
+} elsif (defined($env)) {
+	push(@dim_schema_option, env => $env);
+} else {
+	mydie "-dimension-schema or -env must be defined!";
+}
+
+$DEBUG && print "Standard dimension constructor options: " . join(', ', @dim_schema_option) . "\n";
+
+# obtain dimension objects
+
+my $dim_rx = DS::Dimension::Functional::Std::Rx->new(@dim_schema_option) || die "$PGM: Cannot get DS::Dimension::Functional::Std::Rx object\n";
+
+my $dim_binpcn = DS::Dimension::Functional::Std::BinPCN->new(@dim_schema_option, dbh => $dim_rx->dbh) || die "$PGM: Cannot get DS::Dimension::Functional::Std::BinPCN object\n";
+
+my $dim_tandem = DS::Dimension::Functional::Std::Tandem->new(@dim_schema_option, dbh => $dim_rx->dbh) || die "$PGM: Cannot get DS::Dimension::Functional::Std::Tandem object\n";
+
+my $dim_drug = DS::Dimension::Functional::Std::Drug->new(@dim_schema_option, dbh => $dim_rx->dbh) || die "$PGM: Cannot get DS::Dimension::Functional::Std::BinPCN object\n";
+
+my $dim_rx_cost = DS::Dimension::Functional::Std::RxCost->new(@dim_schema_option, dbh => $dim_rx->dbh) || die "$PGM: Cannot get DS::Dimension::Functional::Std::RxCost object\n";
+
+my $dim_prescriber = DS::Dimension::Functional::EMI::Provider->new(@dim_schema_option, dbh => $dim_rx->dbh) || die "$PGM: Cannot get DS::Dimension::Functional::EMI::Provider object\n";
+
+my $dim_pharmacy = DS::Dimension::Functional::Std::Pharmacy->new(@dim_schema_option, dbh => $dim_rx->dbh) || die "$PGM: Cannot get DS::Dimension::Functional::Std::Pharmacy object\n";
+
+if ($DEBUG) {
+	foreach my $dim_obj ($dim_rx, $dim_binpcn, $dim_tandem, $dim_drug, $dim_rx_cost, $dim_prescriber, $dim_pharmacy) {
+		print $dim_obj->_lookup_gid_select, "\n\n";
+	}
+}
+
+
+# setup patient dimension constructor options
+
+if (defined($PATIENT_REPORTING_SWITCH)) {
+	$PATIENT_REPORTING_SWITCH = 'true';
+} else {
+	$PATIENT_REPORTING_SWITCH = 'false';
+}
+
+#my $patient_connection_info = get_connection_info(username => $patient_schema);
+#die "$PGM: Unable to obtain database password and instance for patient schema '$patient_schema'\n" if (! defined($patient_connection_info));
+
+my @dim_patient_options = (
+	match_type => $PATIENT_MATCH_TYPE,
+	system_id => $PATIENT_SYSTEMCODE,
+	reporting_switch => $PATIENT_REPORTING_SWITCH,
+	@dim_schema_option
+);
+
+#push(@dim_patient_options, db_user => $patient_schema) if (defined($patient_schema));
+push(@dim_patient_options, log_file => $LOGFILE) if ($LOG_TO_FILE);
+push(@dim_patient_options, log_level => $PATIENT_LOG_LEVEL) if (defined($PATIENT_LOG_LEVEL));
+push(@dim_patient_options, debug_filename => $patient_debug_filename) if (defined($patient_debug_filename));
+push(@dim_patient_options, debug_tablename => $patient_debug_tablename) if (defined($patient_debug_tablename));
+push(@dim_patient_options, input_size => $PATIENT_INPUT_SIZE) if (defined($PATIENT_INPUT_SIZE));
+push(@dim_patient_options, bulk_size => $PATIENT_BULK_SIZE) if (defined($PATIENT_BULK_SIZE));
+
+$DEBUG && print "Patient dimension constructor options: " . join(', ', @dim_patient_options) . "\n";
+
+# obtain patient dimension object
+
+my $dim_patient = DS::Dimension::Functional::EMI::Patient->new(@dim_patient_options) || die "$PGM: Cannot get DS::Dimension::Functional::EMI::Patient object\n";
+
+$PATIENT_MATCH_TYPE = $dim_patient->match_type;
+
+if ($DEBUG && ($PATIENT_MATCH_TYPE eq 'NONE')) {
+	print $dim_patient->_lookup_gid_select, "\n\n";
+}
+
+
+# setup NCPDP parser constructor options
+
+my @ncpdp_parser_options = (
+	load_default_mod => 1,
+	screen_threshold => $PARSER_LOG_LEVEL,
+	DIM_PHARM_CACHE_THRESHOLD => 100000,
+);
+
+$DEBUG && print "NCPDP parser constructor options: " . join(', ', @ncpdp_parser_options) . "\n";
+
+# obtain NCPDP parser object
+
+my $parser = BLUELITE::NCPDP::Parser->new(@ncpdp_parser_options) || die "$PGM: Cannot obtain a BLUELITE::NCPDP::Parser object\n";
+
+# setup NCPDP parser filters
+
+# mandatory process date filter
+#my @all_post_dates = al_files_to_post_dates(@alfiles, $fact_rx_trans->dbh);
+#$parser->add_NCPDP_filter(name => 'PROCESS_DATE', values => \@all_post_dates);
+
+# auditlog file filter
+#$parser->add_NCPDP_filter(name => 'AUDITLOG', values => \@alfiles);
+
+if (defined $post_date) {
+
+	# mandatory process date filter
+	$DEBUG && print "add_NCPDP_filter: Using command-line post date '$post_date'\n";
+	$parser->add_NCPDP_filter(name => 'PROCESS_DATE', values => [ $post_date ]);
+
+} elsif (defined $auditlog_file) {
+
+	$post_date = al_file_name_to_post_date($auditlog_file, $fact_rx_trans->dbh) or
+		mydie "could not determine post_date for auditlog file '$auditlog_file'";
+
+	# mandatory process date filter
+	$DEBUG && print "add_NCPDP_filter: Using post date '$post_date' from auditlog file\n";
+	$parser->add_NCPDP_filter(name => 'PROCESS_DATE', values => [ $post_date ]);
+
+	# optional auditlog file filter
+	$DEBUG && print "add_NCPDP_filter: Using auditlog file '$auditlog_file'\n";
+	$parser->add_NCPDP_filter(name => 'AUDITLOG', values => [ $auditlog_file ]);
+
+} else {
+	mydie "Unable to set mandatory post_date filter for NCPDP parser";
+}
+
+# mandatory contract filter: Use ALL, since data rights are checked by this code instead of parser
+# note: TrOOP exclusion is still performed by parser. INCLUDE_VERBOTEN is false (0) by default.
+$parser->add_NCPDP_filter(name => 'CONTRACT', include => 'ALL', include_verboten => $INCLUDE_VERBOTEN);
+
+# PPE filter: first-in/last-out only (pharmacy view)
+$parser->add_NCPDP_filter(name => 'PPE', values => ['FILO']);
+
+# txn type filter: billing txns only
+$parser->add_NCPDP_filter(name => 'TRANS_TYPE', values => ['billing', 'reversal']);
+
+# only capture txns associated with the desired pharmacies
+$parser->add_NCPDP_filter(name => 'PHARMACY', values => $INCLUSION_PHARMACIES) if (defined $INCLUSION_PHARMACIES);
+
+
+# Setup data rights
+my (@pdc_list, $data_rights);
+
+$pdc_text = $DEFAULT_PDC_TEXT if (! defined($pdc_text));
+@pdc_list = get_pdc_list($pdc_text);	# which product delivery codes will be used
+$DEBUG && print "Set up Product Delivery Codes: " . join(', ', @pdc_list) . "\n";
+
+eval '$data_rights = BLUELITE::DataRights->new(options => { cache => \'on\' })';
+die "ERROR: Unable to obtain a DataRights object: $@\n" if (! defined($data_rights));
+
+
+# Declare remaining local variables needed by main txn loop
+
+my ($bin, $pcn, $group_id, $pharm_id, $source_id);
+my (@cob_field_values, $num_cob_occurences, $cob_occurence, $request_arrival_time, $rat, $transaction_id, $pharm_nabp, $pharm_npi, @field_values, $elapsed, @capture_params);
+
+print "Capturing fact and patient info for $capture_message ..\n";
+
+# Initialize both fact txn counters
+
+my $fact_rx_trans_txn_num = 0;
+my $fact_rx_cob_txn_num = 0;
+
+
+#### BEGIN MAIN TXN PARSE LOOP
+
+my $start_time = time;
+
+# note: $parser object will only provide those txns which meet all of the
+# criteria defined by the established filters above.
+
+while (my $pt = $parser->parse_next_transaction) {
+	next if (! $pt->valid);	# skip txn if it cannot be parsed (i.e. it's corrupt)
+
+	$pharm_npi = get_scalar($pt, 'PHARM_NPI', 'UT');
+	$pharm_nabp = get_scalar($pt, 'PHARM_NABP', 'UT');
+
+	$source_id = get_scalar($pt, 'ITB_SID', 'UT');
+	$bin = get_scalar($pt, 'A1', 'RQ');
+
+	# Get the post date for the current auditlog file. Looks like a dog, but under the covers it's basically optimized.
+	# Surjit - commented out below - $post_date is either cmd-line-option or derived from the specified auditlog file
+	# $post_date = al_file_name_to_post_date(get_scalar($pt, 'SOURCE_AUDITLOG', 'UT'), $fact_rx_trans->dbh);
+
+	# skip txn if not contractually included
+	next if (! contract_included($data_rights, \@pdc_list, $pharm_npi, $pharm_nabp, $post_date, $source_id, $bin));
+
+	$transaction_id = get_scalar($pt, 'TRANSACTION_ID', 'UT');
+
+#print "debug included: npi = '$pharm_npi', nabp = '$pharm_nabp', post_date = '$post_date', sid = '$source_id', bin = '$bin'\n";
+
+	if (defined($pharm_npi)) {
+		$pharm_id = $pharm_npi;
+	} elsif (defined($pharm_nabp)) {
+		$pharm_id = $pharm_nabp;
+	} else {
+		die "$PGM: Could not obtain a NPI or NABP for the pharmacy!\n";
+	}
+
+	#$DEBUG && print "debug: source_id = '$source_id', pharm_id = '$pharm_id'\n";
+
+	#### COLLECT FIELD VALUES FOR FACT CAPTURE INTO @field_values ARRAY
+
+	@field_values = (
+		retrieve_repeating_numeric_values($pt, $fact_rx_trans->repeating_numeric_columns),
+		retrieve_repeating_scalar_values($pt, $fact_rx_trans->repeating_scalar_columns),
+		retrieve_scalar_varchar_values($pt, $fact_rx_trans->scalar_varchar_columns),
+		retrieve_scalar_varchar_values($pt, $fact_rx_trans->date_columns),
+		retrieve_scalar_numeric_columns($pt, $fact_rx_trans->scalar_numeric_columns)
+	);
+
+	#### Dimension captures (for deferred GID lookups)
+
+	$group_id = get_scalar($pt, 'C1', '04');
+	$pcn = get_scalar($pt, 'A4', 'RQ');
+
+# get patient dimension object if we haven't already
+#
+#	if (! defined($dim_patient)) {
+#
+#		$DEBUG && print "Patient dimension constructor options: " . join(', ', @dim_patient_options) . "\n";
+#
+#		$dim_patient = DS::Dimension::Functional::EMI::Patient->new(@dim_patient_options) || die "$PGM: Cannot get DS::Dimension::Functional::EMI::Patient object\n";
+#
+#		$PATIENT_MATCH_TYPE = $dim_patient->match_type;
+#
+#		if ($DEBUG && ($PATIENT_MATCH_TYPE eq 'NONE')) {
+#			print $dim_patient->_lookup_gid_select;
+#			print "\n";
+#		}
+#	}
+
+	# perform data capture for patient dimension
+	# note: dim_capture() performs $dim_patient->capture(...) with these and
+	# remaining required patient fields.
+
+	@capture_params = (
+		txn_id => $transaction_id,
+		payer => $bin,
+		processor_control_number => $pcn,
+		group_id => $group_id,
+		pharmacy_id => $pharm_id,
+		source_id => $source_id,
+		service_provider_zip_code => pharmacy_zip($pharm_id)
+	);
+
+	dim_capture($dim_patient, $pt, @capture_params);
+
+	## Collect remaining fact field values prior to fact capture
+
+	# unique txn id comes from the parser
+
+	#$transaction_id = get_scalar($pt, 'TRANSACTION_ID', 'UT');
+
+	# request arrival time will go into Oracle as a TIMESTAMP field
+	# with subsecond precision. Proper formatting is critical and
+	# must adhere to syntax required by the insert_expr meta-data
+	# provided for the request_arrival_time field in the Patient constructor.
+
+	$rat = get_scalar($pt, 'REQ_S_ARRIVAL_TIME', 'UQ');
+
+	if (defined($rat)) {
+		$request_arrival_time = $rat->strftime('%Y%m%d %H%M%S.%N');
+	} else {
+		$request_arrival_time = undef;
+	}
+
+#print "debug: included txn id = $transaction_id\n";
+
+	push(@field_values,
+		request_arrival_time => $request_arrival_time,
+		post_date => $post_date,
+		source_id => $SOURCE_ID,
+		rx_txn_id => $transaction_id,
+		patient_systemcode => $PATIENT_SYSTEMCODE,
+		binpcn_gid => lookup_gid($dim_binpcn, bin => $bin, group_id => $group_id, pcn => $pcn),
+		drug_gid => lookup_gid($dim_drug, $pt),
+		pharmacy_gid => lookup_gid($dim_pharmacy, npi => $pharm_npi, nabp => $pharm_nabp),
+		rx_gid => lookup_gid($dim_rx, $pt),
+		rx_cost_gid => lookup_gid($dim_rx_cost, $pt),
+		prescriber_gid => lookup_gid($dim_prescriber, $pt),
+		tandem_gid => lookup_gid($dim_tandem, $pt)
+	);
+
+	#### CAPTURE FACT DATA TO DATA STRUCTURE
+
+	$fact_rx_trans->capture(txn_id => $transaction_id, @field_values);
+
+	#### Get COB fields and capture into $fact_rx_cob object
+
+	$num_cob_occurences = $pt->occurences(FIELD_ID => '5C', SEGMENT_ID => '05');
+
+	if (defined($num_cob_occurences)) {
+
+		for $cob_occurence (1..$pt->occurences(FIELD_ID => '5C', SEGMENT_ID => '05')) {
+			@cob_field_values = get_cob($pt, $cob_occurence);
+			next if (scalar(@cob_field_values) == 0);
+
+			push(@cob_field_values, rx_txn_id => $transaction_id, cob_txn_num => $cob_occurence, source_id => $SOURCE_ID, post_date => $post_date);
+			$fact_rx_cob->capture(txn_id => $fact_rx_cob_txn_num, @cob_field_values);
+
+			$fact_rx_cob_txn_num++;
+			print "Captured $fact_rx_cob_txn_num COB txns..\n" if ($fact_rx_cob_txn_num % 1000 == 0);
+		}
+	}
+
+	$fact_rx_trans_txn_num++;
+	print "Captured $fact_rx_trans_txn_num Rx txns..\n" if ($fact_rx_trans_txn_num % 1000 == 0);
+
+
+	# if # of txns was limited on cmd-line, prematurely exit this loop when appropriate
+
+	if (defined($txn_parse_limit) && ($fact_rx_trans_txn_num == $txn_parse_limit)) {
+		print "No more txns will be captured, due to MAX # TXNS of $txn_parse_limit being reached.\n";
+		last;
+	}
+}
+
+#### END MAIN TXN PARSE/CAPTURE LOOP
+
+$elapsed = time - $start_time;
+my $throughput;
+
+if ($elapsed != 0) {
+	$throughput = sprintf('%.0f', $fact_rx_trans_txn_num / $elapsed);
+} else {
+	$throughput = 'n/a';
+}
+
+print 'capture stats: ' . join(', ',
+	'elapsed_secs = ' . $elapsed, 
+	"rx_txns = $fact_rx_trans_txn_num",
+	"cob_txns = $fact_rx_cob_txn_num",
+	"rx_txns/sec = $throughput"
+	) . "\n";
+
+#myexit; # uncomment for short-circuit testing (Surjit)
+
+#### Lookup GIDs for "captured" dimensions (Patient)
+
+if ($fact_rx_trans_txn_num >= 1) {
+
+	my $patient_stat_type;
+
+	if ($PATIENT_MATCH_TYPE eq 'NONE') {
+		print 'Inserting new records into ' . $dim_patient->dim_table_name . " table..\n";
+		$patient_stat_type = 'patient_insert';
+	} else {
+		print "Performing patient bulk match..\n";
+		$patient_stat_type = 'patient_match';
+	}
+
+	$start_time = time;
+
+	# note: the $fact_rx_trans lookup_captured_gids() method will:
+	# 1) call lookup_captured_gids() method on the $dim_patient object
+	# 2) link the patient GIDs to the fact records already in the $fact_rx_trans object
+
+	$fact_rx_trans->lookup_captured_gids(num_captured => $fact_rx_trans_txn_num, patient_lid => $dim_patient);
+
+	$elapsed = time - $start_time;
+
+
+	if ($elapsed != 0) {
+		$throughput = sprintf('%.0f', $fact_rx_trans_txn_num / $elapsed);
+	} else {
+		$throughput = 'n/a';
+	}
+
+	print "$patient_stat_type stats: " . join(', ',
+		'elapsed_secs = ' . $elapsed,
+		"rx_txns/sec = $throughput"
+		) . "\n";
+
+	#### Save captured facts to table
+
+	print "Saving captured fact data...\n";
+
+	# INSERT Rx Trans fact records to the database
+
+	# note: the $fact_rx_trans save() method will:
+	# 1) call $dim_patient->save() (which should just do a commit)
+	# 2) bulk-insert the fact records, committing at intervals determined by $fact_rx_trans meta-data
+
+	$start_time = time;
+	$fact_rx_trans->save(captured_dims => [$dim_patient]);
+
+	print_insert_stats($fact_rx_trans, time - $start_time);
+
+	if ($fact_rx_trans->failed_rows) {
+		die $fact_rx_trans->failed_rows . ' rows failed to INSERT into ' . $fact_rx_trans->fact_table_qual_name . " table\n";
+	}
+
+	# Hurry up and make big objects destroy themselves (free up memory)
+	$dim_patient = undef;
+
+	# INSERT Rx COB fact records to the database
+
+	$start_time = time;
+	$fact_rx_cob->save;
+
+	print_insert_stats($fact_rx_cob, time - $start_time);
+} else {
+	print "No txns were captured, so there is no patient match to perform or fact records to insert.\n";
+}
+
+if (defined($WORKER)) {
+	$WORKER->txn_processed($fact_rx_trans->inserted_rows);
+}
+
+if ($fact_rx_cob->failed_rows) {
+	die $fact_rx_cob->failed_rows . ' rows failed to INSERT into ' . $fact_rx_cob->fact_table_qual_name . " table\n";
+}
+
+myexit;
+
+# perl automatically runs the END block prior to the process exiting, even if due to a "die" statement.
+# This allows the extraction process to update the worker status to FAILED if it's dying due to some
+# package calling die().
+
+END {
+  mydie "Unhandled exception: $! . $@\n" if (($? != $EXIT_SUCCESS) && ($? != $EXIT_FAILURE));
+}
+

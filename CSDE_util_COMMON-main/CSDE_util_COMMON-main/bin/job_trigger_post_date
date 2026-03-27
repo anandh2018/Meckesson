@@ -1,0 +1,574 @@
+#!/usr/bin/perl
+
+# job_trigger_post_date: Create a "end of day" trigger file BLUELITE::Job apps
+#
+# Author(s): John Hess		RelayHealth
+#
+# Version history:
+# Version 1.0 - 4/2/2009
+#
+# Version 1.1 - 9/09/2010
+# Adding template option to allow trigger file create base on provided template.
+#
+# Version 3.1 - 6/14/2011
+# Fixed bug in mydie where call to log method would fail if $JOB object was not yet created
+#
+# Version 6.0 - 10/31/2014
+# - Added support for "autohoc" requests (i.e. automated on-demand ad-hoc processing).
+#
+
+use IO::Compress::Gzip qw($GzipError);
+use DateTime;
+use DateTime::Format::Strptime;
+use Getopt::Long;
+use Mail::SendEasy;
+use File::Copy;
+use File::PathConvert qw(rel2abs);
+use File::Spec;
+use Data::Dumper;
+
+use BLUELITE::Job;
+use BLUELITE::Logger;
+
+use strict;
+use warnings;
+
+my @dir_parts = File::Spec->splitdir(rel2abs($0));
+our $PGM = pop(@dir_parts);
+
+
+our $DEFAULT_EXIT_SUCCESS = 0;
+our ($SUCCESS_EMAIL, $FAILURE_EMAIL, $DEFAULT_FAILURE_EMAIL, $TRIGGER_OUTFILE_NAME);
+our $DEFAULT_DATE_FORMAT = DateTime::Format::Strptime->new( pattern => '%Y%m%d%H%M%S') || die "ERROR: Unable to set default date format!\n";
+our $FILES_CREATED = 0;
+our ($DBH, $OUT_FH, $LOGGER, $APP_ID, $SOURCE_APP_ID, $LOGFILE, $TRIGGER_DIR, $APP_DIR_TOP, $TEMPLATE);
+our $custom_header = 0;
+our $custom_trailer = 0;
+our ($JOB, $TODAY_DATE);
+
+
+
+sub mydie($) {
+  my $message = shift;
+
+	# close output file
+
+	if (defined($OUT_FH) && $OUT_FH->opened) {
+		$OUT_FH->close;
+	}
+
+	# remove output file
+
+	if (defined($TRIGGER_OUTFILE_NAME)) {
+		if (-f $TRIGGER_OUTFILE_NAME) {
+
+			eval '$LOGGER->info("Removing trigger file $TRIGGER_OUTFILE_NAME")' if (defined($LOGGER));
+
+			if (! unlink($TRIGGER_OUTFILE_NAME)) {
+				$message .= "\nCould not delete output file $TRIGGER_OUTFILE_NAME : $!\n";
+			} else {
+				$message .= "\nDeleted output file $TRIGGER_OUTFILE_NAME : $!\n";
+			}
+		}
+	}
+
+	if (defined($LOGGER)) {
+		eval '$LOGGER->info("Created $FILES_CREATED trigger files")';
+
+		$message .= "\nSee logfile $LOGFILE for more details\n";
+	}
+
+	$JOB->log(event_code => 'TRFAIL', log_type => 'ERROR', message => $message, email_subject => 'trigger file creation failed') if (defined($JOB));
+
+	if (defined($LOGGER)) {
+		$LOGGER->error($message);
+		exit(1);
+	} else {
+		die $message . "\n";
+	}
+}
+
+
+sub get_trigger_fname($$$) {
+	my ($post_date, $trigger_dir, $job) = @_;
+
+  my $trigger_fname_sprintf = $job->trigger_fname_sprintf;
+  my $trigger_fname_vars = $job->trigger_fname_vars;
+
+	mydie "get_trigger_fname: trigger_fname_sprintf must be configured in the JOB_CONFIG table\n" if (! defined($trigger_fname_sprintf));
+	$trigger_fname_sprintf =~ s/^\s+//;
+	$trigger_fname_sprintf =~ s/\s+$//;
+	mydie "get_trigger_fname: trigger_fname_sprintf must be configured in the JOB_CONFIG table\n" if (length($trigger_fname_sprintf) == 0);
+
+	mydie "get_trigger_fname: trigger_fname_vars must be configured in the JOB_CONFIG table\n" if (! defined($trigger_fname_vars));
+	$trigger_fname_vars =~ s/^\s+//;
+	$trigger_fname_vars =~ s/\s+$//;
+	mydie "get_trigger_fname: trigger_fname_vars must be configured in the JOB_CONFIG table\n" if (length($trigger_fname_vars) == 0);
+
+	my @var_list = split(/\s*,\s*/, uc($trigger_fname_vars));
+	mydie "get_trigger_fname: could not parse any variables from trigger_fname_vars value of '$trigger_fname_vars'\n" if (scalar(@var_list) == 0);
+
+	my @fname_vars = ();
+
+	foreach my $var (@var_list) {
+		if ($var eq 'POST_DATE') {
+			push(@fname_vars, $post_date);
+		} elsif ($var eq 'DATE_CREATED') {
+			push(@fname_vars, $TODAY_DATE);
+		} else {
+			mydie "get_trigger_fname: trigger_fname_vars = '$trigger_fname_vars', which contains a unrecognized variable named '$var'\n";
+		}
+	}
+
+	mydie "get_trigger_fname: could not find any recognized variables from trigger_fname_vars value of '$trigger_fname_vars'\n" if (scalar(@fname_vars) == 0);
+
+	my $fname = sprintf($trigger_fname_sprintf, @fname_vars);
+
+	$fname = "$trigger_dir/$fname";
+	return $fname;
+}
+
+
+sub Usage() {
+  print "$PGM: Create end-of-day trigger files for BLUELITE::Job apps\n\n";
+  print "Usage 1: $PGM [-options] -app-id a -app-dir d\n";
+  print "Usage 2: $PGM [-options] -source-app-id a -app-dir d data_fname\n";
+  print " Required parameters\n";
+  print "  -app-id or -source-app-id     Application id as recorded in JOB_CONFIG table\n";
+  print "  -app-dir d                    Top-level application directory\n";
+  print " Options (defaults in parenthesis):\n";
+  print "  -exit #                       Exit with status # on success. ($DEFAULT_EXIT_SUCCESS)\n";
+  print "  -logging-level level          Set logging to level (INFO). Values: DEBUG, INFO, WARN, ERROR, FATAL\n";
+  print "  -success-email list           Send status to list addresses upon success (application default)\n";
+  print "  -failure-email list           Send status to list addresses upon failure (application default)\n";
+  print "  -default-failure-email list   Send status to list addresses upon failure (does not override app default)\n";
+  print "  -check-only                   Only check to see if trigger creation would be performed (off)\n";
+  print "  -template                     Create .done file based on template provided\n";
+
+}
+
+
+sub sig_handler() {
+  my $signal = shift;
+
+  mydie "$PGM process was killed via $signal signal.\n";
+}
+
+
+
+sub mymove($$) {
+  my ($source_file, $dest_dir) = (shift, shift);
+
+	return undef if (! move($source_file, $dest_dir));
+
+	my $base_fname = $source_file;
+	$base_fname =~ s/.*\///g;
+
+	return "${dest_dir}/${base_fname}";
+}
+
+
+
+sub add_trigger($$$$$) {
+  my ($output_fname, $job, $post_date, $data_records, $workers_in_output) = @_;
+
+	my $trigger_id = $job->add_trigger(fname => $TRIGGER_OUTFILE_NAME, workers => $workers_in_output, commit => 0, post_date => $post_date);
+
+	if (! $trigger_id) {
+		mydie "Could not successfully call BLUELITE::Job->add_trigger() for output file $output_fname\n";
+	}
+
+	# clean up temp worker files since we no longer need them
+
+	return $trigger_id;
+}
+
+
+sub myexit($) {
+	my $exit_code = shift;
+
+	if ($FILES_CREATED && defined($LOGGER)) {
+		eval '$LOGGER->info("Created $FILES_CREATED trigger files.")';
+	} else {
+		eval '$LOGGER->info("No worker trigger files created.")';
+	}
+
+	unlink($LOGFILE) if (defined($LOGFILE) && (! $FILES_CREATED));
+	
+	exit($exit_code);
+}
+
+
+sub basename($) {
+  my $fname_full = shift;
+  my $bname;
+
+	if (defined($fname_full)) {
+		$bname = $fname_full;
+		$bname =~ s/.*\///g;
+	}
+
+	return $bname;
+}
+
+
+sub my_print($$;$) {
+	my ($fh, $mesg, $err_mesg) = @_;
+
+	if (! print $fh $mesg) {
+		no warnings 'uninitialized';
+		mydie "ERROR: $err_mesg : $!";
+	}
+}
+
+############# MAIN ###########
+
+eval { $TODAY_DATE = DateTime->now(time_zone => 'local')->strftime('%Y%m%d'); };
+
+if ($@) {
+  mydie "Could not obtain today's date via DateTime module\n";
+}
+
+my $exit_success = $DEFAULT_EXIT_SUCCESS;
+my $logging_level = 'INFO';
+my $check_only = 0;
+
+# setup signal handler so we can cleanup before getting interrupted
+
+foreach my $sig ('INT', 'QUIT', 'HUP', 'INT', 'TERM', 'ABRT', 'BUS', 'FPE', 'ILL', 'QUIT', 'SEGV', 'SYS', 'TRAP') {
+  if ((! defined($SIG{$sig})) || ($SIG{$sig} ne 'IGNORE')) {
+    $SIG{$sig} = \&sig_handler;
+  }
+}
+
+
+if (scalar(@ARGV) == 0) {
+  Usage;
+  exit(1);
+}
+
+# Get command-line options
+
+GetOptions(
+            'exit=s' => \$exit_success,
+            'logging-level=s' => \$logging_level,
+            'success-email=s' => \$SUCCESS_EMAIL,
+            'failure-email=s' => \$FAILURE_EMAIL,
+            'default-failure-email=s' => \$DEFAULT_FAILURE_EMAIL,
+            'check-only' => \$check_only,
+            'app-id=s' => \$APP_ID,
+            'source-app-id=s' => \$SOURCE_APP_ID,
+            'app-dir=s' => \$APP_DIR_TOP,
+            'template=s' => \$TEMPLATE,
+) || exit(1);
+
+mydie "ERROR: Mandatory -app-id or -source-app-id parameter not specified!\n" if (! (defined($APP_ID) || defined($SOURCE_APP_ID)));
+mydie "ERROR: Cannot use -app-id and -source-app-id parameters together!" if (defined($APP_ID) && defined($SOURCE_APP_ID));
+mydie "ERROR: The mandatory -app-dir parameter was not specified!\n" if (! defined($APP_DIR_TOP));
+mydie "ERROR: Application directory $APP_DIR_TOP does not exist!\n" if (! -e $APP_DIR_TOP);
+
+my $fname;
+
+if (defined($SOURCE_APP_ID)) {
+	if (! @ARGV) {
+		mydie "ERROR: When using -source-app-id, must provide delivered filename\n";
+	}
+
+	if (scalar(@ARGV) > 1) {
+		mydie "ERROR: No more than 1 filename may be specified\n";
+	}
+
+	$fname = $ARGV[0];
+  $APP_ID = $SOURCE_APP_ID;
+}
+
+my $LOG_DIR = "$APP_DIR_TOP/log";
+my $ORIG_LOG_DIR = $LOG_DIR;
+
+if (! -d $LOG_DIR) {
+    $LOG_DIR = '.';
+}
+
+# Check if template exist
+our @temp_content;
+if (defined $TEMPLATE && $TEMPLATE  !~ /^\s*$/) {
+
+	if (! open(TEMP_FILE, $TEMPLATE)) {
+  	$TEMPLATE = "$APP_DIR_TOP/bin/$TEMPLATE";
+    open(TEMP_FILE, $TEMPLATE) or mydie "Could not open Template $TEMPLATE: $!\n";
+	}
+
+  while (my $line = <TEMP_FILE>) {
+     push (@temp_content, $line);
+  }
+
+  close (TEMP_FILE) or mydie "Could not close template file $TEMPLATE: $!\n";
+}
+
+
+
+# Set up logger options and get a logger
+
+$LOGFILE = "$LOG_DIR/${APP_ID}_trigger.$$.log";
+
+# Set screen options for logger
+my @screen_options;
+
+if (-t 1) {
+  @screen_options = (screen_threshold => $logging_level);
+} else {
+  @screen_options = (screen_threshold => 'OFF');
+}
+
+eval 'initialize_logging(@screen_options, file_threshold => $logging_level, logfile => $LOGFILE)';
+die "Cannot initialize logging : $@" if (! logging_initialized);
+
+eval '$LOGGER = get_logger' || die "Cannot get logger: $@";
+
+if ($LOG_DIR eq '.') {
+	eval '$LOGGER->warn("log directory \$ORIG_LOG_DIR does not exist. Logging to current directory instead.")' || die "Cannot write to log file $LOGFILE: $@";
+}
+
+my (@job_opts, $request_id);
+
+if (defined($SOURCE_APP_ID)) {
+  my $select = "
+      select q.rq_request_id
+      from job_queue q, job_delivery d
+      where q.rq_source_app_id = '$SOURCE_APP_ID'
+        and q.app_id = d.app_id
+        and d.delivery_output_file = '$fname'
+				and d.delivery_type = 'DATA'
+      order by creation_date desc";
+
+  my @request_id = BLUELITE::Job->dbh->selectrow_array($select);
+
+  if (! @request_id) {
+    mydie "Could not determine request ID for app_id = '$SOURCE_APP_ID', filename '$fname'";
+  }
+
+  $request_id = $request_id[0];
+  push(@job_opts, app_id => $SOURCE_APP_ID, request_id => $request_id);
+} else {
+  push(@job_opts, app_id => $APP_ID);
+}
+
+eval { $JOB = BLUELITE::Job->new(@job_opts) };
+
+if (! defined($JOB)) {
+	mydie "Unable to obtain BLUELITE::Job object for app_id = '$APP_ID' : $@\n";
+}
+
+if (defined($request_id)) {
+	my $temp_job;
+
+	eval { $temp_job = BLUELITE::Job->new(app_id => $APP_ID) };
+
+	if (! defined($temp_job)) {
+		mydie "Unable to obtain BLUELITE::Job object for app_id = '$APP_ID' : $@\n";
+	}
+
+	$TRIGGER_DIR = $temp_job->rq_deliv_dir;
+} else {
+	$TRIGGER_DIR = $JOB->deliv_dir;
+}
+
+mydie "ERROR: Deliverables directory $TRIGGER_DIR does not exist!\n" if (! -e $TRIGGER_DIR);
+mydie "ERROR: Cannot write to deliverable directory $TRIGGER_DIR\n" if (! -w $TRIGGER_DIR);
+
+my ($seconds_since_last_creation, $hours_since_last_creation);
+my $current_time = DateTime->now(time_zone => 'local');
+my $last_creation_time = $JOB->last_creation_datetime(delivery_type => 'TRIGGER');
+my $tz = $current_time->time_zone->name;
+
+if (defined($last_creation_time)) {
+	$LOGGER->info("Last trigger creation time = $last_creation_time");
+	$seconds_since_last_creation = ($current_time->subtract_datetime_absolute($last_creation_time))->seconds;
+	$hours_since_last_creation = sprintf('%0.2f', $seconds_since_last_creation / 3600);
+	$LOGGER->info("It has been $hours_since_last_creation hours since creating the last trigger file.");
+} else {
+	$LOGGER->info("No trigger files have ever been created.");
+}
+
+
+######
+
+
+$DBH = $JOB->dbh || mydie "Could not get database handle from BLUELITE::Job package : $@\n";
+
+my $limit_pd = 1;
+
+if (defined($SOURCE_APP_ID)) {
+	$limit_pd = 0;
+}
+
+my @workers = $JOB->ready_to_trigger(post_date_complete => 1, post_date_limit => $limit_pd);	# returns list of worker objects
+
+if (scalar(@workers) == 0) {
+	# no new trigger files to create
+	$LOGGER->info("No post dates are ready to trigger.");
+	myexit($exit_success)
+}
+
+# organize workers by post date in a data structure
+my ($post_date_worker, $post_date);
+
+foreach my $worker (@workers) {
+	$post_date = $worker->post_date;
+	$LOGGER->info("Post date $post_date is ready to trigger.") if ($check_only && ! exists($post_date_worker->{$post_date}));
+	push(@{$post_date_worker->{$post_date}->{workers}}, $worker);
+
+	if (! exists($post_date_worker->{$post_date}->{deliveries}->{$worker->delivery_file_id})) {
+		$post_date_worker->{$post_date}->{deliveries}->{$worker->delivery_file_id} = $worker->delivery_info;
+		$post_date_worker->{$post_date}->{num_deliveries}++;
+		$post_date_worker->{$post_date}->{data_records} += $worker->delivery_info->{DATA_RECORDS};
+	}
+
+
+};
+
+myexit($exit_success) if ($check_only);
+
+# For each post date for which all data has been processed and delivered, create a trigger file.
+
+my ($total_records, $records_added, @workers_in_output, @missing_files);
+my $file_encoding = $JOB->trigger_encoding;
+$file_encoding = '' if (! defined($file_encoding));
+my $record_terminator = $JOB->concat_record_terminator;
+
+if (! defined($record_terminator)) {
+	mydie "Could not determine which record terminator to use. Check CONCAT_RECORD_TERMINATOR field in JOB_CONFIG table.\n";
+}
+
+my ($append_error_mesg, $num_data_files, $xml_file_info, $trigger_id, $total_data_records, $total_files, @file_names);
+
+foreach my $post_date (sort keys %{$post_date_worker}) {
+
+	$TRIGGER_OUTFILE_NAME = get_trigger_fname($post_date, $TRIGGER_DIR, $JOB);
+	$total_data_records = $post_date_worker->{$post_date}->{data_records};
+
+	$trigger_id = add_trigger($TRIGGER_OUTFILE_NAME, $JOB, $post_date, $total_data_records, $post_date_worker->{$post_date}->{workers});
+
+	if (! $trigger_id) {
+		$JOB->rollback;
+		mydie "Could not add trigger file $TRIGGER_OUTFILE_NAME\n";
+	}
+
+	if ($file_encoding =~ /^\s*(raw|uncompressed)\s*$/i) {
+		$OUT_FH = new IO::File "> $TRIGGER_OUTFILE_NAME" || mydie "Cannot create trigger file $TRIGGER_OUTFILE_NAME : $!\n";
+	} elsif ($file_encoding =~ /^\s*gzip\s*$/i) {
+		$OUT_FH = new IO::Compress::Gzip $TRIGGER_OUTFILE_NAME || mydie "Gzip failed to create trigger file $TRIGGER_OUTFILE_NAME : $GzipError\n";
+	} else {
+		mydie "ERROR: file_encoding type of '$file_encoding' is not supported!\n";
+	}
+
+	$current_time = DateTime->now(time_zone => 'local');
+	$total_files = scalar(keys %{$post_date_worker->{$post_date}->{deliveries}});
+
+  if (! defined $TEMPLATE) {
+
+	  my_print($OUT_FH, '<trigger id="' . $trigger_id . '" name="' . basename($TRIGGER_OUTFILE_NAME) . '">' . "\n", "Could not create <trigger> tag for trigger file $TRIGGER_OUTFILE_NAME");
+	  my_print($OUT_FH, '   <creation date="' . $current_time->strftime('%Y%m%d') . '" time="' . $current_time->strftime('%H:%M:%S') . '" zone="' . $tz . '"></creation>' . "\n", "Could not create <creation> tag for trigger file $TRIGGER_OUTFILE_NAME");
+
+	  my_print($OUT_FH, '   <data_files count="' . $total_files . '">' . "\n", "Could not create <data_files> tag for trigger file $TRIGGER_OUTFILE_NAME");
+
+
+  }
+
+	$num_data_files = 0;
+
+	foreach my $delivery_id (sort { $post_date_worker->{$post_date}->{deliveries}->{$a}->{SEQ_NUM} <=> $post_date_worker->{$post_date}->{deliveries}->{$b}->{SEQ_NUM} } keys %{$post_date_worker->{$post_date}->{deliveries}}) {
+
+		my $delivery_info = $post_date_worker->{$post_date}->{deliveries}->{$delivery_id};
+		push (@file_names, basename($delivery_info->{DELIVERY_OUTPUT_FILE}));
+
+		no warnings 'uninitialized';
+
+    if (! defined $TEMPLATE) {
+		  my_print($OUT_FH, '      <file id="' . $delivery_id . '" name="' . basename($delivery_info->{DELIVERY_OUTPUT_FILE}) . '">' . "\n", "Cannot create <file> tag in trigger file $TRIGGER_OUTFILE_NAME");
+
+		  my_print($OUT_FH, '         <size bytes="' . $delivery_info->{FILE_SIZE} . '" data_records="' . $delivery_info->{DATA_RECORDS} . '" txns_processed="' . $delivery_info->{TXN_PROCESSED} . '"></size>' . "\n" , "Cannot create <size> tag in trigger file $TRIGGER_OUTFILE_NAME");
+
+		  my_print($OUT_FH, '         <creation date="' . $delivery_info->{CREATION_DATE} . '" time="' . $delivery_info->{CREATION_TIME} . '" zone="' . $tz . '">' . "</creation>\n", "Cannot create file <creation> tag in trigger file $TRIGGER_OUTFILE_NAME");
+
+		  my_print($OUT_FH, '         <transmission date="' . $delivery_info->{DELIVERY_DATE} . '" time="' . $delivery_info->{DELIVERY_TIME} . '" zone="' . $tz . '">' . "</transmission>\n", "Cannot create file <transmission> tag in trigger file $TRIGGER_OUTFILE_NAME");
+
+		  if (defined($delivery_info->{DESTINATION_HOST})) {
+			  my_print($OUT_FH, '         <destination host="' . $delivery_info->{DESTINATION_HOST} . '"></destination>' . "\n", "Cannot create file <creation> tag in trigger file $TRIGGER_OUTFILE_NAME");
+		  }
+
+		  $xml_file_info = {
+			  seq_num => $delivery_info->{SEQ_NUM},
+			  post_date => $post_date,
+		  };
+
+		  foreach my $tag (keys %{$xml_file_info}) {
+			  $append_error_mesg = "Cannot append <$tag> tag to trigger file $TRIGGER_OUTFILE_NAME";
+
+			  if (defined($xml_file_info->{$tag})) {
+				  my_print($OUT_FH, "         <$tag>" . $xml_file_info->{$tag} . "</$tag>\n", $append_error_mesg);
+			  }
+		  }
+
+		  my_print($OUT_FH, "      </file>\n", $append_error_mesg);
+
+		  $num_data_files++;
+
+	  } #end  (! defined $TEMPLATE) 
+	} #foreach loop 
+
+	if (! defined $TEMPLATE) {
+
+	  my_print($OUT_FH, "   </data_files>\n", "Could not create </data_files> tag in trigger file $TRIGGER_OUTFILE_NAME");
+	  my_print($OUT_FH, "</trigger>\n", "Could not create </trigger> tag in trigger file $TRIGGER_OUTFILE_NAME");
+	}
+
+
+  if (defined $TEMPLATE) {
+
+    my @new_temp_content;
+
+    my $files;
+    foreach my $file (@file_names) {
+      $files = $file . "\n";
+    }
+
+    #remove the last end of line character if has multiple files in string
+    chomp ($files);
+
+    my ($y, $m, $d)=  unpack('a4a2a2', $post_date);
+
+    foreach my $line (@temp_content) {
+
+      $line =~ s/\%yyyy/$y/;
+      $line =~ s/\%mm/$m/;
+      $line =~ s/\%dd/$d/;
+      $line =~ s/\%total_files/$total_files/;
+      $line =~ s/\%num_records/$total_data_records/;
+      $line =~ s/\%file_names/$files/;
+      push (@new_temp_content, $line);
+   }
+
+   foreach my $line (@new_temp_content) {
+     my_print($OUT_FH, $line) ; 
+   }
+ }
+
+	$OUT_FH->close || mydie "Could not close output trigger file $TRIGGER_OUTFILE_NAME : $!\n";
+
+	my $new_output_fname = mymove($TRIGGER_OUTFILE_NAME, $TRIGGER_DIR) || mydie "Could not move trigger file $TRIGGER_OUTFILE_NAME to deliverable directory $TRIGGER_DIR : $!\n";
+
+	$TRIGGER_OUTFILE_NAME = $new_output_fname;
+
+	$JOB->commit || mydie "Could not commit addition of trigger file $TRIGGER_OUTFILE_NAME\n";
+
+	$JOB->log(event_code => 'TRSUCCESS', log_type => 'INFO', post_date => $post_date, email_subject => 'trigger file created successfully', message => "Created trigger file $TRIGGER_OUTFILE_NAME . Data Records = ${total_data_records}. Number of data files = ${num_data_files}.");
+
+	$FILES_CREATED++;
+}
+
+
+$LOGGER->info("Completed trigger file creation process.") || mydie "Cannot write to log file $LOGFILE: $@";
+
+myexit($exit_success);
+

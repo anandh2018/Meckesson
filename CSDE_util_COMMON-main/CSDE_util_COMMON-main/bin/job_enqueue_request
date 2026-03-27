@@ -1,0 +1,1186 @@
+#!/usr/bin/perl
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#
+# job_enqueue_request
+#
+# Read in a request file passed on the command line, validate and write the
+# details of this request to the job_queue.  Largely uses BLUELITE::Job to
+# interact with Oracle.
+#
+# 20141031 - Michael Carey <michael.carey@mckesson.com>
+# Initial requirements gathering and development.
+#
+# 20150114 - Michael Carey <michael.carey@mckesson.com>
+# Adding logic to generate an error if unrecognized name value pair are
+# provided in the request file.  Also making minor fixes from first code review.
+#
+# 20140203 - Michael Carey <michael.carey@mckesson.com>
+# Continuing minor fixes from first code review.
+#
+# 20150526 - Michael Carey <michael.carey@mckesson.com>, John Hess (john.hess2@relayhealth.com)
+# Add support for new RQ_VALIDATE_CMD, for custom request validation hook.
+# Make -app-id required command-line parameter.
+#
+# 20150701 - J Hess
+# Allow the following parameters to be customized via config or custom validation:
+#    deliverable_fname_sprintf
+#    trigger_fname_sprintf
+#    deliverable_fname_vars
+#    trigger_fname_vars
+# Allow only RECOGNIZED "a=b" setting (above) from custom validator.
+#
+# 20160421 - J Hess
+# Add name of field when duplicate encountered
+#
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+# TODO: remove this for production
+#use lib '/ds/development/Job/dev/blib/lib';
+
+use strict;
+use warnings;
+use IO::File;
+use File::Spec;
+use File::Copy;
+use File::Path qw(mkpath);
+use DateTime;
+use Getopt::Long;
+use BLUELITE::Common;
+use BLUELITE::Logger;
+use BLUELITE::Job;
+use Data::Dumper;
+
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
+# if no command line parms are given, print usage and exit
+if (scalar @ARGV == 0) {
+	show_help();
+	exit 0;
+}
+
+# a list of valid field names that can occur in a standard request.  an error is
+# generated if anything other than the names listed below occur in a request.
+my $VALNAMES = [
+	'description',
+	'app id',
+	'post date',
+	'reference id',
+	'reset id',
+	'resume id',
+	'file scope',
+	'requester email',
+];
+
+# command line arguments
+my $group_id   = '';
+our $APP_ID    = '';
+my $nomove     = 0;
+my $debug      = 0;
+my $help       = 0;
+my $opt_result = GetOptions(
+	'group-id|group_id=s' => \$group_id,
+	'app-id|app_id=s'     => \$APP_ID,
+	'nomove'              => \$nomove,
+	'debug'               => \$debug,
+	'help|?'              => \$help,
+	);
+
+if ($help) {
+	show_help();
+	exit 0;
+}
+
+if (!$group_id) {
+	show_help();
+	print "ERROR: you must provide a group id on the command line.\n";
+	exit 0;
+}
+
+if (!$APP_ID) {
+	show_help();
+	print "ERROR: you must provide a app id on the command line.\n";
+	exit 0;
+}
+
+$APP_ID = uc($APP_ID);
+
+# get request file passed in by filed from command line
+my $REQ_PATHFILE = join( ' ', @ARGV );
+
+# make sure a request file value was passed
+if ( !defined $REQ_PATHFILE || !$REQ_PATHFILE ) {
+	show_help();
+	print "ERROR: you must provide a request file to process.\n";
+	exit 0;
+}
+
+# initialize some important globals
+my $APP_ENV     = init_pgm();                     # local function
+my $logger      = $APP_ENV->{logger};             # lowercase pls
+my $PGM         = $APP_ENV->{pgm_name};           # file name of pgm
+my $REQ_SUCCDIR = $APP_ENV->{req_succdir};        # dir for parsed requests
+my $REQ_FAILDIR = $APP_ENV->{req_faildir};        # dir for invalid requests
+my $REQ_FILE    = $APP_ENV->{req_file};           # basename
+my $ARC_TS      = $APP_ENV->{arc_ts};             # timestamp for archived files
+my $EMAIL_DEFTO = 'dataservicesnotification@relayhealth.com';
+my $GROUP_ID    = uc( trim($group_id) );          # from the command line,
+                                                  # required, not validated.
+
+if ( !-e $REQ_PATHFILE ) {
+	abend_pgm("request file, $REQ_PATHFILE, does not exist");
+}
+
+if ( !-r $REQ_PATHFILE ) {
+	abend_pgm("request file is not readable, $REQ_PATHFILE");
+}
+
+$logger->info("starting $PGM");
+$logger->info("processing request file, $REQ_PATHFILE");
+
+my $req = read_request($REQ_PATHFILE); # local function
+
+# print Dumper( $req ); # todo: remove this
+my $REQUEST_ID = ''; # file level global
+
+# check to see if there was some fundamental problem parsing the request
+if ( $req->{error} ) {
+	# there was a problem parsing the request, write error job_queue record
+	insert_failed( $req );
+	move_req($REQ_PATHFILE, $REQ_FAILDIR);
+	exit 0;
+}
+
+# is this a reset
+if ($req->{'reset id'}) {
+	process_reset( $req ); # never returns, local function
+}
+
+# is this a resume
+if ($req->{'resume id'}) {
+	process_resume( $req ); # never returns, local function
+}
+
+# we are processing a normal new request
+
+# get new job object
+my $template_app;
+eval {
+	$template_app = BLUELITE::Job->new(app_id => $req->{'app id'})
+		|| die("cannot create template application object, $!");
+};
+
+if ($@) {
+	# an error condition with the supplied app id occurred, we cannot create
+	# a failure record with an invalid app id
+	abend_pgm($@);
+}
+
+my $dbh = $template_app->dbh();
+
+# make sure the provided app id is a valid one
+# need object database connection to perform this test
+# if app id is not valid, we cannot insert a failure record.  abend_pgm
+if ( !appid_valid( $template_app, $req ) ) {
+	$req->{error} .= 'App id provided in request is not valid. ';
+	insert_failed( $req, $dbh );
+	move_req($REQ_PATHFILE, $REQ_FAILDIR);
+	exit 0;
+}
+
+
+my $new_app;
+eval {
+	$new_app = $template_app->create_new_request() || die $!;
+};
+
+if (!defined $new_app) {
+	$req->{error} .= 'could not create new request from template. ';
+	insert_failed( $req, $dbh );
+	move_req($REQ_PATHFILE, $REQ_FAILDIR);
+	exit 0;
+}
+
+$dbh = $new_app->dbh();  # new request, new connection
+$req->{RQ_SOURCE_APP_ID} = $new_app->source_app_id();
+
+# check post date spec, set data_source_format
+my $post_date_list;
+my $num_post_dates = 0;
+eval {
+	$post_date_list = $new_app->post_date_list($req->{'post date'});
+	$num_post_dates = scalar( @{$post_date_list} );
+};
+
+if ($@ || !defined $post_date_list || $num_post_dates < 1) {
+	# an invalid post date spec was provided
+	$req->{error} = 'invalid post date spec provided. ' . $req->{'post date'};
+	insert_failed( $req, $dbh );
+	move_req($REQ_PATHFILE, $REQ_FAILDIR);
+	exit 0;
+}
+
+if ($num_post_dates > 20) {
+	$req->{data_source_format} = 'POSTDATE';
+} else {
+	$req->{data_source_format} = '';
+}
+
+# first set of updates
+my $updates = {
+	description               => $req->{description},
+	rq_requester_email        => $req->{email_string},
+	output_scope              => $req->{'file scope'},
+	rq_post_date              => $req->{'post date'},
+	rq_reference_id           => $req->{'reference id'},
+	group_id                  => $GROUP_ID,
+	data_source_format        => $req->{data_source_format},
+};
+
+# set deliverable/trigger fname/vars according to this precedence:
+# 1) value returned by custom validator
+# 2) value configured via corresponding rq_*() method (i.e. from rq_* column in job_config table)
+# 3) default convention: ${reference_id}_*fname_sprintf (from job_config table)
+
+if (defined($template_app->rq_deliverable_fname_sprintf)) {
+	#2
+	$updates->{deliverable_fname_sprintf} = $template_app->rq_deliverable_fname_sprintf;
+} else {
+	#3
+	$updates->{deliverable_fname_sprintf} = $req->{'reference id'} . '_' . $template_app->deliverable_fname_sprintf;
+}
+
+if (defined($template_app->rq_trigger_fname_sprintf)) {
+	#2
+	$updates->{trigger_fname_sprintf} = $template_app->rq_trigger_fname_sprintf;
+} elsif (defined($template_app->trigger_fname_sprintf)) {
+	#3
+	$updates->{trigger_fname_sprintf} = $req->{'reference id'} . '_' . $template_app->trigger_fname_sprintf;
+}
+
+if (defined($template_app->rq_deliverable_fname_vars)) {
+	#2
+	$updates->{deliverable_fname_vars} = $template_app->rq_deliverable_fname_vars;
+} else {
+	#3
+	$updates->{deliverable_fname_vars} = $template_app->deliverable_fname_vars;
+}
+
+if (defined($template_app->rq_trigger_fname_vars)) {
+	#2
+	$updates->{trigger_fname_vars} = $template_app->rq_trigger_fname_vars;
+} elsif (defined($template_app->trigger_fname_vars)) {
+	#3
+	$updates->{trigger_fname_vars} = $template_app->trigger_fname_vars;
+}
+
+my %allowed_custom_rq_settings = map { $_ => undef } (qw/
+	worker_opts
+	deliverable_fname_sprintf
+	trigger_fname_sprintf
+	deliverable_fname_vars
+	trigger_fname_vars
+/);
+
+# check for unrecognized parameters from custom validator
+foreach my $custom_rq_setting (keys %{$req->{rq_settings}}) {
+	if (! exists($allowed_custom_rq_settings{$custom_rq_setting})) {
+		$req->{error} = "Custom validator set an unrecognized parameter '$custom_rq_setting'";
+		insert_failed( $req, $dbh );
+		move_req($REQ_PATHFILE, $REQ_FAILDIR);
+		exit 0;
+	}
+}
+
+# override above settings w/values from custom validator
+foreach my $setting_key (keys %allowed_custom_rq_settings) {
+	if (exists($req->{rq_settings}->{$setting_key})) {
+		$updates->{$setting_key} = $req->{rq_settings}->{$setting_key};
+	}
+}
+
+# at this point, the request has been validated, time to commit it
+
+my $result;
+eval{ $result = $new_app->update_job_config(assignments => $updates) };
+# print Dumper $updates; # todo: remove this
+
+if (!defined $result || $result->{error}) {
+	$req->{error} .= 'cannot update job config ' . $result->{error};
+	insert_failed( $req, $dbh );
+	move_req($REQ_PATHFILE, $REQ_FAILDIR);
+	exit 0;
+}
+
+$new_app->commit;
+
+$REQUEST_ID = $new_app->{RQ_REQUEST_ID};
+
+# get a fresh object to query/update
+my $fresh_app;
+eval {
+	$fresh_app = BLUELITE::Job->new(
+		app_id => $req->{'app id'},
+		request_id => $REQUEST_ID,
+		) || die("cannot get fresh job object, $!");
+};
+
+if ($@) {
+	# an error condition occurred while attempting to get a fresh job object
+	# for newly created request.  This is a system problem, not caused by user
+	$req->{error} .= 'system error, cannot get job obj for new request.';
+	insert_failed($req, $dbh);
+	move_req($REQ_PATHFILE, $REQ_FAILDIR);
+	exit 0;
+}
+
+# create file system resources for this request
+$logger->debug("creating output dir " . $fresh_app->output_dir);
+mkpath( $fresh_app->output_dir, 0, 0770 );
+
+# do we need to write a drug list file?
+
+if ( scalar(@{$req->{drugs}}) > 0 ) {
+	
+	my $fname = File::Spec->catfile( $fresh_app->worker_dir, "${REQUEST_ID}_drugs.txt" );
+	$logger->debug("opening file: $fname");
+	my $fh;
+	
+	eval {
+		$fh = IO::File->new( $fname, O_WRONLY | O_CREAT | O_TRUNC )
+			or die("$fname, $!");
+		
+		foreach my $drug ( @{$req->{drugs}} ) {
+			print $fh "$drug\n" || die $!;
+		}
+		
+		$logger->debug("closing file: $fname");
+		$fh->close() || die $!;
+	};
+	
+	if ($@) {
+		$req->{error} .= "problem writing drug file, $@, $!";
+		insert_failed($req, $dbh);
+		move_req($REQ_PATHFILE, $REQ_FAILDIR);
+		exit 0;
+	}
+	
+	$req->{drug_filename} = $fname;
+}
+
+# do we need to write a pharmacy list file?
+if ( scalar(@{$req->{pharms}}) > 0 ) {
+	
+	my $fname = File::Spec->catfile( $fresh_app->worker_dir, "${REQUEST_ID}_pharms.txt" );
+	$logger->debug("opening file: $fname");
+	my $fh;
+	
+	eval {
+		$fh = IO::File->new( $fname, O_WRONLY | O_CREAT | O_TRUNC )
+			or die("$fname, $!");
+		
+		foreach my $pharm ( @{$req->{pharms}} ) {
+			print $fh "$pharm\n" || die $!;
+		}
+		
+		$fh->close() || die $!;
+	};
+	
+	if ($@) {
+		$req->{error} .= "problem writing pharmacy file, $@, $!";
+		insert_failed($req, $dbh);
+		move_req($REQ_PATHFILE, $REQ_FAILDIR);
+		exit 0;
+	}
+	
+	$req->{pharmacy_filename} = $fname;
+}
+
+# last set of updates
+my $last_updates = {
+	RQ_DRUG_FILENAME     => $req->{drug_filename},
+	RQ_PHARMACY_FILENAME => $req->{pharmacy_filename},
+	RQ_STEP              => 'VALIDATE',
+	RQ_SUBMITTED_DATE    => 'sysdate',
+	RQ_STATUS            => 'COMPLETE'
+};
+
+eval { $result = $fresh_app->update_job_config(assignments => $last_updates); };
+
+if (!defined $result || $result->{error}) {
+	$req->{error} .= 'system error, cannot perform last set of updates.';
+	insert_failed( $req, $dbh );
+	move_req($REQ_PATHFILE, $REQ_FAILDIR);
+	exit 0;
+}
+
+$fresh_app->commit;
+
+$logger->info("New request, " . $fresh_app->{APP_ID} . ", enqueued.");
+$logger->info("ending $PGM normally");
+
+move_req($REQ_PATHFILE, $REQ_SUCCDIR);
+exit 0;
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+sub read_request {
+	# read request file passed on command line, return hash of parms
+	my $file = shift;
+
+	# hash in which the request details reside
+	my $req     = {
+		drugs => [],
+		pharms => []
+	};
+
+	$logger->debug("opening file: $file");
+	my $fh = IO::File->new( $file, O_RDONLY ) or abend_pgm("$file, $!");
+	my $app_id;
+
+	while (my $line = <$fh>) {
+		if ($line =~ /^\s*app id:\s*(\S+)\s*$/i) {
+			if (defined $app_id) {
+				$req->{error} = "App id specified more than once in $file";
+#				return $req;
+			}
+
+			$app_id = uc($1);
+		}
+	}
+
+	close($fh);
+
+	if (! defined($app_id)) {
+		$req->{error} = "App ID not specified in $file";
+#		return $req;
+	}
+
+	if (($APP_ID ne 'ANY') && ($app_id ne $APP_ID)) {
+		$req->{error} = "App ID of '$app_id' specified in $file does not match App ID of '$APP_ID' on command line";
+#		return $req;
+	}
+
+	my $job = BLUELITE::Job->new(app_id => $app_id);
+	my ($validate_cmd, $temp_err_fname);
+
+	if (defined $job->rq_validate_cmd) {
+		$temp_err_fname = "${file}.stderr";
+		$validate_cmd = $job->rq_validate_cmd() . " -app-id $app_id $file 2> $temp_err_fname |";
+		if (! open($fh, "$validate_cmd")) {
+			$req->{error} = "Could not start rq_validate_cmd $validate_cmd : $!";
+			return $req;
+		}
+	} else {
+		$fh = IO::File->new( $file, O_RDONLY ) or abend_pgm("$file, $!");
+	}
+
+	my $l       = 0;            # current request file line number
+	my $parsing = 'nameval';    # initialize state to parsing of namevals
+	while ( my $line = <$fh> ) {
+		$l++;
+		$line =~ s/\r|\n//g;
+		$line = trim( $line );
+		
+		$logger->debug("line: >$line<");
+		
+		if (!$line) {
+			$logger->debug("skipping blank Line $l");
+			next;
+		}
+		
+		if ($line =~ m/^\s*#+/) {
+			$logger->debug("skipping comment on Line $l");
+			next;
+		}
+		
+		# set "parsing mode"
+		if ( lc($line) =~ m/^drug:?$/) {
+			# make sure drugs have not been previously specified
+			if (exists $req->{drugs} && scalar @{ $req->{drugs} } > 0) {
+				# since this could be read from a pipe now, the line number is
+				# no longer a reflection of the actual line from the request
+				# $req->{error} .= "Line $l, duplicate drug specification. ";
+				$req->{error} .= "Duplicate drug specification. ";
+			} else {
+				$req->{drugs} = [];
+			}
+			$parsing = 'drugs';
+			next;
+		} elsif ( lc($line) =~ m/^pharmacy:?$/ ) {
+			# make sure pharmacies have not been previously specified
+			if (exists $req->{pharms} && scalar @{ $req->{pharms} } > 0) {
+				# $req->{error} .= "Line $l, duplicate pharmacy specification. ";
+				$req->{error} .= "Duplicate pharmacy specification. ";
+			} else {
+				$req->{pharms} = [];
+			}
+			$parsing = 'pharms';
+			next;
+		} elsif ($line =~ /^\s*([a-z0-9_]+)\s*=\s*(.*)$/i) {
+			my ($rq_setting_key, $rq_setting_value) = (lc($1), $2);
+
+			if (exists($req->{rq_settings}->{$rq_setting_key})) {
+				# $req->{error} .= "Line $l, duplicate $rq_setting_key specified. ";
+				$req->{error} .= "Duplicate $rq_setting_key specified. ";
+				next;
+			}
+
+			$req->{rq_settings}->{$rq_setting_key} = $rq_setting_value;
+			next;
+		} elsif ($line =~ m/\:/) {
+			$parsing = 'nameval';
+		}
+		
+		$logger->debug("currently parsing $parsing");
+		
+		if ($parsing eq 'nameval') {
+			
+			# we are parsing a name value pair
+			my ($name, $value) = split(':', $line, -1);
+			$name  = lc( trim($name) );
+			$value = trim( $value );
+			
+			# make sure we are parsing an accepted parm name
+			if ( !grep(/^$name$/, @{$VALNAMES}) ) {
+				# error condition
+				# $req->{error} .= "Line $l, $name is not a valid field name. ";
+				$req->{error} .= "$name is not a valid field name. ";
+				next;
+			}
+			
+			# check to make sure we haven't seen this name value already
+			# to prevent duplicate specification in the file
+			if (exists $req->{$name}) {
+				# $req->{error} .= "Line $l, duplicate field in request. ";
+				$req->{error} .= "Duplicate field ($name) in request. ";
+				next;
+			}
+			
+			$req->{$name} = $value;
+			$logger->debug("Name: $name, Value: $value");
+		
+		} elsif ($parsing eq 'drugs') {
+			
+			# we are parsing drugs
+			if ( length($line) != 11 ) {
+				# error condition
+				# $req->{error} .= "Line $l, drug $line must be 11 chars. ";
+				$req->{error} .= "Drug $line must be 11 chars. ";
+				next;
+			}
+			
+			push( @{$req->{drugs}}, $line );
+			$logger->debug("Drug: $line");
+			
+		} elsif ($parsing eq 'pharms') {
+			
+			# we are parsing a pharmacy
+			if ( length($line) != 7 && length($line) != 10 ) {
+				# error condition
+				$req->{error} .= "Line $l, pharmacy $line must be 7 or 10 chars. ";
+				$req->{error} .= "Pharmacy $line must be 7 or 10 chars. ";
+				next;
+			}
+			
+			push( @{$req->{pharms}}, $line );
+			$logger->debug("Pharmacy: $line");
+			
+		}
+	}
+	
+	$logger->debug("closing file: $file");
+
+	if (! $fh->close()) {
+
+		if (defined $validate_cmd) {
+
+			$logger->debug("returned non-zero: $validate_cmd");
+			$req->{error} .= "Custom validation command failed for file: $file ";
+
+			if (-f $temp_err_fname) {
+				open(ERR, $temp_err_fname);
+				$req->{error} .= join('', <ERR>);
+				close(ERR);
+#				unlink($temp_err_fname); unlinked below
+			}
+		} else {
+			$req->{error} .= "Could not close $file : $!";
+		}
+
+		# return $req;
+	}
+
+	if (defined $temp_err_fname) {
+		unlink($temp_err_fname);
+	}
+	
+	# BEGIN LOGICAL VALIDATION OF HASH
+	
+	# app id of application on which this is based must be provided
+	if (!$req->{'app id'}) {
+		$req->{error} .= "Request did not contain an app id. ";
+	}
+	
+	$req->{'app id'} = uc( $req->{'app id'} );  # uppercase it
+	
+	# reset id and resume id may not both be specified (they can be null)
+	if ($req->{'reset id'} && $req->{'resume id'}) {
+		$req->{error} .= "Reset and resume id may not both be specified. ";
+	}
+	
+	if ($req->{'reset id'}) {
+		return $req;
+	}
+	
+	if ($req->{'resume id'}) {
+		return $req;
+	}
+	
+	# email address(es) must be provided.
+	if (!$req->{'requester email'}) {
+		$req->{error} .= "Request did not contain a requester email. ";
+	}
+	
+	# parse/validate email addresses
+	my @emails = split('\,', $req->{'requester email'});
+	
+	foreach my $email (@emails) {
+		$logger->debug("testing: $email");
+		$email = trim( $email );  # trim it
+		$email = lc( $email );    # lowercase it
+		if ($email =~ m/\@mckesson\.com$|\@relayhealth\.com$/) {
+			$req->{email_string} .= "$email,";
+		} else {
+			$logger->debug("rejecting invalid email, $email");
+		}
+	}
+	
+	# remove trailing comma
+	$req->{email_string} =~ s/\,$//;
+	
+	$logger->debug( "email string: " . $req->{email_string} );
+	
+	if (!$req->{email_string}) {
+		$req->{error} .= "Request did not contain a valid requester email. ";
+	}
+	
+	# memorable description must be provided
+	if (!$req->{description}) {
+		$req->{error} .= "Request did not contain a description. ";
+	}
+	
+	# post date must be provided
+	if (!$req->{'post date'}) {
+		$req->{error} .= "Request did not contain a post date spec. ";
+	}
+	
+	# reference id must be provided (jtrac number)
+	if (!$req->{'reference id'}) {
+		$req->{error} .= "Request did not contain a reference id. ";
+	}
+	
+	$req->{'reference id'} = uc( $req->{'reference id'} );
+	
+	# make sure reference id begins with AH followed by some word chars
+	if ($req->{'reference id'} !~ m/^AH[a-zA-Z0-9]+$/) {
+		$req->{error} .= "Reference id must begin with AH and contain only letters or numbers. ";
+	}
+	
+	# if specified, file scope must be daily|monthly|yearly|all,
+	# (daily|all for now)
+	if (exists $req->{'file scope'} && $req->{'file scope'}) {
+		$req->{'file scope'} = uc( $req->{'file scope'} ); # uppercase it
+		if ($req->{'file scope'} !~ m/^(DAILY|ALL)$/) {
+			$req->{error} .= "Specified file scope, " . $req->{'file scope'} . ", not valid. ";
+		}
+	}
+
+#	print Dumper $req; # todo: remove this
+
+	return $req;
+}
+
+sub appid_valid {
+	my $ta = shift;
+	my $r  = shift;
+	
+	# return true  = app id ok
+	# return false = app id not ok
+	
+	# if the autohoc_support value from job_config record is 'Y', return true
+	if ($ta->autohoc_support() eq 'Y') {
+		return 1;
+	}
+	
+	# if autohoc support value from job_config is set to 'N', return false
+	if ($ta->autohoc_support() eq 'N') {
+		$r->{error} .= "Autohoc for this app_id is not allowed. ";
+		return 0;
+	}
+
+	# if environment is dev, skip further checks
+	if ($ENV{JOBPKG_ENV} eq 'DEV') {
+		$logger->debug("dev environment, not checking validity of app id");
+		return 1;
+	}
+
+	# otherwise make sure there have been recent deliveries
+	my $dbh = $ta->dbh();
+	
+	my $sql = q{
+		SELECT
+			'ok'
+		FROM
+			job_delivery
+		WHERE
+			creation_date BETWEEN trunc(sysdate) - 7 AND trunc(sysdate)
+			AND DELIVERY_TYPE = 'DATA'
+			AND destination_host IS NOT NULL
+			AND app_id = ?
+		GROUP BY
+			app_id
+		HAVING
+			count(1) = 7
+	};
+	
+	my $sth = $dbh->prepare($sql) or abend_pgm('prep: ' . $dbh->errstr);
+
+	$sth->execute( $ta->app_id ) or abend_pgm('exec: ' . $sth->errstr);
+	
+	# fetch
+	my ($ok) = $sth->fetchrow_array;
+	
+	if ( $sth->err ) { abend_pgm('fetch: ' . $sth->errstr) }
+	
+	$sth->finish;
+	
+	if (defined $ok) {
+		# the app is a 'go', return true
+		return 1;
+	}
+	
+	$r->{error} .= "This app_id has no recent data delivery. ";
+	return 0;
+}
+
+sub insert_failed {
+	my $req                = shift;
+	my $dbh2               = shift;
+	my $group_id           = $GROUP_ID;
+	my $rq_requester_email = $EMAIL_DEFTO; # initialize to default
+
+	# if there is no provided app id, we cannot insert anything into job_queue
+	# oracle constraint
+	if (!exists $req->{'app id'} || !$req->{'app id'}) {
+		my $m = "no valid app id provided";
+		if (defined $req->{error}) {
+			$m .= ", " . $req->{error};
+		}
+		abend_pgm($m);
+	}
+
+	my $app_id  = $req->{'app id'};
+
+	# if I haven't been able to bootstrap a connection, create one
+	if (!defined $dbh2 || !$dbh2->ping ) {
+		$logger->debug("creating database connection for generic update");
+		$dbh2 = BLUELITE::Job->dbh();
+		if (!defined $dbh2 || !$dbh2->ping) {
+			abend_pgm("could not get db connection to insert request failure");
+		}
+	}
+	
+	# from here, insert a record in job queue representing a failed validation
+	# Job records inserted because of failed request parsing
+	# will never be executed.  Job records inserted because of failed request
+	# parsing will always need to be resubmitted by uploading a new file.
+	# The exact detail of the request need not be written, only a description
+	# of the ways in which the request failed validation.
+	
+	# if I have an email address in the request, use that
+	if ($req->{email_string}) {
+		$rq_requester_email = $req->{email_string};
+	} else {
+		$req->{error} .= "request did not contain a valid email, using default $EMAIL_DEFTO. ";
+	}
+	
+	my $rq_status = "$REQ_FILE, UNKNOWN ERROR"; # initialize to something generic
+	
+	# if I have an error messsage, use that
+	if ($req->{error}) {
+		$rq_status = "$REQ_FILE, " . $req->{error};
+		$rq_status = substr($rq_status, 0, 1023); # limit of the column
+	}
+	
+	$logger->error( $rq_status );
+
+	$logger->info("inserting parsing error record");
+	
+	# get request id sequence number
+	my $seqsth = $dbh2->prepare('select JOB_REQUEST_ID_SEQ.NEXTVAL from dual')
+		|| abend_pgm( 'prep: ' . $dbh2->errstr );
+	
+	$seqsth->execute() or abend_pgm('exec: ' . $dbh2->errstr);
+	
+	($REQUEST_ID) = $seqsth->fetchrow_array;
+	
+	$seqsth->finish;
+	
+	# insert error record
+	my $if_sth = $dbh2->prepare( qq{
+		insert into job_queue (
+			APP_ID,
+			GROUP_ID,
+			RQ_SOURCE_APP_ID,
+			RQ_REQUESTER_EMAIL,
+			RQ_STATUS,
+			RQ_STATUS_DETAIL,
+			RQ_SUBMITTED_DATE,
+			RQ_REQUEST_ID,
+			RQ_REFERENCE_ID,
+			RQ_STEP )
+		values (
+			?,
+			?,
+			?,
+			?,
+			'ERROR',
+			?,
+			sysdate,
+			?,
+			?,
+			'VALIDATE' )
+		} ) || abend_pgm( 'prep: ' . $dbh2->errstr );
+	
+	$if_sth->execute(
+			"$app_id.$REQUEST_ID",
+			$group_id,
+			$app_id,
+			$rq_requester_email,
+			$rq_status,
+			$REQUEST_ID,
+			$req->{'reference id'}
+			) || abend_pgm( 'exec: ' . $if_sth->errstr );
+	
+	$dbh2->commit() || abend_pgm( 'commit: ' . $dbh2->errstr );
+	
+	return 1;
+}
+
+sub process_reset {
+	my $req      = shift;
+	my $app_id   = $req->{'app id'};
+	my $reset_id = $req->{'reset id'};
+	
+	my $reset_app;
+	eval{
+		$reset_app = BLUELITE::Job->new(
+			app_id     => $app_id,
+			request_id => $reset_id,
+			) || die("app id: $app_id, reset id: $reset_id, combination invalid.");
+	};
+	
+	if (!defined $reset_app) {
+		$req->{error} .= $@;
+		insert_failed( $req );
+		move_req($REQ_PATHFILE, $REQ_FAILDIR);
+		exit 0;
+	}
+	
+	$logger->info("source app id is " . $reset_app->source_app_id() );
+	$req->{RQ_SOURCE_APP_ID} = $reset_app->source_app_id();
+	$req->{email_string}     = $reset_app->{RQ_REQUESTER_EMAIL};
+	
+	if ($reset_app->{GROUP_ID} ne $GROUP_ID) {
+		$req->{error} .= "reset request is not in proper group, origional request group is " . $reset_app->{GROUP_ID} . ". ";
+		$GROUP_ID = $reset_app->{GROUP_ID}; # error notification should be in the original group
+		insert_failed($req);
+		move_req($REQ_PATHFILE, $REQ_FAILDIR);
+		exit 0;
+	}
+	
+	# RQ_STEP must be EXTRACT and RQ_STATUS must be ERROR
+	if ($reset_app->{RQ_STEP} ne 'EXTRACT') {
+		$req->{error} .= "cannot reset $app_id $reset_id, it is not currently extracting, step is currently " . $reset_app->{RQ_STEP} . ". ";
+		insert_failed($req);
+		move_req($REQ_PATHFILE, $REQ_FAILDIR);
+		exit 0;
+	}
+	
+	if ($reset_app->{RQ_STATUS} ne 'ERROR') {
+		$req->{error} .= "cannot reset $app_id $reset_id, it is not currently in an error status, status is currently " . $reset_app->{RQ_STATUS} . ". ";
+		insert_failed($req);
+		move_req($REQ_PATHFILE, $REQ_FAILDIR);
+		exit 0;
+	}
+	
+	my $updates = {
+		RQ_RESET  => 'Y',
+		RQ_RESUME => 'N',
+		RQ_STEP   => 'VALIDATE',
+		RQ_STATUS => 'COMPLETE',
+	};
+
+	my $result;
+	eval { $result = $reset_app->update_job_config(assignments => $updates); };
+	
+	if (!defined $result || $result->{error}) {
+		$req->{error} .= 'system error, cannot update reset job config';
+		insert_failed( $req, $dbh );
+		move_req($REQ_PATHFILE, $REQ_FAILDIR);
+		exit 0;
+		}
+
+	if ($result->{error}) {
+		abend_pgm( $result->{error} );
+	}
+	
+	$reset_app->commit;
+	
+	$logger->info("flagged " . $reset_app->{APP_ID} . " for reset.");
+	
+	move_req($REQ_PATHFILE, $REQ_SUCCDIR);
+	exit 0;
+}
+
+sub process_resume {
+	my $req       = shift;
+	my $app_id    = $req->{'app id'};
+	my $resume_id = $req->{'resume id'};
+	
+	my $resume_app;
+	eval{
+		$resume_app = BLUELITE::Job->new(
+			app_id     => $app_id,
+			request_id => $resume_id,
+			) || die("app id: $app_id, resume id: $resume_id, combination invalid.");
+	};
+	
+	if (!defined $resume_app) {
+		$req->{error} .= $@;
+		insert_failed( $req );
+		move_req($REQ_PATHFILE, $REQ_FAILDIR);
+		exit 0;
+	}
+	
+	$logger->debug("source app id is " . $resume_app->source_app_id() );
+	$req->{RQ_SOURCE_APP_ID} = $resume_app->source_app_id();
+	$req->{email_string}     = $resume_app->{RQ_REQUESTER_EMAIL};
+	
+	if ($resume_app->{GROUP_ID} ne $GROUP_ID) {
+		$req->{error} .= "resume request is not in proper group, original request group is " . $resume_app->{GROUP_ID} . ". ";
+		$GROUP_ID = $resume_app->{GROUP_ID}; # error notification should be in the original group
+		insert_failed($req);
+		move_req($REQ_PATHFILE, $REQ_FAILDIR);
+		exit 0;
+	}
+	
+	# RQ_STEP must be EXTRACT and RQ_STATUS must be ERROR
+	if ($resume_app->{RQ_STEP} ne 'EXTRACT') {
+		$req->{error} .= "cannot resume $app_id $resume_id, it is not currently extracting, step is currently " . $resume_app->{RQ_STEP};
+		insert_failed($req);
+		move_req($REQ_PATHFILE, $REQ_FAILDIR);
+		exit 0;
+	}
+	
+	if ($resume_app->{RQ_STATUS} ne 'ERROR') {
+		$req->{error} .= "cannot resume $app_id $resume_id, it is not currently ERROR, status is currently " . $resume_app->{RQ_STATUS};
+		insert_failed($req);
+		move_req($REQ_PATHFILE, $REQ_FAILDIR);
+		exit 0;
+	}
+	
+	my $updates = {
+		RQ_RESUME => 'Y',
+		RQ_RESET  => 'N',
+		RQ_STEP   => 'VALIDATE',
+		RQ_STATUS => 'COMPLETE',
+	};
+
+	my $result;
+	eval { $result = $resume_app->update_job_config(assignments => $updates); };
+	
+	if (!defined $result || $result->{error}) {
+		$req->{error} .= 'cannot update resume job config';
+		insert_failed( $req, $dbh );
+		move_req($REQ_PATHFILE, $REQ_FAILDIR);
+		exit 0;
+	}
+	
+	$resume_app->commit;
+	
+	$logger->info("flagged " . $resume_app->{APP_ID} . " for resume.");
+	
+	move_req($REQ_PATHFILE, $REQ_SUCCDIR);
+	exit 0;
+}
+
+sub abend_pgm {
+	my $msg = shift;
+	my ( $pkg, $filnm, $lin ) = caller;
+	$msg = "(abend\@$PGM:" . $lin . ") $msg";
+
+	move_req($REQ_PATHFILE, $REQ_FAILDIR);
+
+	if ( defined $logger ) {
+		$logger->debug("ending $PGM abnormally");
+		$logger->error($msg);
+	} else {
+		print "$msg\n";
+	}
+	
+	exit 1;
+} ## end sub abend_pgm
+
+sub init_pgm {
+
+	# get a logger
+	my $logger = get_logger();
+
+	if ($debug) {
+		initialize_logging( screen_only => 1, screen_level => "DEBUG" );
+		$logger->debug("debug logging enabled");
+	} else {
+		initialize_logging( screen_only => 1, screen_level => "INFO" );
+	}
+
+	# get application filename and standard directories
+	my $pgm = File::Spec->rel2abs($0);    # $0 = builtin var, name/path of pgm
+	my ( $vol, $path, $file ) = File::Spec->splitpath($pgm);
+	my $pgmname = $file;
+	my $pgmdir  = $path;
+
+	# formulate request file directories
+	$REQ_PATHFILE = File::Spec->rel2abs($REQ_PATHFILE);
+	my ( $rvol, $rpath, $rfile ) = File::Spec->splitpath($REQ_PATHFILE);
+	my $req_path    = $rpath;
+	my $req_file    = $rfile;
+	my $req_succdir = File::Spec->catfile( $req_path, '.processed' );
+	my $req_faildir = File::Spec->catfile( $req_path, '.failed' );
+	
+	# make the dirs if they don't exist
+	if (!-d $req_succdir) {
+		$logger->debug("success directory doesn't exist, creating it");
+		mkpath( $req_succdir );
+	}
+
+	if (!-d $req_faildir) {
+		$logger->debug("failed directory doesn't exist, creating it");
+		mkpath( $req_faildir );
+	}
+
+	# get start time
+	my $start_time = DateTime->now();
+	$start_time->set_time_zone( 'America/New_York' );
+	my $start_yyyy = $start_time->year;
+	my $start_mo   = sprintf( "%02d", $start_time->month );
+	my $start_dd   = sprintf( "%02d", $start_time->day );
+	my $start_hh   = sprintf( "%02d", $start_time->hour );
+	my $start_mi   = sprintf( "%02d", $start_time->minute );
+	my $start_ss   = sprintf( "%02d", $start_time->second );
+	# used as prefix for processed filenames
+	my $arc_ts     = $start_yyyy . $start_mo . $start_dd . $start_hh
+	                 . $start_mi . $start_ss;
+
+	# populate hashref for return
+	my $app_env = {
+		logger      => $logger,
+		pgm_name    => $pgmname,
+		req_path    => $req_path,
+		req_file    => $req_file,
+		req_succdir => $req_succdir,
+		req_faildir => $req_faildir,
+		arc_ts      => $arc_ts,
+		};
+
+	return ($app_env);
+} ## end sub init_pgm
+
+sub move_req {
+	my $source_file   = shift;
+	my $dest_dir      = shift;
+	my $rid           = shift;
+	
+	if (!-d $dest_dir) {
+		$logger->error("cannot move $source_file, $dest_dir is not a directory");
+		return 0;
+	}
+	
+	# should already be absolute path
+	my ($s_vol, $s_path, $s_file) = File::Spec->splitpath( $source_file );
+	
+	$dest_dir = File::Spec->rel2abs( $dest_dir );
+
+	# if a reference id has been assigned, use it in the destination
+	# filename
+	if (defined $REQUEST_ID && $REQUEST_ID) {
+		$s_file = $REQUEST_ID . "-" . $s_file;
+	} else {
+		$s_file = "NONE-" . $s_file;
+	}
+	
+	my $dest_file = File::Spec->catfile( $dest_dir, $ARC_TS . '-' . $s_file );
+	
+	if ($nomove) {
+		$logger->debug("not moving request, -nomove specified on command line");
+	} else {
+		
+		$logger->debug("moving $source_file to $dest_file");
+		if ( move( $source_file, $dest_file ) ) {
+			return 1;
+		} else {
+			# the move did not happen.  must die here with error
+			$logger->error("Could not move $source_file to $dest_file, $!");
+			exit 1;
+		}
+		
+	}
+	
+	return 1;
+}
+
+sub trim {
+	my $str = shift;
+	
+	if (defined $str) {
+		$str =~ s/^\s+//;    # strip leading whitespace
+		$str =~ s/\s+$//;    # strip trailng whitespace
+	} else {
+		return ''; # if it's undefined, return null string
+	}
+	
+	return $str;
+}
+
+sub show_help {
+	print q{job_enqueue_request [options] -group_id AUTOHOC request_file.txt
+
+Read in an Autohoc request file and add a record to the job queue.
+
+Options:
+-group-id|group_id          The group id of the request we are processing.
+                            (AUTOHOC|AUTOHOC2)
+
+-app-id|app_id              REQUIRED The application id for which a request
+                            is being submitted.
+
+-nomove                     Do NOT move request files to .processed or .failed
+
+-debug                      Show debug statements
+
+-help
+
+Examples:
+job_enqueue_request -group_id AUTOHOC -app_id EVPAR_HIST sample_req.txt
+job_enqueue_request -group_id AUTOHOC -app_id EVPAR_HIST sample_reset.txt
+job_enqueue_request -group_id AUTOHOC -app_id EVPAR_HIST sample_resume.txt
+job_enqueue_request -nomove -group_id AUTOHOC2 -app_id EVPAR_HIST sample_req.txt
+job_enqueue_request -nomove -group_id AUTOHOC2 -app_id EVPAR_HIST sample_reset.txt
+job_enqueue_request -nomove -group_id AUTOHOC2 -app_id EVPAR_HIST sample_resume.txt
+job_enqueue_request -nomove -group_id AUTOHOC2 -app_id EVPAR_HIST sample_req.txt -debug
+	};
+	print "\n";
+} ## end sub show_help
+

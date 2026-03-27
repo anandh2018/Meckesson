@@ -1,0 +1,4 @@
+
+set -x
+
+make && PERL_DL_NONLAZY=1 /usr/bin/perl "-Iblib/lib" "-Iblib/arch" $*

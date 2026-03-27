@@ -1,0 +1,37 @@
+#!/usr/bin/bash
+
+#Author: W Hampton
+# Status GlassFish Elig 
+export USER=`whoami`
+if [ "${USER}" = "webadmin" ];
+then
+  # Find current PIDs running Glassfish
+  export GLASS_PID_PATIENT=`ps ux | grep -w "patient" | grep -v "grep" | tr -s ' ' | cut -f 2 -d ' '`
+  export GLASS_PID_PATIENTRX=`ps ux | grep -w "patientrx" | grep -v "grep" | tr -s ' ' | cut -f 2 -d ' '`
+  export GLASS_PID_ADDRESS=`ps ux | grep -w "correctAddress1" | grep -v "grep" | tr -s ' ' | cut -f 2 -d ' '`
+  # Checking if the PIDs are running
+  if [ "${GLASS_PID_PATIENT}" = "" ];
+  then
+     echo "patient is not running..."
+  else
+  
+     echo "domain=[patient] running: ${GLASS_PID_PATIENT}"
+  fi
+    # Checking for patientrx PIDs
+    if [ "${GLASS_PID_PATIENTRX}" = "" ];
+     then
+        echo "patientrx is not running..."
+    else
+        echo "domain=[patientrx] running: ${GLASS_PID_PATIENTRX}"
+  fi     
+        # Checking for correctAddress1 PIDs 
+        if [ "${GLASS_PID_ADDRESS}" = "" ];
+     then
+        echo "correctAddress1 is not running..."
+    else
+        echo "domain=[correctAddress1] running: ${GLASS_PID_ADDRESS}" 
+  fi 
+
+else
+    echo "Need to be webadmin to execute."
+fi

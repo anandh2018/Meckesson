@@ -1,0 +1,40 @@
+#!/usr/bin/bash
+
+#Author: W Hampton
+export USER=`whoami`
+if [ "${USER}" = "webadmin" ];
+then
+  # Find current PIDs running Glassfish
+  export GLASS_PID_PATIENT=`ps ux | grep -w "patient" | grep -v "grep" | tr -s ' ' | cut -f 2 -d ' '`
+  export GLASS_PID_PATIENTRX=`ps ux | grep -w "patientrx" | grep -v "grep" | tr -s ' ' | cut -f 2 -d ' '`
+  export GLASS_PID_ADDRESS=`ps ux | grep -w "correctAddress1" | grep -v "grep" | tr -s ' ' | cut -f 2 -d ' '`
+  # Checking if the PIDs are running
+  if [ "${GLASS_PID_PATIENT}" = "" ];
+  then
+     echo "patient is not running..."
+  else
+
+     echo "Stopping domain=[patient]..."
+	/dsapp/prod/local/${HOSTNAME%%.*}/gf/current/bin/asadmin stop-domain patient
+  fi
+    # Checking for patientrx PIDs
+    if [ "${GLASS_PID_PATIENTRX}" = "" ];
+     then
+        echo "patientrx is not running..."
+    else
+        echo "Stopping domain=[patientrx]... "
+	      /dsapp/prod/local/${HOSTNAME%%.*}/gf/current/bin/asadmin stop-domain patientrx
+  fi
+        # Checking for correctAddress1 PIDs
+        if [ "${GLASS_PID_ADDRESS}" = "" ];
+     then
+        echo "correctAddress1 is not running..."
+    else
+        echo "Stopping domain=[correctAddress1]..."
+	      /dsapp/prod/local/${HOSTNAME%%.*}/gf/current/bin/asadmin stop-domain correctAddress1
+  fi
+
+else
+    echo "Need to be webadmin to execute."
+fi
+

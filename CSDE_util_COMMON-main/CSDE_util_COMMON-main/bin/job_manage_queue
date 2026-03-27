@@ -1,0 +1,316 @@
+#!/usr/bin/perl
+
+# Program: job_manage_queue
+# Purpose: Scan and "manage" the job_queue table (send email notifications, fix status of dead jobs, etc)
+#
+# This process will be scheduled to run via cron automatically every 10 minutes.
+#
+# Initial version (6.0): Nov 3, 2014
+#
+# Version 6.2: Jan 2, 1015
+# - Auto-delete requests from job_queue with bad app_id (to avoid repeated error emails)
+#
+
+use Params::Validate qw(:all);
+use Data::Dumper;
+use BLUELITE::Job;
+use Getopt::Long;
+use File::Spec;
+use File::PathConvert qw(rel2abs);
+
+use warnings;
+use strict;
+
+#our $JOB_PROCESS_QUEUE_CMD = "perl -I /ds/development/Job/dev/blib/lib /ds/development/Job/dev/job_process_queue";
+#our $JOB_QUEUE_NOTIFY_CMD = "perl -I /ds/development/Job/dev/blib/lib /ds/development/Job/dev/job_queue_notify";
+
+our $JOB_PROCESS_QUEUE_CMD = "job_process_queue";
+our $JOB_QUEUE_NOTIFY_CMD = "job_queue_notify";
+
+my @dir_parts = File::Spec->splitdir(rel2abs($0));
+our $PGM = pop(@dir_parts);
+our @GROUP_ID = ();
+our $LOOKBACK_DAYS = 21;
+
+sub update_queue($$) {
+  my ($app_obj, $updates) = @_;
+
+	my $app_id = $app_obj->app_id;
+	my $update_result = $app_obj->update_job_config( assignments => $updates);
+
+	if ($update_result->{error}) {
+		die "Could not update job_queue for $app_id : " . $update_result->{error} . "\n\nThe updates were: " . Dumper $updates;
+	}
+
+	$app_obj->commit;
+}
+
+
+sub mylog($) {
+	my $msg = shift;
+	$msg =~ s/\n$//;
+	$msg .= "\n";
+
+	if (-t 0) {
+		print  $msg;
+	}
+}
+
+sub manage_validate($$) {
+  my ($rq, $app_obj) = @_;
+
+	my $rq_status = $rq->{RQ_STATUS};
+	my $detail = $rq->{RQ_STATUS_DETAIL};
+	my @updates = ();
+
+	if ($rq_status eq 'COMPLETE') {
+		$detail = "Request validated and queued for processing.";
+
+		push(@updates,
+			rq_status => 'QUEUE',
+			rq_step => 'EXTRACT',
+			rq_status_detail => $detail,
+			rq_step_begin_date => 'sysdate',
+			rq_step_end_date => 'sysdate'
+		);
+	} elsif ($rq_status eq 'ERROR') {
+		if (! defined($detail)) {
+			$detail = "Error validating request";
+		}
+
+		push(@updates,
+			rq_process_begin_date => 'sysdate',
+			rq_process_end_date => 'sysdate',
+		);
+
+		if (! defined($rq->{RQ_STEP_NOTIFY_DATE})) {
+			push(@updates,
+				rq_step_begin_date => 'sysdate',
+				rq_step_end_date => 'sysdate'
+			);
+		}
+	} else {
+		return 0;
+	}
+
+	update_queue($app_obj, { @updates });
+
+	mylog($detail);
+
+	my $job_queue_notify_cmd = "$JOB_QUEUE_NOTIFY_CMD " . join(' ', map { "-group-id $_" } @GROUP_ID) . " -lookback-days $LOOKBACK_DAYS";
+	system($job_queue_notify_cmd);
+
+	return 1;
+}
+
+sub manage_reset($$) {
+  my ($rq, $app_obj) = @_;
+
+	my $rq_status = $rq->{RQ_STATUS};
+
+	if (($rq_status ne 'COMPLETE') && ($rq_status ne 'ERROR')) {
+		return 0;  # probably still PROCESSING or QUEUE
+	}
+
+	my $detail = 'Reset queued';
+
+	update_queue($app_obj, {
+		rq_status => 'QUEUE',
+		rq_step => 'EXTRACT',
+		rq_status_detail => $detail,
+		rq_process_begin_date => '',
+		rq_process_end_date => '',
+		rq_step_notify_date => '',
+		rq_step_begin_date => 'sysdate',
+		rq_step_end_date => 'sysdate',
+		rq_job_attempts => 0
+	});
+
+	my $job_queue_notify_cmd = "$JOB_QUEUE_NOTIFY_CMD " . join(' ', map { "-group-id $_" } @GROUP_ID) . " -lookback-days $LOOKBACK_DAYS";
+	system($job_queue_notify_cmd);
+
+	mylog($detail);
+	return 1;
+}
+
+
+sub manage_extract($$) {
+  my ($rq, $app_obj) = @_;
+
+	my $rq_status = $rq->{RQ_STATUS};
+	my @updates = ();
+
+	if (($rq_status ne 'COMPLETE') && ($rq_status ne 'ERROR')) {
+		return 0;  # probably still PROCESSING or QUEUE
+	}
+
+	my $detail;
+
+	if ($rq_status eq 'COMPLETE') {
+		my $dfa_dir = $app_obj->dfa_dir;
+
+		if (($app_obj->qaqc() eq 'Y') && glob("$dfa_dir/*.dmp.gz")) {
+
+			$detail = 'All data extracted. DataFeed Analyzer queued.';
+
+			push(@updates,
+				rq_step => 'DFA',
+				rq_status => 'QUEUE',
+				rq_step_begin_date => 'sysdate',
+				rq_step_end_date => 'sysdate',
+				rq_status_detail => $detail
+			);
+		} else {
+			$detail = 'All data extracted. No DataFeed Analyzer needed.';
+			push(@updates, rq_process_end_date => 'sysdate', rq_status_detail => $detail);
+		}
+
+		update_queue($app_obj, { @updates });
+		mylog($detail);
+
+		return 1;
+	}
+
+	if ($rq_status ne 'ERROR') {
+		return 0;
+	}
+
+  my ($max_job_attempts, $job_attempts);
+
+	if (defined($rq->{RQ_MAX_JOB_ATTEMPTS}) && $rq->{RQ_MAX_JOB_ATTEMPTS} >= 1) {
+		$max_job_attempts = $rq->{RQ_MAX_JOB_ATTEMPTS};
+	} else {
+		$max_job_attempts = 1;
+	}
+
+	if (defined($rq->{RQ_JOB_ATTEMPTS}) && $rq->{RQ_JOB_ATTEMPTS} >= 1) {
+		$job_attempts = $rq->{RQ_JOB_ATTEMPTS};
+	} else {
+		$job_attempts = 0;
+	}
+
+	if (($job_attempts >= $max_job_attempts) && ((! defined($rq->{RQ_RESUME})) || ($rq->{RQ_RESUME} !~ /^\s*Y\s*/i))) {
+		# max attempts reached, and no resume requested
+		return 0;
+	}
+
+	$detail = 'Retry queued';
+
+	update_queue($app_obj, {
+		rq_status => 'QUEUE',
+		rq_status_detail => $detail,
+		rq_process_begin_date => '',
+		rq_process_end_date => '',
+		rq_step_begin_date => 'sysdate',
+		rq_step_end_date => 'sysdate'
+	});
+
+	mylog($detail);
+	return 1;
+}
+
+
+sub manage_dfa($$) {
+  my ($rq, $app_obj) = @_;
+
+	my $rq_status = $rq->{RQ_STATUS};
+
+	if (! (defined($rq_status) && ($rq_status eq 'ERROR'))) {
+		return 0;
+	}
+
+	my $rq_resume = $rq->{RQ_RESUME};
+
+	if (! (defined($rq_resume) && ($rq_resume =~ /^\s*Y\s*$/i))) {
+		return 0;
+	}
+
+	my $detail = 'Failed DataFeed Analyzer queued for retry';
+
+	update_queue($app_obj, {
+		rq_status => 'QUEUE',
+		rq_status_detail => $detail,
+		rq_step_begin_date => 'sysdate',
+		rq_step_end_date => 'sysdate',
+		rq_resume => 'N'
+	});
+
+	mylog($detail);
+	return 1;
+}
+
+
+sub Usage() {
+	print "$PGM: manage job requests in job_queue table\n";
+	print "\n";
+	print "Usage: $PGM -group-id g [-group-id g ...] [-lookback-days #]\n";
+}
+
+#### Main ####
+
+GetOptions(
+            'group-id=s@' => \@GROUP_ID,
+            'lookback-days=i' => \$LOOKBACK_DAYS,
+) || exit(1);
+
+if (@ARGV) {
+	print STDERR "$PGM: Extraneous command-line arguments!\n";
+	Usage;
+	exit(1);
+}
+
+if (! @GROUP_ID) {
+	Usage;
+	exit(0);
+}
+
+my $requests = BLUELITE::Job->get_requests(
+		add_where              => "rq_process_end_date is null",
+		submission_search_days => $LOOKBACK_DAYS,
+		group_id               => \@GROUP_ID,
+		order_by               => 'rq_submitted_date'
+);
+
+foreach my $rq (@{$requests}) {
+  my $app_id = $rq->{RQ_SOURCE_APP_ID};
+  my $request_id = $rq->{RQ_REQUEST_ID};
+  my $rq_step = $rq->{RQ_STEP};
+  my $rq_status = $rq->{RQ_STATUS};
+  my $rq_status_detail = $rq->{RQ_STATUS_DETAIL};
+
+	my $app_obj;
+
+	eval { $app_obj = BLUELITE::Job->new(app_id => $app_id, request_id => $request_id, force_log_init => 1) };
+
+	if (! defined($app_obj)) {
+		if (($rq_step eq 'VALIDATE') && ($rq_status eq 'ERROR') && ($rq_status_detail =~ /app.*id\s+.*n.*valid/i)) {
+			my $rows = BLUELITE::Job->dbh->do("DELETE from job_queue WHERE rq_request_id = $request_id");
+			print STDERR "Removed request ID $request_id due to: $rq_status_detail\n";
+			BLUELITE::Job->dbh->commit;
+		}
+
+		next;
+	}
+
+
+  if (defined($rq->{RQ_RESET}) && ($rq->{RQ_RESET} =~ /^\s*Y\s*/i)) {
+		print "calling reset for $app_id/$request_id\n" if (-t 1);
+		manage_reset($rq, $app_obj);
+	} elsif ($rq_step eq 'VALIDATE') {
+		print "calling validate for $app_id/$request_id\n" if (-t 1);
+		manage_validate($rq, $app_obj);
+	} elsif ($rq_step eq 'EXTRACT') {
+		print "calling extract for $app_id/$request_id\n" if (-t 1);
+		manage_extract($rq, $app_obj);
+	} elsif ($rq_step eq 'DFA') {
+		print "calling dfa for $app_id/$request_id\n" if (-t 1);
+		manage_dfa($rq, $app_obj);
+	} else {
+		print "didn't call anything for $app_id/$request_id\n" if (-t 1);
+	}
+}
+
+my $process_queue_cmd = "$JOB_PROCESS_QUEUE_CMD " . join(' ', map { "-group-id $_" } @GROUP_ID) . " -lookback-days $LOOKBACK_DAYS";
+print "cmd = $process_queue_cmd\n" if (-t 0);
+exec($process_queue_cmd);
+

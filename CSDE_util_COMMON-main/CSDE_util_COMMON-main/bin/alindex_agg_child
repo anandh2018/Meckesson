@@ -1,0 +1,46 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+#use lib qw(/ds/development/AuditLog/AuditLog_V0.4.4_alpi_dev/blib/lib /ds/development/NCPDP_Parser/NCPDP_V0.3.1_alpi_dev);
+
+use BLUELITE::TandemSwitchAuditLog::Index_Mgr;
+use BLUELITE::Logger;
+use Params::Validate qw(:all);
+
+#my $log_file = "/tmp/index_agg_child.$$.log";
+my $log_file = '/dev/null';
+
+initialize_logging(logfile => $log_file, screen_only => 1, screen_threshold => 'INFO');
+
+my $logger = get_logger;
+
+my %option = validate_with
+    ( params  => \@ARGV,
+      spec    => {  PROCESS_DATE => { type => SCALAR, optional => 0 },
+                    HASH_ID => { type => SCALAR, optional => 0 },
+                    TEMP_DIR => { type => SCALAR, optional => 0 },
+										EXIT_SUCCESS => { type => SCALAR, optional => 1, default => 200 },
+                    BUILD_ID => { type => SCALAR, optional => 0 },
+                    CONNECTION_VAR => { type => SCALAR, optional => 0 }
+      },
+      called  => $0,
+      normalize_keys => sub { my $k = shift; $k =~ s/^-//; return uc $k }
+    );
+
+my $maint_grp = BLUELITE::TandemSwitchAuditLog::Index_Mgr::Maint_Group->new(
+	temp_dir => $option{TEMP_DIR},
+	process_date => $option{PROCESS_DATE},
+	hash_id => $option{HASH_ID},
+	build_id => $option{BUILD_ID},
+	connection_var => $option{CONNECTION_VAR}
+	);
+
+if ($maint_grp->_index_aggregate) {
+	unlink($log_file);
+	exit($option{EXIT_SUCCESS});
+} else {
+	exit(1);
+}
+

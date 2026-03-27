@@ -1,0 +1,447 @@
+#!/bin/ksh
+EXIT_STATUS=0
+
+trap '	rm -f ${TMP}/*$$ ${TMP}/*$$.Z
+	exit $EXIT_STATUS	'	0 1 2 3 4 5 6 7 8 10 14 15
+
+usage()
+{
+	echo ""
+	echo "Usage: export_table [ options ] table_name"
+	echo ""
+	echo "Options:"
+	echo "     -d delimiter"
+	echo "     -e exclude_column[, exclude_column[, ...]]"
+	echo "     -w \"where_clause\""
+	echo "     -U username/password (USERID)"
+	echo "     -D database (ORACLE_SID)"
+	echo "     -n import_table_name"
+	echo "     -t \"date_export_format\" (DD-Mon-YYYY)"
+	echo "     -a New_Column[Default_Value]"
+	echo "     -u Export Unique Rows"
+	echo "     -r       {truncate mode}"
+	echo "     -o Table Owner"
+	echo ""
+}
+
+TMP="${TMP_DIR:-/usr/tmp}"
+
+EXCLUDE_COLUMNS="${TMP}/exclude$$"
+ADD_COLUMNS="${TMP}/add$$"
+DATABASE_OUTPUT="${TMP}/database$$"
+COLUMN_LAYOUT="${TMP}/column$$"
+RAW_DATA="${TMP}/raw$$.gz"
+
+
+prepare_column_layout()
+{
+#	Get the tables columns
+
+	{
+		echo "set pagesize 0;"
+		echo "set heading off;"
+		echo "set linesize 1000;"
+		echo "set echo off;"
+		echo "set verify off;"
+		echo "set sqlprompt '';"
+		echo "set feedback off;"
+
+		echo "SELECT COLUMN_NAME || ':' || DATA_TYPE || ':' || NULLABLE"
+		echo "FROM ALL_TAB_COLUMNS"
+		echo "WHERE TABLE_NAME = '${TABLE_NAME}' AND OWNER = '$OWNER'"
+		echo "ORDER BY COLUMN_ID;"
+
+	} |
+	database -s -U${USERID} |
+	tr -d " \011" > ${DATABASE_OUTPUT}
+
+	for COLUMN_DESCRIPTION in `cat ${DATABASE_OUTPUT}`
+	do
+		COLUMN_NAME=`echo "$COLUMN_DESCRIPTION" | cut -d":" -f1`
+
+		EXCLUDE=N
+
+		if [ -f ${EXCLUDE_COLUMNS} ] && egrep "^$COLUMN_NAME" ${EXCLUDE_COLUMNS} > /dev/null
+		then
+			EXCLUDE=Y
+		fi
+
+		if [ -f ${ADD_COLUMNS} ] && egrep "^$COLUMN_NAME[:]" ${ADD_COLUMNS} > /dev/null
+		then
+			EXCLUDE=Y
+		fi
+
+		if [ "$EXCLUDE" = N ]
+		then
+			echo "${COLUMN_DESCRIPTION}:DATABASE" >> ${COLUMN_LAYOUT}
+		else
+			echo "${COLUMN_DESCRIPTION}:EXCLUDE" >> ${COLUMN_LAYOUT}
+		fi
+	done
+
+
+# Additional Columns
+
+	if [ -f ${ADD_COLUMNS} ]
+	then
+		sed "s/[:]/:CHAR:Y:ADD:/1" ${ADD_COLUMNS} >> ${COLUMN_LAYOUT}
+	fi
+
+}
+
+
+generate_sql_loader_code()
+{
+
+	DATETIME=`date +"%y/%m/%d"`
+
+	echo "--"
+	echo "-- SQL Loader Script for the ${TABLE_NAME} table"
+	echo "--"
+	echo "-- This script was generated automagically on ${DATETIME}"
+	echo "-- The data is contained within the script"
+	echo "--"
+
+	echo "-- This data is begin extracted from the $TABLE_NAME table"
+	echo "-- for importation into the $IMPORT_TABLE_NAME table"
+	echo "--"
+
+	if [ "$WHERE_CLAUSE" != "" ]
+	then
+		echo "-- This is not a complete snapshot of this table.  The"
+		echo "-- following was the search criteria applied:"
+		echo "--"
+		echo "--    $WHERE_CLAUSE"
+	fi
+
+
+	echo "--"
+	echo "-- Column Layout"
+	echo "--"
+
+	for COLUMN_DESCRIPTION in `cat ${COLUMN_LAYOUT} | cut -d: -f1-4 | sort`
+	do
+		COLUMN_NAME=`echo "$COLUMN_DESCRIPTION" | cut -d: -f1`
+		COLUMN_TYPE=`echo "$COLUMN_DESCRIPTION" | cut -d: -f4`
+
+		if [ "$COLUMN_TYPE" = DATABASE ]
+		then
+			echo "--    ${COLUMN_NAME}		Included From Table"
+		fi
+
+		if [ "$COLUMN_TYPE" = EXCLUDE ]
+		then
+			echo "--    ${COLUMN_NAME}		Excluded From Extract"
+		fi
+
+		if [ "$COLUMN_TYPE" = ADD ]
+		then
+			echo "--    ${COLUMN_NAME}		Added To Extract"
+		fi
+
+	done
+
+	echo "--"
+
+	echo ""
+	echo ""
+	echo "LOAD DATA"
+	echo ""
+	echo "INFILE *"
+	echo ""
+	echo "$MODE"
+	echo "INTO TABLE ${IMPORT_TABLE_NAME}"
+	echo ""
+	echo "FIELDS TERMINATED BY '$DELIMITER' OPTIONALLY ENCLOSED BY '\"'"
+	echo "("
+
+	FIRST=Y
+	for COLUMN_DESCRIPTION in `cat ${COLUMN_LAYOUT} | cut -d: -f1-4`
+	do
+
+		COLUMN_NAME=`echo "$COLUMN_DESCRIPTION" | cut -d: -f1`
+		COLUMN_DATATYPE=`echo "$COLUMN_DESCRIPTION" | cut -d: -f2`
+		COLUMN_NULLABLE=`echo "$COLUMN_DESCRIPTION" | cut -d: -f3`
+		COLUMN_TYPE=`echo "$COLUMN_DESCRIPTION" | cut -d: -f4`
+
+		if [ "$COLUMN_TYPE" = EXCLUDE ]
+		then
+			continue;
+		fi
+
+		[ "$FIRST" = N ] && echo ","
+
+		echo "	$COLUMN_NAME	\c"
+
+		if [ "$COLUMN_DATATYPE" = DATE ]
+		then
+			echo "DATE \"${DATE_MASK}\" \c"
+		fi
+
+		if [ "$COLUMN_NULLABLE" = Y ]
+		then
+			echo "NULLIF ${COLUMN_NAME} = BLANKS\c"
+		fi
+
+		FIRST=N
+	done
+
+	echo ")"
+
+	echo ""
+	echo ""
+
+
+}
+
+
+
+prepare_query()
+{
+
+	SELECT=""
+
+	for COLUMN_DESCRIPTION in `cat ${COLUMN_LAYOUT} | cut -d: -f1-4`
+	do
+		COLUMN_NAME=`echo "$COLUMN_DESCRIPTION" | cut -d: -f1`
+		COLUMN_DATATYPE=`echo "$COLUMN_DESCRIPTION" | cut -d: -f2`
+		COLUMN_TYPE=`echo "$COLUMN_DESCRIPTION" | cut -d: -f4`
+
+		if [ "$COLUMN_TYPE" = ADD ]
+		then
+			COLUMN_DEFAULT="`egrep \"^$COLUMN_NAME[:]\" ${ADD_COLUMNS} | cut -d: -f2`"
+		fi
+
+
+		if [ "$COLUMN_TYPE" = EXCLUDE ]
+		then
+			continue;
+		fi
+
+
+		if [ "${COLUMN_TYPE}" != ADD ]
+		then
+
+			SELECT_COLUMN="$COLUMN_NAME"
+
+			if [ "${COLUMN_DATATYPE}" = CHAR ]
+			then
+				SELECT_COLUMN="RTRIM(${COLUMN_NAME})"
+			fi
+
+			if [ "${COLUMN_DATATYPE}" = DATE ]
+			then
+				SELECT_COLUMN="TO_CHAR(${COLUMN_NAME}, '${DATE_MASK}')"
+			fi
+
+		else
+			if echo "${COLUMN_DEFAULT}" | egrep "[(]" > /dev/null
+			then
+				SELECT_COLUMN="${COLUMN_DEFAULT}"
+			else
+				SELECT_COLUMN="'${COLUMN_DEFAULT}'"
+			fi
+		fi
+
+
+		if [ "$SELECT" = "" ]
+		then
+			SELECT="${SELECT_COLUMN} " 
+		else
+			SELECT="${SELECT} || '${DELIMITER}' || ${SELECT_COLUMN} "
+		fi
+	done
+}
+
+
+execute_query()
+{
+
+	{
+		echo "set pagesize 0;"
+		echo "set heading off;"
+		echo "set linesize 1000;"
+		echo "set echo off;"
+		echo "set verify off;"
+		echo "set sqlprompt '';"
+		echo "set feedback off;"
+
+		echo "SELECT ${DISTINCT_CLAUSE} ${SELECT}"
+		echo "FROM ${OWNER}.${TABLE_NAME}"
+
+		if [ "$WHERE_CLAUSE" != "" ]
+		then
+			echo "WHERE ${WHERE_CLAUSE}"
+		fi
+		echo "/"
+
+	} | 
+	database -s -U${USERID} |
+	tr "\011" " " |
+	sed "	/^[ ]*$/ d
+		s/[ ][ ]*[${DELIMITER}]/${DELIMITER}/g
+		s/[${DELIMITER}][${DELIMITER}]/${DELIMITER} ${DELIMITER}/g
+		s/[${DELIMITER}][${DELIMITER}]/${DELIMITER} ${DELIMITER}/g
+		s/^[${DELIMITER}]/ ${DELIMITER}/g
+		s/[${DELIMITER}]$/${DELIMITER} /g
+		s/$/${DELIMITER}/g" 
+
+
+
+}
+
+
+WHERE_CLAUSE=""
+DATE_MASK="DD-Mon-YYYY"
+DELIMITER="|"
+IMPORT_TABLE_NAME=""
+DISTINCT_CLAUSE=""
+MODE="APPEND"
+
+[ -f "$EXCLUDE_COLUMNS" ] && rm -f $EXCLUDE_COLUMNS
+[ -f "$ADD_COLUMNS" ] && rm -f $ADD_COLUMNS
+[ -f "$COLUMN_LAYOUT" ] && rm -f $COLUMN_LAYOUT
+
+while getopts "hrw:n:d:o:t:e:U:D:a:u" OPT
+do
+	case "$OPT" in
+
+	d)	DELIMITER="$OPTARG"
+		;;
+
+	u)	DISTINCT_CLAUSE="distinct"
+		;;
+
+	r) MODE="TRUNCATE"
+		;;
+
+	n)	IMPORT_TABLE_NAME="${OPTARG}"
+		;;
+
+	e)	EXCLUDE=`echo "$OPTARG" | tr "[a-z]" "[A-Z]" | sed 's/[ ]//g;s/[,]/ /g'`
+
+
+		for COLUMN in $EXCLUDE
+		do
+			echo "$COLUMN" >> $EXCLUDE_COLUMNS
+		done
+		;;
+
+	a)	ADDITIONS="`echo \"${OPTARG}|\" | sed 's/[]][, 	]*\([A-Za-z]\)/]|\1/g'`"
+
+		while :
+		do
+			COLUMN_SPEC="`echo \"$ADDITIONS\" | cut -d'|' -f1`"
+			ADDITIONS="`echo \"$ADDITIONS\" | cut -d'|' -f2-`"
+
+			if echo "$COLUMN_SPEC" | tr -d " \011," | egrep "^$" > /dev/null
+			then
+				break;
+			fi
+
+			COLUMN_NAME=`echo "$COLUMN_SPEC" | cut -d'[' -f1 | tr "[a-z]" "[A-Z]"`
+			COLUMN_DEFAULT="`echo \"$COLUMN_SPEC\" | cut -d'[' -f2 | cut -d']' -f1`"
+
+
+			if [ "$COLUMN_DEFAULT" = "" ]
+			then
+				COLUMN_DEFAULT=" "
+			fi
+
+			echo "$COLUMN_NAME:$COLUMN_DEFAULT" >> $ADD_COLUMNS
+
+		done
+		;;
+
+	o) OWNER=`echo "$OPTARG" |  tr "[a-z]" "[A-Z]"`
+		;;
+
+
+	w)	WHERE_CLAUSE="$OPTARG"
+		;;
+	t)	DATE_MASK="$OPTARG"
+		;;
+	U)	USERID="$OPTARG"
+		;;
+	D)	ORACLE_SID="$OPTARG"
+		export ORACLE_SID
+		;;
+	?|h)	usage
+		exit 0
+		;;
+
+	esac
+done
+
+shift `expr $OPTIND - 1`
+
+[ "$USERID" = "" ] && USERID="/"
+
+if [ "$OWNER" = "" ]
+then
+	OWNER=`echo "$USERID" | cut -f1 -d"/" |  tr "[a-z]" "[A-Z]"`
+fi
+
+
+TABLE_NAME=`echo "$1" | tr "[a-z]" "[A-Z]"`
+
+if [ "$IMPORT_TABLE_NAME" = "" ]
+then
+	IMPORT_TABLE_NAME="$TABLE_NAME"
+fi
+
+if [ "$IMPORT_TABLE_NAME" = "" ]
+then
+	echo "" >&2
+	echo "Table name not specified!" >&2
+	echo "" >&2
+	usage
+	exit
+fi
+
+
+echo "exit" | database -s -U${USERID} > /dev/null
+if [ "$?" -ne 0 ]
+then
+	echo "export_table: Error - Cannot connect to database." >&2
+	echo "              Check username, password and database" >&2
+	EXIT_STATUS="$?"
+	exit
+fi
+
+{
+	echo "SELECT 'TABLE_EXISTS'"
+	echo "FROM ALL_TAB_COLUMNS"
+	echo "WHERE TABLE_NAME = '${TABLE_NAME}' AND OWNER = '$OWNER'"
+	echo "/"
+} | database -s -U${USERID}  |
+egrep "no rows select" > /dev/null
+
+if [ "$?" -eq 0 ]
+then
+	echo "" >&2
+	echo "export: Table $TABLE_NAME not found" >&2
+	echo "" >&2
+	EXIT_STATUS=1
+	exit
+fi
+
+prepare_column_layout
+
+prepare_query
+
+generate_sql_loader_code
+
+execute_query | gzip -c > ${RAW_DATA}
+
+if gunzip -c ${RAW_DATA} | head -1000 | egrep "ORA[-][0-9]" ${RAW_DATA} > /dev/null
+then
+	echo "Database Returned an Error:" >&2
+	gunzip -c ${RAW_DATA} | tail -50 >&2
+
+	EXIT_STATUS=1
+	exit 
+fi
+
+echo "BEGINDATA"
+gunzip -c ${RAW_DATA}

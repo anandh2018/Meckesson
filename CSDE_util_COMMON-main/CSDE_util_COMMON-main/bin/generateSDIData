@@ -1,0 +1,333 @@
+#!/usr/bin/perl
+
+eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
+
+eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+  if 0;    # not running under some shell
+
+# generateSDIDate.pl: Create SDI Claim B1/B2 test data file(s)
+#
+# Author: K. Humphrey, RelayHealth
+#
+# Version history:
+#
+# 10/24/2008 - Version 1.0
+# - Initial release
+#
+
+our $VERSION_NUMBER = '1.0';
+our $VERSION_DATE   = '10/24/2008';
+our $COPYRIGHT      = '2008';
+our $COMPANY        = 'RelayHealth';
+
+
+use Getopt::Long;
+use Sys::Hostname;
+use Data::Dumper;
+use FileHandle;
+use Compress::Zlib;
+use strict;
+use warnings;
+
+use lib qw(/ds/development/RXAggrRpt/lib);
+use XML::Simple;
+
+use lib qw(/ds/development/SDI/lib);
+use SDI;
+
+# DEFAULT VALUES
+our $FAILURE_EMAIL  = 'keith.humphrey@relayhealth.com';
+our $EXIT_SUCCESS = 0;     # default
+our $EXIT_FAILURE = 80;    # default
+our $DEFAULT_CONFIG = "/ds/development/SDI/config/SDI.xml";
+our $PGM;
+$PGM = $0;
+$PGM =~ s|.*/||g;
+our $MYDIE_CALLED = 0;
+ $ENV{RANDOMDATA_CSV_PATH} = "/ds/development/SDI/config";
+
+
+######  SUBROUTINES    ######
+sub mydie($)
+{
+  
+    return undef if ($MYDIE_CALLED);
+
+    $MYDIE_CALLED = 1;
+
+    my $message = shift;
+    my $exit_code;
+
+    if ( defined($message) )
+    {
+        chomp($message);
+        $message = "$PGM: ERROR: $message";
+    }
+    print STDERR $message . "\n";
+
+    if ( defined($FAILURE_EMAIL) )
+    {
+        email(
+               to      => $FAILURE_EMAIL,
+               subject => ' SDI Test Data Generator FAILED',
+               msg     => $message );
+    }
+
+    exit($EXIT_FAILURE);
+}
+
+#our $MYEXIT_CALLED = 0;
+
+
+
+sub Usage()
+{
+    print "\nThis is $PGM, v$VERSION_NUMBER, $VERSION_DATE, Copyright $COPYRIGHT, $COMPANY\n";
+    print "\n";
+    print "Usage: $PGM [-options] \n";
+    print "Usage: $PGM [-nbrOfFiles  <number of files>] [-recsPerFile  <number of recs per files>] [-recsProc  <number of recs to Process>] fn1 [fn2 fn3 ......]\n";
+    print "\n";
+    print "OPTION                                DEFAULT\n";
+    print "-----------------------               --------------------\n";
+    print "-inFile                               \n";
+    print "-outFile                               \n";
+    print "-inDir                                 \n";
+    print "-outDir                               \n";
+    print "-nbrOfFiles                            \n";
+    print "-recsPerFile                            \n";
+    print "-recsProc                              \n";
+    print "\n";
+}
+
+sub getFileList
+{
+    my (%option) = @_;
+    my (@files, @inList, @outList, $i);
+    
+    if (defined ($option{inFile}))
+    {
+        my (%file) = checkCompress(fileName => $option{inFile});
+        if (! $file{error})
+        {
+            $file{outFile}   = $file{inFile}.'.out';
+            $file{outFile}   = $option{outFile} if (defined ($option{outFile}));
+            push (@files,\%file);
+
+        }        
+    }
+    elsif (@ARGV)
+    {
+        foreach my $item (@ARGV)
+        {
+            my (%file) = checkCompress(fileName => $item);
+             if (! $file{error})
+             {
+                  $file{outFile} = $file{inFile}.'.out';
+                  push (@files,\%file);
+             }
+        }
+    }
+    elsif (defined ($option{inDir}))
+    {
+        if ( ! defined ($option{outDir}) )
+        {
+            &Usage;
+            exit($EXIT_FAILURE);
+        }
+         
+        my (@results) = qx/ls -1 $option{inDir}/;
+        foreach my $item (@results)
+        {
+             my (%file);
+            chomp ($item);
+            $file{inFile}                 = $option{inDir}.'/'.$item;
+            (%file) = checkCompress(fileName => $file{inFile});
+            if (! $file{error})
+            {    
+                 if ($file{inflate})
+                 {
+                    $item =~ m/\.gz/;
+                    $file{outFile} = $option{outDir}.'/'.$`.'.out';
+                 }
+                 else
+                 {
+                     $file{outFile} = $option{outDir}.'/'.$item.'.out'; 
+                 }
+                 
+                 push (@files, \%file)
+            }
+            
+        }
+    }
+    else
+    {
+        &Usage;
+        exit($EXIT_FAILURE);
+    }
+    
+    return (@files)
+}
+
+sub checkCompress
+{
+    my (%option) = @_;
+    my ($fileName,
+        $inflate,
+        $status);
+        
+    $fileName = $option{fileName};
+    $inflate  = 0;
+    if ($option{fileName} =~ m/\.gz/)
+    {
+       qx/gunzip $fileName/;
+       $fileName = $`;
+       if (-e $fileName)
+       {
+          qx/dos2unix $fileName/;
+          $inflate = 1;
+          
+       }
+       else
+       {
+          print "ERROR: DECOMPRESSION WAS UNSUCCESSFUL FOR ".$option{fileName}."\ n";
+          $status  = 1;
+       }
+    }
+    elsif (!(-e $fileName))
+    {
+        $status = 1;
+        print "ERROR: $fileName DOES NOT EXIST \n"
+    }
+    return (inFile => $fileName, error => $status, inflate => $inflate)
+}
+
+######   MAIN #######
+
+my ($sdiInFile,
+    $sdiOutFile,
+    $sdiInDir,
+    $sdiOutDir,
+    $nbrOfFiles,
+    $recsPerFile,
+    $env,
+    $fileSize,
+    $configFile,
+    $email
+    );
+if  (! eval { GetOptions(
+                         'inFile=s'          => \$sdiInFile,
+                         'outFile=s'         => \$sdiOutFile,
+                         'inDir=s'           => \$sdiInDir,
+                         'outDir=s'          => \$sdiOutDir,
+                         'nbrOfFiles=i'      => \$nbrOfFiles,
+                         'recsPerFile=i'     => \$recsPerFile,
+                         'recsProc=i'        => \$fileSize,
+                         'configFile=s'      => \$configFile,
+                         'notify=s'          => \$email
+                       )
+           }
+    )
+{
+    &Usage;
+    exit($EXIT_FAILURE);
+}
+
+$configFile = $DEFAULT_CONFIG if (! defined $configFile);
+$email      = $FAILURE_EMAIL  if (! defined $email);
+
+my (@fileList) = getFileList (inFile =>  $sdiInFile,
+                              outFile => $sdiOutFile,
+                              inDir   => $sdiInDir,
+                              outDir  => $sdiOutDir
+                             );
+my ($totRecs) = 0;
+
+
+
+ if (! defined($nbrOfFiles) || $nbrOfFiles == 1)
+    {
+       $recsPerFile = $recsPerFile;
+    }
+    else
+    {
+       $recsPerFile = sprintf("%u", $recsPerFile/$nbrOfFiles); 
+    }
+
+
+
+my ($sdi)     = SDI::new(pgm => $PGM, email => $email, configFile => $configFile);
+foreach  my $file ( @fileList )
+{
+    $sdiInFile  = $file->{inFile};
+    $sdiOutFile = $file->{outFile};
+    
+    my ($fnIn) = FileHandle::new();
+    $fnIn->open("< $sdiInFile")  || mydie ( "UNABLE TO OPEN $sdiInFile \n ");
+    my ($fnOut) = FileHandle::new();
+    $fnOut->open("> $sdiOutFile")  || mydie ( "UNABLE TO OPEN $sdiOutFile \n ");
+    $fnOut->autoflush(1);
+
+
+    my ($sdiRec, $recsNbr, $fileNbr, $recsPerFile, $trailer);
+   
+
+    my($fileCnt)  = 0;
+    my($recCnt)   = 0;
+    
+    while ($sdiRec = $fnIn->getline)
+    {
+        
+        chomp($sdiRec);
+       
+ 	    my (%option)    = $sdi->parseRec(record => $sdiRec);
+ 	    if (defined $option{errMsg})
+ 	    {
+ 	        mydie($option{errMsg})
+ 	    }
+ 	    my ($sdiOutRec) = $option{record};
+      
+
+ 	    my ($recType)   = substr($sdiRec,0,1);
+ 	
+	if ($recType eq 'C' || $recType eq 'R' )
+	{
+	   $recCnt++;
+	   $totRecs++;
+	}
+	elsif ($recType eq 'H')
+	{
+	    $trailer = substr($sdiRec,1,14);
+	}
+
+
+	
+	
+	if (defined($recsPerFile) && $recCnt > $recsPerFile)
+	{ 
+	    $fileCnt++;
+	    $recCnt = 0;
+	    $fnOut->close();
+	    my ($fnOut) = FileHandle::new;
+	    $fnOut->open("> $sdiOutFile\.$fileCnt") || mydie ("UNABLE TO OPEN $sdiOutFile\.$fileCnt \n ");
+	}
+	$fnOut->print("$sdiOutRec\n");
+
+	if (defined($fileSize) && $totRecs == $fileSize )
+	{
+	    my ($result) = qx/wc -l $sdiInFile/;
+	    ($result)    = split (/ /,$result);
+	     $trailer    = "T".(sprintf('%010d',($totRecs))).$trailer;
+	     $fnOut->print("$trailer\n");
+	   last;
+	}
+   }
+   
+   $fnOut->close() ;
+   if ($fnIn->close() && $file->{inflate})
+   {
+       qx/gzip $sdiInFile/
+   }
+}
+print "FINAL TOTAL DETAIL RECORDS PROCESSED: $totRecs \n";
+print "$PGM COMPLETED \n";

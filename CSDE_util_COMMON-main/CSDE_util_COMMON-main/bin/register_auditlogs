@@ -1,0 +1,71 @@
+#!/usr/bin/perl
+
+use BLUELITE::WorkUnit;
+use BLUELITE::Data_Source;
+use strict;
+use warnings;
+
+our $PGM = $0;
+$PGM =~ s/.*\///g;
+
+sub register_auditlog_file($) {
+
+	my ($fname) = $_[0];
+
+	if (! defined($fname)) {
+		print STDERR "$PGM: register_auditlog_file(): not filename provided to function!\n";
+		return undef;
+	}
+
+	if (! -f $fname) {
+		print STDERR "$PGM: register_auditlog_file(): file '$fname' does not exist!\n";
+		return undef;
+	}
+
+	my $ds_obj = BLUELITE::Data_Source->new(analysis_type => 'partial', filename => $fname, auto_commit => 0);
+
+	return undef if (! defined($ds_obj));
+
+	$ds_obj->post_date_complete('Y');
+
+	if ($ds_obj->register_data_source()) {
+		return $ds_obj;
+	} else {
+		return undef;
+	}
+}
+
+my $process_date = shift(@ARGV);
+
+if (! defined($process_date)) {
+	die "Usage: $PGM YYYYMMDD\n";
+}
+
+if ($process_date !~ /^\d\d\d\d\d\d\d\d$/) {
+	die "ERROR: process date must be in YYYYMMDD format\n";
+}
+
+my $audit_log_files = BLUELITE::WorkUnit->new;
+$audit_log_files->data_type('rx');
+$audit_log_files->data_version('a');
+$audit_log_files->begin_date($process_date);
+$audit_log_files->end_date($process_date);
+
+my @al_workunits = $audit_log_files->workunits;
+my ($ds_obj);
+
+foreach my $alfile (@al_workunits) {
+	$ds_obj = register_auditlog_file($alfile);
+
+	if (! defined($ds_obj)) {
+		die "Cannot get Data_Source object for file $alfile on process date $process_date\n";
+	}
+}
+
+if ($ds_obj->commit) {
+	print "Registered " . scalar(@al_workunits) . " auditlog files for $process_date\n";
+} else {
+	$ds_obj->rollback;
+	die "ERROR: Unable to register auditlog files for $process_date\n";
+}
+

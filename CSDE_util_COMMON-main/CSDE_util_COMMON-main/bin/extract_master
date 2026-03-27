@@ -1,0 +1,33 @@
+#!/bin/bash
+
+if [ $# -ne 1 -o ! -f $1 ]
+then
+	echo "Usage: $0 <NCPDP_ZIP_file>"
+	exit 1
+fi
+
+zip_archive=$1
+extract_dir=$(dirname $zip_archive)/upload
+ncpdp_file=$extract_dir/$(basename $zip_archive .ZIP).dat.gz
+
+if [ ! -d $extract_dir ]
+then
+	echo "ERROR: $extract_dir: Missing directory '$extract_dir'"
+	exit 3
+fi
+
+unzip -p $zip_archive mas.txt | gzip -c > $ncpdp_file
+
+if [ $? != 0 ]
+then
+	echo "ERROR: $zip_archive: Failed to extract 'mas.txt' file"
+	exit 2
+fi
+
+if [ ! -f $ncpdp_file ]
+then
+	echo "ERROR: $zip_archive: Failed to generate '$ncpdp_file'"
+	exit 3
+fi
+
+exit 0

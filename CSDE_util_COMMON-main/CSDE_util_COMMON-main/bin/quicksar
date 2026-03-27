@@ -1,0 +1,3 @@
+#!/bin/bash
+
+sar | tail -n2 | head -n1 | cut -c58-61

@@ -1,0 +1,335 @@
+#!/usr/bin/perl
+
+# Program: job_enqueue_files
+# Purpose: move validated files from temporary location to dest dir to queue for transfer to destination
+#
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+use BLUELITE::Job;
+use Getopt::Long;
+use File::Spec;
+use File::Basename;
+use File::Copy;
+
+use warnings;
+use strict;
+
+my @dir_parts = File::Spec->splitdir(File::Spec->rel2abs($0));
+our $PGM = pop(@dir_parts);
+
+sub Usage() {
+  print "$PGM: Move validated files from temp dir to dest dir to queue for transfer to customer\n";
+  print "\n";
+  print "Usage: $PGM -app-id a -request-id # [filename ...]\n";
+}
+
+
+sub post_date_sql($$) {
+  my ($post_date_spec, $alias) = @_;
+
+	my $post_dates = BLUELITE::Job->post_date_list($post_date_spec);
+	return "${alias}.post_date = '" . join("' or ${alias}.post_date = '", @{$post_dates}) . "'";
+}
+
+
+sub verify_files($@) {
+  my ($job, @files_to_verify) = @_;
+
+	my $app_id = $job->app_id;
+	my $post_date_spec = $job->{RQ_POST_DATE};
+
+	if (! defined($post_date_spec)) {
+		print STDERR "ERROR: Could not determine rq_post_date for this request\n";
+		return ();
+	}
+
+	my $post_date_sql = post_date_sql($post_date_spec, 'w');
+
+	my $files_in_delivery_table = $job->dbh->selectall_hashref("
+		select distinct delivery_output_file
+		from job_delivery d, job_worker w
+		where w.app_id = '$app_id' and d.app_id = w.app_id and ($post_date_sql)", 'DELIVERY_OUTPUT_FILE');
+
+	my @does_not_exist = ();
+	my @verified_files = ();
+	my @not_in_delivery_table = ();
+
+	foreach my $verify_filename (@files_to_verify) {
+		my $verify_filename_full = File::Spec->rel2abs($verify_filename, $ENV{PWD});
+
+		if (! -f $verify_filename_full) {
+			push(@does_not_exist, $verify_filename_full);
+			next;
+		}
+
+		if (exists($files_in_delivery_table->{$verify_filename_full})) {
+			push(@verified_files, $verify_filename_full);
+		} else {
+			push(@not_in_delivery_table, $verify_filename_full);
+		}
+	}
+
+	if (@does_not_exist) {
+		die "$PGM: ERROR: The following files do not exist!\n" . join("\n", @does_not_exist) . "\n";
+	}
+
+	if (@not_in_delivery_table) {
+		die "$PGM: ERROR: The following files could not be found in the job_delivery table!\n" . join("\n", @not_in_delivery_table) . "\n";
+	}
+
+	return @verified_files;
+}
+
+
+sub get_all_files($) {
+	my $job = shift;
+
+	my $app_id = $job->app_id;
+	my $post_date_spec = $job->{RQ_POST_DATE};
+
+	if (! defined($post_date_spec)) {
+		print STDERR "ERROR: Could not determine rq_post_date for this request\n";
+		return ();
+	}
+
+	my $post_dates = BLUELITE::Job->post_date_list($post_date_spec);
+
+	if (! @{$post_dates}) {
+		print STDERR "ERROR: Could not get a list of post dates for $post_date_spec\n";
+		return ();
+	}
+
+	my $post_date_sql = post_date_sql($post_date_spec, 'w');
+	
+	my $files = $job->dbh->selectall_arrayref("
+		select distinct
+			d.delivery_output_file,
+			d.delivery_date,
+			w.post_date
+		from job_delivery d, job_worker w
+		where w.app_id = '$app_id' and w.app_id = d.app_id and w.delivery_file_id = d.delivery_file_id and ($post_date_sql)", { Slice => {} });
+
+	my %file_list = ();
+	my %post_dates_found = ();
+
+	foreach my $row (@{$files}) {
+		my $fname = $row->{DELIVERY_OUTPUT_FILE};
+		$file_list{$fname} = $row->{DELIVERY_DATE};
+
+		my $post_date = $row->{POST_DATE};
+		$post_dates_found{$post_date}++;
+	}
+
+	my @post_dates_not_generated = ();
+	my @dupe_post_dates = ();
+
+	foreach my $post_date (@{$post_dates}) {
+		if (! exists($post_dates_found{$post_date})) {
+			push(@post_dates_not_generated, $post_date);
+		} elsif ($post_dates_found{$post_date} > 1) {
+			push(@dupe_post_dates, $post_date);
+		}
+	}
+
+	if (@post_dates_not_generated) {
+		die "$PGM: ERROR: The following post dates within $post_date_spec were not found in the job_worker/job_delivery table:\n" . join("\n", @post_dates_not_generated) . "\n";
+	}
+
+	if (@dupe_post_dates) {
+		die "$PGM: ERROR: The following post dates within $post_date_spec are associated with more than one file in the job_delivery table:\n" . join("\n", @dupe_post_dates) . "\n";
+	}
+
+	my @to_enqueue = ();
+	my @delivered_but_still_exists = ();
+	my @does_not_exist = ();
+
+	foreach my $fname (keys %file_list) {
+		my $delivery_date = $file_list{$fname};
+
+		if (defined($delivery_date)) {
+			if ( -f $fname) {
+				push(@delivered_but_still_exists, $fname);
+			}
+
+			next;
+		}
+
+		if (-f $fname) {
+			push(@to_enqueue, $fname);
+		} else {
+			push(@does_not_exist, $fname);
+		}
+	}
+
+	if (@delivered_but_still_exists) {
+		die "$PGM: ERROR: The following files were delivered, but still exist:\n" . join("\n", @delivered_but_still_exists) . "\n";
+	}
+
+	if (@does_not_exist) {
+		die "$PGM: ERROR: The following are missing:\n" . join("\n", @does_not_exist) . "\n";
+	}
+
+	return @to_enqueue;
+}
+
+
+sub update_job_delivery($$$) {
+  my ($job, $curr_file, $new_file) = @_;
+	my $app_id = $job->app_id;
+	my $update_sql = "update job_delivery set delivery_output_file = '$new_file' where app_id = '$app_id' and delivery_output_file = '$curr_file'";
+
+	my $rows = $job->dbh->do($update_sql);
+
+	if ($rows != 1) {
+		$job->dbh->rollback;
+		die "$PGM: ERROR: The following update changed $rows rows instead of 1: $update_sql\n";
+	}
+}
+
+
+### Main ###
+
+my ($app_id, $request_id);
+
+GetOptions(
+            'app-id=s' => \$app_id,
+            'request-id=i' => \$request_id,
+) || exit(1);
+
+if (! defined($app_id)) {
+	print STDERR "$PGM: -app-id must be specified!\n";
+  Usage;
+  exit(1);
+}
+
+if (! defined($request_id)) {
+	print STDERR "$PGM: -request-id must be specified!\n";
+  Usage;
+  exit(1);
+}
+
+if ($app_id =~ /^\s*$/) {
+	print STDERR "$PGM: -app-id is '$app_id', which is not valid\n";
+  Usage;
+  exit(1);
+}
+
+if ($request_id !~ /^\s*\d+\s*$/) {
+	print STDERR "$PGM: -request-id of '$request_id' is not valid. Must be a positive integer!\n";
+  Usage;
+  exit(1);
+}
+
+my $request_job;
+
+eval { $request_job = BLUELITE::Job->new(app_id => $app_id, request_id => $request_id) } ;
+
+if (! defined($request_job)) {
+	die "$PGM: ERROR: Could not obtain a BLUELITE::Job object for app-id='$app_id', request-id='$request_id'\n";
+}
+
+my @file_list = ();
+
+if (@ARGV) {
+	@file_list = @ARGV;
+	@file_list = verify_files($request_job, @file_list);
+} else {
+	@file_list = get_all_files($request_job);
+}
+
+if (! @file_list) {
+	die "$PGM: No files found to enqueue!\n";
+}
+
+my $dest_job;
+
+eval { $dest_job = BLUELITE::Job->new(app_id => $app_id) } ;
+
+if (! defined($dest_job)) {
+	die "$PGM: ERROR: Could not obtain a BLUELITE::Job object for app-id='$app_id'\n";
+}
+
+my $deliv_dir = $dest_job->rq_deliv_dir;
+
+if (! defined($deliv_dir)) {
+	die "$PGM: ERROR: Could not determine a destination directory to queue the files into!\n";
+}
+
+if (! -e $deliv_dir) {
+	die "$PGM: ERROR: The destination directory '$deliv_dir' does not exist!\n";
+}
+
+if (! -w $deliv_dir) {
+	die "$PGM: ERROR: No permission to write files to the destination directory '$deliv_dir' !\n";
+}
+
+my @already_exists = ();
+my %filename_map = ();
+
+foreach my $curr_file_full (@file_list) {
+	my $curr_file_basename = basename($curr_file_full);
+	my $new_file_full = "$deliv_dir/$curr_file_basename";
+
+	if (-e $new_file_full) {
+		push(@already_exists, $new_file_full);
+	} else {
+		$filename_map{$curr_file_full} = $new_file_full;
+	}
+}
+
+if (@already_exists) {
+	die "$PGM: ERROR: The following files already exist on the destination directory:\n\n" . join("\n", @already_exists) . "\n";
+}
+
+foreach my $curr_file_full (keys %filename_map) {
+	update_job_delivery($request_job, $curr_file_full, $filename_map{$curr_file_full});
+}
+
+print "The following files will be moved:\n\n" . join("\n", @file_list) . "\n\n";
+
+print "The above " . scalar(@file_list) . " files will be moved to the $deliv_dir directory, which will enqueue them for subsequent transfer to the final destination (i.e. customer site).\n\n";
+print "ARE YOU SURE YOU WISH TO PROCEED (y/N) ? : ";
+
+my $response = <STDIN>;
+
+print "\n";
+
+if ($response !~ /^\s*(y|yes)\s*$/i) {
+	print "Did not attempt to move anything.\n";
+	exit(1);
+}
+
+print "Moving files to $deliv_dir ..\n";
+
+my %moved_files = ();
+
+foreach my $curr_file_full (keys %filename_map) {
+	my $new_file = $filename_map{$curr_file_full};
+
+	if (move($curr_file_full, $new_file)) {
+		$moved_files{$new_file} = $curr_file_full;
+	} else {
+		print STDERR "$PGM: ERROR: Could not move the file $curr_file_full to $new_file : $!\n";
+
+		if (%moved_files) {
+			print STDERR "Attempting to undo successful file moves.\n";
+		}
+
+		foreach my $moved_file (keys %moved_files) {
+			if (! move($moved_file, $moved_files{$moved_file})) {
+				print STDERR "WARNING: COULD NOT UNDO MOVE FROM " . $moved_files{$moved_file} . " TO $moved_file : $!\n";
+			}
+		}
+
+		$request_job->rollback;
+		exit(1);
+	}
+}
+
+$request_job->commit;
+
+print "Done\n";
+

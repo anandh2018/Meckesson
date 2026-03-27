@@ -1,0 +1,12 @@
+#!/usr/bin/perl
+
+use BLUELITE::X12::Parser;
+use strict;
+
+my $fname = shift(@ARGV);
+
+# Create a parser object
+my $p = BLUELITE::X12::Parser->new(input_file => $fname, trim => 1);
+
+# Parse a file with the transaction specific configuration file
+$p->print_tree();

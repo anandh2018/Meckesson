@@ -1,0 +1,21 @@
+#!/usr/bin/bash
+
+#Author: W Hampton
+# Stop Glasssfish Elim
+export USER=`whoami`
+if [ "${USER}" = "adhoc" ];
+then
+    # Find current PIDs running Glassfish
+    export GLASS_PID_ADHOC=`ps ux | grep -w "provider" | grep -v "grep" | tr -s ' ' | cut -f 2 -d ' '`
+    #Checking if the PIDs are running
+    if [ "${GLASS_PID_ADHOC}" = "" ]
+  then
+     echo "domain=[provider] is not running..."
+  else
+     echo "Stopping domain=[provider]..."
+	   /dsapp/prod/local/${HOSTNAME%%.*}/adhoc_gf/glassfish-4.1.1/glassfish/bin/asadmin stop-domain provider
+    fi
+    else
+        echo "Need to be adhoc to execute."
+fi
+

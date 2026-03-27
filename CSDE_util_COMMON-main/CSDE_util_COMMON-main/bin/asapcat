@@ -1,0 +1,14 @@
+#!/usr/bin/perl 
+
+use warnings;
+use strict;
+
+use lib qw{blib/lib/};
+use Data::Dumper;
+use DS::ASAP::Parser;
+
+my $p = DS::ASAP::Parser->new(input_file => shift @ARGV) || die 'Cannot obtain DS::ASAP::Parser object!';
+
+$p->print_tree;
+
+exit(0);

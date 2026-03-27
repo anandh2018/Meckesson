@@ -1,0 +1,52 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use BLUELITE::TandemSwitchAuditLog::File;
+
+my $al_file = BLUELITE::TandemSwitchAuditLog::File->new || die "Cannot get BLUELITE::TandemSwitchAuditLog::File object:  $!\n";
+
+our $USING_CMD_LINE = 0;
+
+sub get_next_id() {
+	if (scalar(@ARGV) >= 1) {
+		$USING_CMD_LINE = 1;
+		return shift(@ARGV);
+	}
+
+	return undef if ($USING_CMD_LINE);
+
+	my $id;
+
+	$id = <STDIN>;
+
+	if (defined($id)) {
+		chomp($id);
+		return $id;
+	}
+
+	return undef;
+}
+
+our $PGM = $0;
+$PGM =~ s/^.*\///g;
+
+if ((scalar(@ARGV) == 0) && (-t 0)) {
+	print "Usage 1: $PGM id1 [id2] [...]\n";
+	print "Usage 2: $PGM < file\n";
+	exit(1);
+}
+
+my ($id, $name);
+
+while ($id = get_next_id) {
+	$name = $al_file->name(rx_txn_id => $id);
+
+	if (! defined($name)) {
+		die "ERROR: Could not determine the auditlog file name for '$_'\n";
+	}
+
+	print "$id,$name\n" || die "$!\n";
+}
+

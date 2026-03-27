@@ -1,0 +1,180 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+
+use File::Basename;
+use File::stat;
+use List::Util qw(min);
+
+sub tmpdir() {
+
+	foreach my $tdir ($ENV{TMPDIR}, $ENV{TMP}, $ENV{TEMPDIR}, $ENV{TEMP}, '/temp', '/tmp', '.') {
+		next if (! -d $tdir);
+		next if (! -w $tdir);
+		return $tdir;
+	}
+
+	die "ERROR: could not find useable temp dir!\n";
+}
+
+our $PGM = $0;
+$PGM =~ s/^.*\///g;
+
+my ($output_file_prefix, $command, $prun2_options);
+my $resume = 0;
+our $NUM_FILES_DEFAULT = 10;
+my $temp_dir = tmpdir();
+my $overwrite_temp = 0;
+my ($num_records_per_file, $num_files);
+
+sub Usage() {
+	print "Usage: $PGM [-options] -command 'cmd -cmd-options' input_file\n";
+	print "Options  (defaults in parenthesis):\n";
+	print "   -prun2-opts '-r hosts ...'\n";
+	print "   -num-files #                 ($NUM_FILES_DEFAULT)\n";
+	print "   -num-records-per-file #\n";
+	print "   -resume\n";
+	print "   -temp-dir dir                ($temp_dir)\n";
+	print "   -prefix p                    {basename of input_file}\n";
+	print "   -overwrite-temp              (do not overwrite)\n";
+}
+
+if (! @ARGV) {
+	&Usage;
+	exit(1);
+}
+
+my $ret = GetOptions(
+	'resume' => \$resume,
+  'num-files=s' => \$num_files,
+  'num-records-per-file=s' => \$num_records_per_file,
+  'temp-dir=s' => \$temp_dir,
+	'prefix=s' => \$output_file_prefix,
+	'overwrite-temp' => \$overwrite_temp,
+	'command=s' => \$command,
+	'prun2-opts=s' => \$prun2_options
+);
+
+if (! $ret) {
+	Usage;
+	exit(1);
+}
+
+my $input_file = shift(@ARGV);
+
+if (! defined($input_file)) {
+	&Usage;
+	die "Must specify input file!\n" if (! defined($input_file));
+}
+
+die "ERROR: The -command parameter is mandatory!\n" if (! defined($command));
+
+die "ERROR: File '$input_file' is not accessible!\n" if (! -r $input_file);
+
+if (! defined($output_file_prefix)) {
+  $output_file_prefix = $input_file;
+  $output_file_prefix =~ s|\.[^/]*$||;
+	$output_file_prefix .= '.';
+}
+
+$output_file_prefix = basename($output_file_prefix);
+
+my $wu_file = "${temp_dir}/wu." . basename($output_file_prefix);
+$wu_file =~ s/\.$//;
+
+my $wu_done_file = "${wu_file}.done";
+
+die "ERROR: work unit file $wu_file already exists!  Remove $wu_file and $wu_done_file files to start over or use -resume option to continue.\n" if (-f $wu_file && ! $resume);
+die "ERROR: -resume option used, but work unit file $wu_file does not exist! Rerun without the -resume option\n" if ($resume && ! -f $wu_file);
+die "ERROR: -num-records-per-file and -num-files cannot be used together!\n" if (defined($num_records_per_file) && defined($num_files));
+
+my $num_records = `run_pipe "read_file $input_file | wc -l"`;
+die "ERROR: Could not determine number of records in $input_file !\n" if ($? != 0);
+
+chomp($num_records);
+
+if (defined($num_records_per_file)) {
+  $num_files = $num_records / $num_records_per_file;
+	$num_files = int($num_files + 1) if ($num_files != int($num_files));
+} elsif (! defined($num_files)) {
+  $num_files = $NUM_FILES_DEFAULT;
+}
+
+$num_files = $num_records if ($num_records < $num_files);
+
+my @output_files = map { "${temp_dir}/${output_file_prefix}$_" } (1..$num_files);
+
+my @existing_files = ();
+map { push(@existing_files, $_) if (-f $_) } @output_files;
+
+if (@existing_files && ! $resume && ! $overwrite_temp) {
+	die "ERROR: The following temp files already existed, but the -resume and -overwrite-temp options were not used: " . join(' ', @existing_files) . "\nEither remove these files or use the -overwrite-temp or -resume option to continue.\n";
+}
+
+
+if ($resume) {
+	if (@existing_files != @output_files) {
+		die "ERROR: " . scalar(@output_files) . " temp files should have already existed, but there are only " . scalar(@existing_files) . ". Either recover the temp files or rerun without the -resume option\n";
+	}
+
+	if (stat($input_file)->mtime > min(map { stat($_)->mtime } @existing_files)) {
+		die "ERROR: The input file was created AFTER at least one of the following temp files: " . join(' ', @existing_files) . "\nPlease rerun without the -resume option.";
+	};
+} else {
+	unlink(@existing_files) if (@existing_files);
+
+	open(WU, "> $wu_file") || die "ERROR: Could not create work unit file $wu_file : $!\n";
+
+	if ( ! print WU join("\n", @output_files) . "\n") {
+		close(WU); unlink($wu_file);
+		die "ERROR: Could not write to work unit file $wu_file : $!\n";
+	}
+
+	if (! close(WU)) {
+		unlink($wu_file);
+		die "ERROR: Could not close work unit file $wu_file : $!\n";
+	}
+
+	my $split_cmd = "split_file -prefix $output_file_prefix $input_file " . join(' ', @output_files);
+
+	if (system($split_cmd) != 0) {
+		unlink(@output_files, $wu_file);
+		die "ERROR: The following command failed: $split_cmd\n";
+	}
+
+	my @missing_files = ();
+	map { push(@missing_files, $_) if (! -f $_) } @output_files;
+
+	if (@missing_files) {
+		unlink(@output_files, $wu_file);
+		die "ERROR: split_file command failed to create the following temp files: " . join(' ', @missing_files) . "\n";
+	}
+}
+
+
+my $prun2_cmd = "prun2 -f $wu_file ";
+$prun2_cmd .= "$prun2_options " if (defined($prun2_options));
+$prun2_cmd .= "$command ";
+
+print "$prun2_cmd\n";
+
+if (system($prun2_cmd) == 0) {
+	if (unlink($wu_file)) {
+		print STDERR "Warning: Could not remove work unit done file $wu_done_file : $!\n" if (! unlink($wu_done_file));
+	} else {
+		print STDERR "Warning: Could not remove work unit file $wu_file : $!\n";
+	}
+
+	foreach my $fname (@output_files) {
+		print STDERR "Warning: Could not remove temp file $fname : $!\n" if (! unlink($fname));
+	}
+
+	exit(0);
+}
+
+print STDERR "ERROR: All work units did not successfully complete! Try adding -resume option to finish remaining work units.\n";
+
+exit(1);

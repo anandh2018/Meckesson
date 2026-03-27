@@ -1,0 +1,110 @@
+#!/usr/bin/perl
+
+use BLUELITE::Job;
+use List::Util qw(min max);
+use Data::Dumper;
+use strict;
+use warnings;
+
+# Version 2.75 - 4/6/2011
+#
+# - Added support for flexible date specifications in -post-date option (ranges, months, etc).
+# - Added interactive confirmation when more than 1 post date is requested for removal.
+# - Added -no-confirm command line option in case this script ever needs to be used non-interactively.
+#
+# Version 4.7 - 4/17/2013
+#
+# - Added '-no-confirm' to usage display
+#
+# Version 6.0 - 10/31/2014
+# - Added support for "autohoc" requests (i.e. automated on-demand ad-hoc processing).
+#
+# Version 6.2 - 5/27/2015
+# - Exit with error status when remove_post_date method says something failed
+#
+# Version 6.4e - 12/8/2017
+# - Added -log-level command-line option. Can use to disable outgoing email via "-log-level INFO".
+#
+
+our $PGM = $0;
+$PGM =~ s/.*\///g;
+
+if (scalar(@ARGV) == 0) {
+	print "$PGM: Completely remove entire post dates from the database for a specific BLUELITE::Job-based application.
+
+This will remove all rows associated to the given application and post dates from the following tables:
+JOB_WORKER, JOB_DELIVERY, JOB_DELIVERY_SEQ
+
+Usage: $PGM [-no-confirm] [-log-level INFO|WARN|ERROR|FATAL] -app-id app_id -post-date pd_spec
+
+Note: pd_spec may be a comma-separated list of any combination of the following syntaxes:
+
+ YYYYMMDD
+ YYYYMMDD-YYYYMMDD
+ YYYYMM
+ YYYYMM-YYYYMM
+ YYYYMMDD-YYYYMM
+ YYYYMM-YYYYMMDD
+";
+	exit(1);
+}
+
+use Getopt::Long;
+
+my ($app_id, $post_date, $no_confirm, $request_id, $log_level);
+my $confirm= 1;
+
+GetOptions(
+            'app-id=s' => \$app_id,
+            'request-id=i' => \$request_id,
+            'post-date=s' => \$post_date,
+            'no-confirm' => \$no_confirm,
+            'log-level=s' => \$log_level
+) || exit(1);
+
+$confirm = 0 if (defined($no_confirm));
+
+die "$PGM: -app-id parameter not provided!\n" if (! defined($app_id));
+die "$PGM: -post-date parameter not provided!\n" if (! defined($post_date));
+
+my $post_date_list = BLUELITE::Job->post_date_list($post_date);
+die "ERROR: Could not decipher post date of '$post_date'\n" if (! defined($post_date_list));
+
+if ($confirm && (scalar(@{$post_date_list}) > 1)) {
+	print "WARNING! This will remove up to " . scalar(@{$post_date_list}) . " post dates between " . min(@{$post_date_list}) . " and " . max(@{$post_date_list}) . "\n";
+	print "ARE YOU SURE YOU WISH TO PROCEED? (y/N) : ";
+
+	my $response = <STDIN>;
+
+	if ($response !~ /^\s*(y|yes)\s*$/i) {
+		print "Did not attempt to remove anything\n";
+		exit(1);
+	}
+}
+
+my @job_opts = (app_id => $app_id);
+
+if (defined($request_id)) {
+	push(@job_opts, request_id => $request_id);
+}
+
+my $job = BLUELITE::Job->new(@job_opts) || die "Could not obtain BLUELITE::Job object\n";
+
+my @params = (post_date => $post_date_list, post_date_spec => $post_date);
+
+if (defined($log_level)) {
+	push(@params, log_type => $log_level);
+}
+
+my ($num_not_removed, $num_removed) = $job->remove_post_date(@params);
+
+if ($num_not_removed) {
+	print "$num_not_removed post dates could not be removed!\n";
+	exit(1);
+}
+
+if (! $num_removed) {
+	print "Nothing to remove\n";
+}
+
+exit(0);

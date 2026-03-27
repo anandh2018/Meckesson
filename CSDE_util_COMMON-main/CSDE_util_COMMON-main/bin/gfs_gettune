@@ -1,0 +1,8 @@
+
+host=`hostname -s`
+
+for fs in /ds /incoming /outgoing /prod /scsi10k_1 /scsi10k_2 /scsi10k_3 /scsi10k_3 /scsi15k_1
+  do
+		gfs_tool gettune $fs |
+		sed 's/^/'${host}:\\"$fs:/"
+  done

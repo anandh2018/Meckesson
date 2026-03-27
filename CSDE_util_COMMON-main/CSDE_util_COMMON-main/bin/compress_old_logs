@@ -1,0 +1,21 @@
+
+
+days=60
+echo $LOG_DIR
+if [ ! -d "$LOG_DIR" ]
+  then
+		echo LOG_DIR not set to a existing directory!
+		exit 1
+fi
+
+echo Storage on $LOG_DIR :
+df -h $LOG_DIR
+
+echo Compressing .log files not modified within the last $days days
+
+time find $LOG_DIR -mtime +$days -name '*.log' -exec bzip2 --best {} \;
+
+echo Completed
+
+echo Storage on $LOG_DIR :
+df -h $LOG_DIR

@@ -1,0 +1,742 @@
+#!/usr/bin/perl
+
+
+# pipe_ftp: transfer file from standard input to remote host via ftp protocol
+# author: J. Hess, NDCHealth
+
+use Net::FTP;   # ftp client protocol library
+use Getopt::Std;
+use File::Spec qw(:all);
+
+use Net::Ping;
+use File::Basename;
+
+$last_error_msg = "";
+
+
+sub printerr ($)
+{
+	print STDERR $_[0];
+}
+
+sub get_ftp_connection()
+{
+my ($host) = shift;
+my ($retries) = 3;
+my ($parm);
+my ($value);
+my ($try);
+my ($ftp);
+
+	while ($parm = shift)
+	{
+		if ($parm =~ /retries/i)
+		{
+			if ($_[0] =~ /^[0-9]+$/)
+			{
+				$retries = shift;
+			}
+			else
+			{
+				printerr "$prog: Number of retires on get_ftp_connection appears to be invalid\n";
+				printerr "$space  Aborting\n";
+				exit (10);
+			}
+		}
+		else
+		{
+			$value = shift;
+			push(@options, $parm);
+			push (@options, $value);
+		}
+	}
+
+	for ($try = 1; $try <= $retries; $try++)
+	{
+
+		if ($ftp = Net::FTP->new($host, @options))
+		{
+			$last_error_msg = "";
+			return $ftp;
+		}
+
+		$last_error_msg = $@;
+
+		print "DEBUG: Warning: ($try): Attempted connection: $last_error_msg\n" if ($debug);
+	}
+
+	return undef;
+
+
+}
+
+
+$prog = basename($0);
+$space = $prog;
+$space =~ s/./ /g;
+
+if ($prog =~ /write/i)
+{
+	$PROG_MODE = "WRITE";
+}
+else
+{
+	$PROG_MODE = "READ";
+}
+
+#print "DEBUG (forced):  Operating under $PROG_MODE mode\n";
+
+sub usage()
+{
+	print "\n";
+	print "Usage:\t$prog\t[ -h host[,host..] ] [ -l enviroment variable | username/password | filename ]\n";
+	print "\t\t\t[ -p ] [host[,host...]:]filename\n";
+	print "\n";
+	print "Parmeters:\n";
+	print "\t-h\thostname to transfer file to/from.  Optionally a comma seperated list of hosts.  The host used\n";
+	print "\t\twill be the *first* host where a FTP connection could be obtained\n";
+	print "\n";
+	print "\t-l\tFTP login information.  Login info is comprised of a list of username/password\n";
+	print "\t\tpairs.  This information can be obtained from the following:\n";
+	print "\n";
+	print "\t\t1)\tEnviromental variable containing\n";
+	print "\t\t\tusername/password[,username/password...]\n";
+	print "\t\t2)\tName of file containing username/password\n";
+	print "\t\t\t\(seperate lines or commmas are ok.\n";
+	print "\t\t\tComments and blank lines are ignored)\n";
+	print "\t\t3)\tList of username/password pairs\n";
+	print "\t\t4)\tList of username/password pairs in the FTPKEYS environment variable\n";
+	print "\n";
+	print "\t\tThe first successful login info combination will be used to transfer the data.\n";
+	print "\n";
+	print "\t\tThe first successful login info combination will be used to transfer the data.\n";
+	print "\n";
+	print "\t-p\tSwitch to indicate NOT to use passive mode on FTP\n";
+
+
+	print "\n";
+
+
+}
+
+
+sub string_to_login_keys()
+{
+my ($string) = @_[0];
+my ($text);
+my (@info);
+my (@info_keys);
+
+	foreach $text (split(",", $string))
+	{
+		$text =~ s/^[\t ]+//;
+		$text =~ s/[\t ]+$//;
+
+		@info = split("[:/\t ]+", $text);
+
+		if ($#info != 1)
+		{
+			return ();
+		}
+
+
+		push(@login_keys, $info[0] . "/" . $info[1]);
+
+	}
+
+	return @login_keys;
+}
+
+
+
+
+if (scalar(@ARGV) == 0)
+{
+	&usage();
+	exit(1);
+}
+
+
+if (! getopts('adph:l:f'))
+{
+	&usage();
+	exit(1);
+}
+
+if ($opt_d)
+{
+	$debug = 1;
+	$silent_mode = 0;
+}
+else
+{
+	$debug = 0;
+	$silent_mode = 1;
+}
+
+if ($opt_a)
+{
+	$send_as_ascii = 1;
+}
+else
+{
+	$send_as_ascii = 0;
+}
+
+$filename_parm = shift;
+
+if (! $filename_parm)
+{
+	printerr "$prog: Filename parameter not given\n";
+	printerr "$space  See usage - Aborting\n";
+	exit (10);
+}
+
+
+if ($filename_parm =~ /[:]/)
+{
+	($hostnames, $filename) = split("[:]", $filename_parm);
+
+}
+else
+{
+	$hostnames = "";
+	$filename = $filename_parm;
+}
+
+if (! File::Spec->file_name_is_absolute( $filename ))
+{
+	printerr "$prog: Filename of output file must, at this time, be a absolute path name\n";
+	printerr "$space  Aborting\n";
+	exit (10);
+}
+
+
+
+#($remote_volume, $remote_directory, $remote_file) = File::Spec->splitpath( $filename );
+
+if ($filename =~ m#^(.*)[/]([^/]+)#)
+{
+	$remote_volume = "";
+	$remote_directory = $1;
+	$remote_file = $2;
+}
+else
+{
+	print STDERR "$prog_name: Cannot break filename into dir and file \"$filename\"\n";
+	exit(10);
+}
+
+#print "FILE = " . join(", ", $remote_volume, $remote_directory, $remote_file) . "\n";
+
+if ($opt_p)
+{
+	$passive_mode = 0;
+}
+else
+{
+	$passive_mode = 1;
+}
+
+
+if ($opt_f)
+{
+	$MODE = "FTP";
+}
+else
+{
+	if (! -d $remote_directory)
+	{
+		printerr "DEBUG: Was going to transfer via DIRECT but since dest directory doesn't exist going to FTP\n" if ($debug);
+		$MODE = "FTP";
+	}
+	else
+	{
+		$MODE = "DIRECT";
+
+		@local_dirs = ( "bin", "cdrom", "dev", "devices", "etc", "export", "kernel", "lib", "sbin", "tmp", "usr", "var");
+
+		#@dirs = File::Spec->splitdir( $remote_directory );
+		@dirs = split("[/]", $remote_directory );
+
+		@dirs = ("/") if ($dirs[0] eq "");
+
+print "DEBUG: First dir is \"$dirs[0]\"\n" if ($debug);
+
+		foreach $dir (@local_dirs)
+		{
+			if ($dirs[0] =~ /$dir/i)
+			{
+				print "DEBUG: First directory \"$dirs[0]\" is listed as a local directory forcing a FTP mode\n" if ($debug);
+				$MODE = "FTP";
+				last;
+			}
+		}
+	}
+}
+
+
+printerr "DEBUG: Using transfer mode of $MODE\n" if ($debug);
+
+
+#===================================================================
+#
+#	Get list of hostname(s) from options
+#
+#===================================================================
+
+
+if ($opt_h && $MODE eq "FTP")
+{
+	# Note this will override the hostnames given on the filename parameter
+
+	$hostnames = $opt_h;
+}
+
+
+#===================================================================
+#
+#	Get test and find hostname out of list of hostnames
+#
+#===================================================================
+
+if ($MODE eq "FTP")
+{
+
+	# Since we are going to FTP then test hostnames
+
+	@hosts = split("[ ]*[,][ ]*", $hostnames);
+
+	$connection_success = 0;	
+	foreach $host (@hosts)
+	{
+		if ($ftp = &get_ftp_connection($host, Passive => $passive_mode, Timeout => 300)) 
+		{
+			$ftp->quit;
+			$connection_success = 1;	
+			$hostname = $host;
+			last;
+		}
+		else
+		{
+
+			$ping_test = Net::Ping->new();
+	    		if ($ping_test->ping($host))
+			{
+				$ping_test->close();
+				printerr "$prog: Was not able to connect to $host despite the fact it exists!\n";
+				printerr "$space  Error: $last_error_msg\n";
+				printerr "$space  Check that the server has a functional FTP server\n";
+				exit(10);
+			
+			}
+			$ping_test->close();
+		}
+	}
+
+	if (! $connection_success)
+	{
+
+		if (scalar(@hosts) != 0)
+		{
+			printerr "$prog: Unable to connect to the host(s) \"" . join(", ", @hosts) . "\"\n";
+		}
+		else
+		{
+			printerr "$prog: Was unable to connect since there was no host(s) given with hosts\n";
+			printerr "$space  parameter or as a prefix to the filename parameter\n";
+		}
+		printerr "$space  Aborting\n";
+		exit (10);
+	}
+
+	printerr "DEBUG: Will connect to host $hostname\n"  if ($debug);
+}
+
+
+#===================================================================
+#
+#	Get password for host
+#
+#===================================================================
+
+
+
+if (($opt_l || $ENV{"FTPKEYS"} =~ /^([^:\/\t ]+[:\/\t ][^:\/\t ]+[,]?)+/ ) && $MODE eq "FTP")
+{
+	# Figure out the ftp password
+
+	if ($opt_l =~ /^[A-Z0-9_]+$/ && $ENV{$opt_l} && ! -f $opt_l)
+	{
+		printerr "DEBUG: Getting info from env $ENV{$opt_l}\n"  if ($debug);
+		@login_keys = &string_to_login_keys($ENV{$opt_l});
+
+		if (scalar(@login_keys) == 0)
+		{
+			printerr "$prog: Attempted to get login info from ENV variable \"$opt_l\" but it doesn't appear to be valid\n";
+			printerr "$space  Aborting\n";
+			exit (10);
+		}
+
+	}
+	elsif ($opt_l =~ /^([^:\/\t ]+[:\/\t ][^:\/\t ]+[,]?)+/ && ! -f $opt_l)
+	{
+		printerr "DEBUG: Getting login info from the command line\n"  if ($debug);
+
+		# The parameter is a list of username/passwd(s)
+
+
+		@login_keys = &string_to_login_keys($opt_l);
+
+		if (scalar(@login_keys) == 0)
+		{
+			printerr "$prog: Attempted to get login info from the command line \"$opt_l\" but it doesn't appear to be valid\n";
+			printerr "$space  Aborting\n";
+			exit (10);
+		}
+
+
+	}
+	elsif (-f $opt_l)
+	{
+		printerr "DEBUG: Getting the login info from a file\n"  if ($debug);
+
+		if (open (PWD, "< $opt_l"))
+		{
+			$string = "";
+			while (<PWD>)
+			{
+				chomp;
+				next if (/^\w*[#]/);
+				next if (/^\w*$/);
+
+				$string = $_ . "," . $string; 
+			}
+
+			$string =~ s/,$//;
+
+			close (PWD);
+
+
+			@login_keys = &string_to_login_keys($string);
+
+			if (scalar(@login_keys) == 0)
+			{
+				printerr "$prog: Attempted to get login info from the file \"$opt_l\" but info inside doesn't appear to be valid\n";
+				printerr "$space  Aborting\n";
+				exit (10);
+			}
+
+		}
+		else
+		{
+			printerr "$prog: Unable to open login info file \"$opt_l\"\n";
+			printerr "$space  Aborting\n";
+			exit(10);
+		}
+
+	}
+	elsif ($ENV{"FTPKEYS"} =~ /^([^:\/\t ]+[:\/\t ][^:\/\t ]+[,]?)+/)
+	{
+                printerr "DEBUG: Getting login info from FTPKEYS environment variable\n"  if ($debug);
+
+                # The parameter is a list of username/passwd(s)
+
+                @login_keys = &string_to_login_keys($ENV{"FTPKEYS"});
+
+		if (scalar(@login_keys) == 0)
+                {
+			printerr "$prog: Attempted to get login info from the environment var FTPKEYS but it doesn't appear to be valid\n";
+                        printerr "$space  Aborting\n";
+                        exit (10);
+                }
+	}
+	else
+	{
+		printerr "$prog: Unable to determine username/password from \"$opt_l\"\n";
+		if ($opt_l =~ /[\/.]/)
+		{
+			printerr "$space  If this is a file it does not seem to exist\n";
+		}
+		printerr "$space  Aborting\n";
+		exit(10);
+	}	
+
+
+	$login_success = 0;	
+	foreach $key (@login_keys)
+	{
+		($username, $password) = split("[/]", $key);
+
+		if (! ($ftp = &get_ftp_connection($hostname, Passive => $passive_mode, Timeout => 300))) 
+		{
+			printerr "$prog: Unable to get a connect to FTP server (@ $hostname) even though I was able to before (?)\n";
+			printerr "$space  Error: $last_error_msg\n";
+			printerr "$space  Aborting\n";
+			exit(10);
+		}
+
+		if ($ftp->login($username, $password)) 
+		{
+			$login_success = 1;
+			$ftp_connect = $ftp; # Remember the FTP connection\n";
+			last;
+		}
+
+		$ftp->quit;
+	}
+
+	if (! $login_success)
+	{
+		printerr "$prog: Unable to login to $hostname with any set of keys\n";
+		printerr "$space  Aborting\n";
+		exit(10);
+	}
+}
+else
+{
+	if ($MODE eq "FTP")
+	{
+		printerr "$prog: Need to use FTP but was note provided a username/password information\n";
+		printerr "$space  Aborting\n";
+		exit(10);
+	}
+}
+
+
+if ($MODE eq "DIRECT")
+{
+
+	if ($PROG_MODE eq "WRITE")
+	{
+
+		$output_file_name = File::Spec->catfile($remote_directory, $remote_file);
+
+		if (! open(OUTFILE, "> $output_file_name"))
+		{
+			printerr "$prog: Unable to create output file \"$output_file_name\"\n";
+			printerr "$space  $!\n";
+			printerr "$space  Aborting\n";
+			exit(10);
+		}
+
+		$start_time = time;
+
+		$bytes_transferred = 0;
+		while ($bytes = read(STDIN, $block, 8192))
+		{
+			$bytes_transferred += $bytes;
+
+			print OUTFILE $block || die "$prog: Unable to print to output file \"$output_file_name\": $!";
+		}
+
+		$end_time = time;
+
+		close (OUTFILE);
+
+		if ($?)
+		{
+			printerr "$prog: An error occurred when closing output file \"$output_file_name\"\n";
+			printerr "$space  Error: $!\n";
+			printerr "$space  Have to assume a problem - Aborting\n";
+			exit(10);
+		}
+	}
+	else
+	{
+		$input_file_name = File::Spec->catfile($remote_directory, $remote_file);
+
+		if (! -f $input_file_name || -p $input_file_name)
+		{
+			printerr "$prog: Cannot locate input file \"$input_file_name\"\n";
+			printerr "$space  Aborting\n";
+			exit(10);
+		}
+
+		if (! open(INFILE, "< $input_file_name"))
+		{
+			printerr "$prog: Unable to open input file \"$input_file_name\"\n";
+			printerr "$space  $!\n";
+			printerr "$space  Aborting\n";
+			exit(10);
+		}
+
+		$start_time = time;
+
+		$bytes_transferred = 0;
+		while ($bytes = read(INFILE, $block, 8192))
+		{
+			$bytes_transferred += $bytes;
+
+			print STDOUT $block || die "$prog: Unable to print to input file \"$input_file_name\": $!";
+		}
+
+		$end_time = time;
+
+		close (INFILE);
+
+		if ($?)
+		{
+			printerr "$prog: An error occurred when closing input file \"$input_file_name\"\n";
+			printerr "$space  Error: $!\n";
+			printerr "$space  Have to assume a problem - Aborting\n";
+			exit(10);
+		}
+	}
+
+        if (($end_time - $start_time) != 0 && $bytes_transferred =~ /^[0-9]+$/)
+        {
+                $KBps = ($bytes_transferred / 1024) / ($end_time - $start_time);
+                $KBps = sprintf("%.3f", $$KBps);
+        }
+        else
+        {
+                $KBps = "unknown";
+        }
+}
+else
+{
+
+
+
+	$keep_trying = 1;
+
+	if (! $silent_mode)
+	{
+		if ($MODE eq "DIRECT")
+		{
+			printerr "$prog: Started writing \"$remote_directory/$remote_file\" to local filesystem\n";
+		}
+		else
+		{
+			printerr "$prog: Started writing \"$remote_directory/$remote_file\" to $hostname\n";
+		}
+	}
+
+
+	while ($keep_trying)
+	{
+		$keep_trying = 0;
+
+		if (! ($ftp_connect->cwd($remote_directory))) 
+		{
+			printerr "$prog: Unable to change directory to \"$remote_directory\"\n";
+			printerr "$space  Error: " . $ftp_connect->message . "\n";
+			printerr "$space  Aborting\n";
+			exit(10);
+		}
+
+		if (! $send_as_ascii)
+		{
+			if (! $ftp_connect->binary())
+			{
+				printerr "$prog: Unable to change transfer mode to binary\n";
+				printerr "$space  Error: " . $ftp_connect->message . "\n";
+				printerr "$space  Aborting\n";
+				exit(10);
+			}
+		}
+		else
+		{
+			if (! $ftp_connect->ascii())
+			{
+				printerr "$prog: Unable to change transfer mode to ascii\n";
+				printerr "$space  Error: " . $ftp_connect->message . "\n";
+				printerr "$space  Aborting\n";
+				exit(10);
+			}
+		}
+
+		$start_time = time;
+
+		if ($PROG_MODE eq "WRITE")
+		{
+
+			# Create empty file if directory happens to be local.
+			# This way, current umask will take effect instead of
+			# the umask of the ftp server.
+
+			if ((! -f $filename) && ( (-d $remote_directory) || (-l $remote_directory) )) {
+				open(EMPTY, "> $filename");
+				close(EMPTY);
+			}
+
+			$transfer_result = $ftp_connect->put(*STDIN, $remote_file);
+		}
+		else
+		{
+			$transfer_result = $ftp_connect->get($remote_file, *STDOUT);
+		}
+
+		$end_time = time;
+
+		if (not ($transfer_result)) 
+		{
+			if ($ftp_connect->message =~ /passive mode not allowed/i)
+			{
+				printerr "DEBUG: Passive mode not allowed on server - reconnecting without passive mode\n"  if ($debug);
+				$passive_mode = 0;
+				$keep_trying = 1;
+
+				$ftp_connect->quit;
+
+				if (! ($ftp_connect = &get_ftp_connection($hostname, Passive => $passive_mode, Timeout => 300))) 
+				{
+					printerr "$prog: Unable to re-connect into FTP server to turn off passive mode\n";
+					printerr "$space  Error: $last_error_msg\n";
+					printerr "$space  Aborting\n";
+					exit(10);
+				}
+
+				if (! $ftp_connect->login($username, $password)) 
+				{
+					printerr "$prog: Unable to log back into FTP server to turn off passive mode\n";
+					printerr "$space  Error: " . $ftp_connect->message . "\n";
+					printerr "$space  Aborting\n";
+					exit(10);
+				}
+
+			}
+			else
+			{
+				printerr "$prog: An error occured during FTP transfer command\n";
+				printerr "$space  Error: " . $ftp_connect->message . "\n";
+				printerr "$space  Assume file transfer incomplete\n";
+				printerr "$space  Aborting\n";
+				exit(10);
+			}
+		}
+
+	}
+
+	$bytes_transferred = $ftp_connect->size($remote_file);
+
+	if (($end_time - $start_time) != 0 && $bytes_transferred =~ /^[0-9 ]+$/)
+	{
+		$KBps = ($bytes_transferred / 1024) / ($end_time - $start_time);
+		$KBps = sprintf("%.3f", $KBps);
+	}
+	else
+	{
+		$KBps = "unknown";
+	}
+
+	$ftp_connect->quit;
+
+
+}
+
+if (! $silent_mode)
+{
+	if ($MODE eq "DIRECT")
+	{
+		printerr "Written $bytes_transferred to \"$remote_directory/$remote_file ($KBps KBps)\n";
+	}
+	else
+	{
+		printerr "Written $bytes_transferred to \"${hostname}:$remote_directory/$remote_file ($KBps KBps)\n";
+	}
+}
+
+exit(0);
+

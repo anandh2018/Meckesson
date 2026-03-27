@@ -1,0 +1,1 @@
+egrep -v '^analyzed|^key is duplicate' $1 | sed 's/^<rd>//g'

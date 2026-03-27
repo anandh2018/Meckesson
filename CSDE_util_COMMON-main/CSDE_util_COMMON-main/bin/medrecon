@@ -1,0 +1,145 @@
+#!/usr/bin/perl -w
+
+use SOAP::Lite;
+use Data::Dumper;
+use strict;
+use Time::HiRes;
+use BLUELITE::GPG;
+use Data::UUID qw(NameSpace_URL);
+
+sub encrypt {
+  my $string = shift;
+
+  my $pgp = new BLUELITE::GPG(homedir => '/ds/gnupg',
+                              armor   => 0,
+                 );
+  my $encrypted_string = $pgp->sign_encrypt("Jessica.Landisman\@per-se.com", 'Niwthh', $string, "data.services\@per-se.com");
+
+  if ($pgp->error()) {
+    print $pgp->error();
+    return undef;
+  }
+  else {
+    return$encrypted_string; 
+  }
+}
+
+my $verbose_flag = 0;
+if ($ARGV[0] eq "-v") {
+  $verbose_flag = 1;
+  shift @ARGV;
+}
+my $host = shift @ARGV;
+my $start_date = shift @ARGV;
+my $end_date = shift @ARGV;
+my $last_name = shift @ARGV;
+my $first_name = shift @ARGV;
+my $dob = shift @ARGV;
+my $gender = shift @ARGV;
+my $zip_code = shift @ARGV;
+my $cardholder = shift @ARGV;
+
+if (! defined $cardholder) {
+ $cardholder = q{};
+}
+ 
+my $ug = new Data::UUID;
+my $uuid = $ug->create_str();
+my $time = time();
+#generate xml string
+my $unencrypted_criteria = qq{<start_date>$start_date</start_date>
+<end_date>$end_date</end_date>
+<last_name>$last_name</last_name>
+<first_name>$first_name</first_name>
+<dob>$dob</dob>
+<gender>$gender</gender>
+<zip_code>$zip_code</zip_code>
+};
+if (defined $cardholder) {
+  $unencrypted_criteria .= "<member_id>$cardholder</member_id>\n";
+} 
+my $criteria = encrypt($unencrypted_criteria);
+
+my $message = qq{<data_services_request id="$uuid" timestamp="$time">
+  <Header>
+    <authentication>
+      <auth_mode>ppk</auth_mode>
+      <user_name>Jessica.Landisman\@per-se.com</user_name>
+    </authentication>
+  </Header>
+  <request_format>
+    <request_data>med_history</request_data>
+    <request_version>1</request_version>
+  </request_format>
+  <response_format>
+    <predefined_response>NCPDPScript</predefined_response>
+    <response_version>1</response_version>
+  </response_format>
+  <request_criteria>$criteria</request_criteria>
+</data_services_request>};
+
+#CONNECTION:
+my $uri   = 'MedHistory';
+my $proxy = "http://$host/soap";
+my $soap = SOAP::Lite
+           ->uri($uri)
+           ->proxy($proxy, timeout => 180);
+
+my $start_time = Time::HiRes::gettimeofday();
+my $result = $soap->GetMedHistory($message);
+my $end_time = Time::HiRes::gettimeofday();
+
+my $return = 1;
+my $fault_code = '-';
+if ($result->fault) {
+  $return = 0;
+  $fault_code = $result->fault->{'detail'}->{'ErrorCode'}->{'code'};
+}
+
+my $elapsed_time = $end_time - $start_time;
+if ($verbose_flag) {
+  print Dumper $result;
+  if ($result->fault) {
+    print Dumper $result->fault;
+  }
+  else {
+    my $result_string = $result->result;
+    print $result_string, "\n";
+    my @lines = split /\n/, $result_string;
+    my $encrypted_text;
+    my $cdata_flag = 0;
+    foreach my $line (@lines) {
+      if ($cdata_flag == 1) {
+        if ($line =~ m/]]/) {
+          $cdata_flag = 0;
+        } else {
+          $encrypted_text .= "$line\n";
+        }
+      } else {
+        if ($line =~ m/CDATA/) {
+          $cdata_flag = 1;
+          $line =~ s/^\s+\<!\[CDATA\[//;
+          $encrypted_text = "$line\n";
+        }
+      }
+    }
+
+    if (0 < length($encrypted_text)) {
+      my $pgp = new BLUELITE::GPG(homedir => '/ds/gnupg',
+      );
+
+      my $result = $pgp->decrypt_verify('Niwthh', $encrypted_text);
+      if ($pgp->error()) {
+        print "Failed decryption: " . $pgp->error() . "\n";
+      }
+      else {
+        print "Signature verified for " . $result->{'key_user'} . "\n";
+        my $decrypted_text = $result->{'text'};
+        print Dumper $result;
+        print $decrypted_text;
+      }
+    }
+  }
+} 
+
+print "\n$host|$start_date|$end_date|$last_name|$first_name|$dob|$gender|$zip_code|$cardholder|$return|$fault_code|$start_time|$end_time|$elapsed_time\n";

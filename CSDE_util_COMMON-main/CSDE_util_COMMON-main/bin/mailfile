@@ -1,0 +1,104 @@
+#!/usr/bin/perl
+
+use BLUELITE::Mail;
+
+$prog_name = "mailfile";
+
+use IO::File;
+use Getopt::Std;
+
+use FileHandle;
+use File::Spec;
+
+autoflush STDOUT 1;
+autoflush STDERR 1;
+
+sub usage()
+{
+	print "Usage: mailfile -r recepient[,recepient...] [ -s subject ] file [ file ... ]\n";
+	exit(1);
+}
+
+
+
+if (scalar(@ARGV) == 0 || ! getopts('r:s:', \%opt))
+{
+        &usage();
+}
+
+if ($opt{r})
+{
+	$to = $opt{r};
+}
+else
+{
+	print STDERR "$prog_name: No receipents listed.  See usage.\n";
+	exit (1);
+}
+
+
+@files = @ARGV;
+
+if ($opt{s})
+{
+	$subject = $opt{s};
+}
+else
+{
+	$subject = "Files " . join(", ", @files);
+}
+
+
+if (scalar(@files) == 0)
+{
+	print STDERR "$prog_name: No files to send listed. See usage\n";
+	exit(1);
+}
+
+for $file (@files)
+{
+	if (! -f $file)
+	{
+		print STDERR "$prog_name: Unable to locate file \"$file\"\n";
+		exit (1);
+	}
+
+	$size = (stat($file))[7];
+	$file_info{$file} = $size;
+
+	$total_size = $total_size + $size;
+	
+}
+
+if ($total_size > 30000000)
+{
+	print STDERR "$prog_name:  Total size of files is greater than 30M - aborting\n";
+	exit(1);
+}
+
+$msg = "\n\nFiles from the Bluelite User (attached):\n";
+foreach $_ (keys %file_info)
+{
+	$msg .= "\tFile: $_ ($file_info{$_})\n";
+}
+
+$msg .= "\n";
+
+$ret = 
+&sendmail ( TO => $to,
+						MSG => $msg,
+						SUBJECT => $subject,
+						attachment => join(",", @files)
+);
+
+
+if (! $ret)
+{
+	print STDERR "$prog_name: Mail appears to have failed - $! ($ret)\n";
+	exit (1);
+}
+
+print scalar(@files) . " files have been sent succesfully.\n";
+exit (200);
+
+

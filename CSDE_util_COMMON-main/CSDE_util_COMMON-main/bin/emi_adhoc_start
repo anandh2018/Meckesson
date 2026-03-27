@@ -1,0 +1,21 @@
+#!/usr/bin/bash
+
+#Author: W Hampton
+export USER=`whoami`
+if [ "${USER}" = "adhoc" ];
+then
+    # Find current PIDs running Glassfish
+    export GLASS_PID_ADHOC=`ps ux | grep -w "provider" | grep -v "grep" | tr -s ' ' | cut -f 2 -d ' '`
+    #Checking if the PIDs are running
+    if [ "${GLASS_PID_ADHOC}" = "" ]
+  then
+     echo "Starting domain=[provider]..."
+    /dsapp/prod/local/${HOSTNAME%%.*}/adhoc_gf/glassfish-4.1.1/glassfish/bin/asadmin start-domain provider
+  else
+     echo "domain=[provider] running: ${GLASS_PID_ADHOC}"
+    fi
+    else
+        echo "Need to be adhoc to execute."
+fi
+
+

@@ -1,0 +1,719 @@
+#!/usr/bin/perl
+
+# nsf_clean: Applies NDCHealth standardization of non-encrypted NSF (HCFA 1500) files from H, L, C, P, N or M sources
+# Author: jmh, NDCHealth
+#
+# - Removes non-standard records
+# - Removes unterminated, orphaned, and operationally duplicate claims
+# - Fixes YA0 and ZA0 records in H,L,C,N,P sources
+# - Blanks out appropriate AA0 (submitter) fields
+# - Sets submitter id field in AA0 records to value passed in as -s option
+# - Fixes bad record ID character for DA records (caused by MU bug)
+# - Converts Windows/DOS record delimiters to UNIX record delimiters (replaces ending CR/LF with LF)
+# - Converts binary characters to spaces
+#
+
+# Version history:
+# 2004 - Version 1.0
+# - Initial release
+#
+# 2004 - Version 1.1 - 1.41
+# - Added other options :-)
+#
+# 20050610 - Version 1.42
+# - Added -k option to enable skipping generation if existing output file is newer than input file
+#	- Added -g option to enable debugging output
+#
+# 20050615 - Version 1.43
+# - Empty file error now generated when output goes to STDOUT
+# - Output files now removed when input file is empty or other output error happens
+#
+# 20051109 - Version 1.44
+# - Added TC as valid source
+# - Limited fix of YA0 and ZA0 records to H,L,C,N,P sources
+# - Added -L option to add structured logging of stats
+# - Added -v valid_set option to support named "valid NSF record ID sets"
+#		(supported sets are 'external' (default) and 'ihr')
+#
+
+use Getopt::Std;
+use String::CRC;
+use BLUELITE::Common;
+use DateTime;
+
+$VERSION = '1.44';
+$prog_name = "nsf_clean";
+
+
+if (! defined($ARGV[0])) {
+	print STDERR "$prog_name : Version $VERSION\n\n";
+
+	print STDERR "Usage 1: $0 [-kgL] [-f file_id] [-s submitter_id] [-d|D output_dir [-r dest_host]] [-e success_exit_status] [-v valid_set] -i input_list_file
+Usage 2: $0 [-kgL] [-f input_file] [-s submitter_id] [-d|D output_dir [-r dest_host]] [-e success_exit_status] [-v valid_set] [raw_input_file] [raw_input_file ...]
+
+-d	Top-level output directory. Output dir is derived to YYYYMM based on input file name
+-D	Output directory
+-r	Use write_file (ftp) to send file to dest_host
+-k	Skip clean process if output file already exists and is newer than input file
+-v	Use valid record set named valid_set as record inclusion list (supported sets are 'external' (default) and 'ihr')
+-L	Use structured format for stats log output
+-g	Turn on debugging output\n";
+	exit(1);
+}
+
+getopts('d:D:i:r:f:s:e:kgLv:');
+
+@valid_nsf_rec_types = (
+'AA0',
+'BA0',
+'BA1',
+'CA0',
+'CA1',
+'CB0',
+'DA0',
+'DA1',
+'DA2',
+'DA3',
+'EA0',
+'EA1',
+'EA2',
+'FA0',
+'FB0',
+'FB1',
+'FB2',
+'FB3',
+'FD0',
+'FE0',
+'GA0',
+'GC0',
+'GD0',
+'GD1',
+'GE0',
+'GP0',
+'GU0',
+'GX0',
+'GX1',
+'GX2',
+'HA0',
+'XA0',
+'YA0',
+'ZA0'
+);
+
+if (defined($opt_v)) {
+	if ($opt_v =~ /^\s*ihr\s*$/i) {
+		push(@valid_nsf_rec_types, 'DA9', 'EA9', 'FA9', 'GD9');
+	} elsif ($opt_v !~ /^\s*external\s*$/i) {
+		die "ERROR: Only 'ihr' or 'external' may be used for -v option. '$opt_v' is not a recognized valid_set\n";
+	}
+}
+
+foreach $rec_type (@valid_nsf_rec_types) {
+	$valid_nsf_rec_types{$rec_type} = 1;
+}
+
+
+if (defined($opt_L)) {
+	$STRUCTURED_LOG = 1;
+} else {
+	$STRUCTURED_LOG = 0;
+}
+
+if (defined($opt_g)) {
+	$DEBUG = 1;
+} else {
+	$DEBUG = 0;
+}
+
+if (defined($opt_k)) {
+	$skip_if_newer = 1;
+} else {
+	$skip_if_newer = 0;
+}
+
+if (defined($opt_e)) {
+	$success_exit = $opt_e;
+} else {
+	$success_exit = 200;
+}
+
+if (defined($opt_f)) {
+	$file_id = $opt_f;
+	$file_id_base = $file_id;
+}
+
+if (defined($opt_D)) {
+	$output_dir = $opt_D;
+
+	if (! -d $output_dir) {
+		print STDERR "ERROR: Output directory $output_dir does not exist\n";
+		exit(1);
+	}
+
+	$USE_STDOUT = 0;
+
+	if (defined($opt_r)) {
+		$remote_host = $opt_r;
+	}
+} elsif (defined($opt_d)) {
+	$output_dir_top = $opt_d;
+	if (! -d $output_dir_top) {
+		print STDERR "ERROR: Output top directory $output_dir_top does not exist\n";
+		exit(1);
+	}
+
+	$USE_STDOUT = 0;
+
+	if (defined($opt_r)) {
+		$remote_host = $opt_r;
+	}
+} else {
+	$USE_STDOUT = 1;
+
+	if (defined($opt_r)) {
+		print STDERR "ERROR: -r option can only be used with -d or -D option\n";
+		exit(1)
+	}
+
+	if ($file_id eq '') {
+		$file_id = 'STDOUT';
+		$file_id_base = $file_id;
+	}
+}
+
+if (defined($opt_i)) {
+
+	if (defined($ARGV[0])) {
+		print STDERR "ERROR: Cannot specify input file name when using -i option\n";
+		exit(1);
+	}
+
+	$input_list_file = $opt_i;
+
+	if (($input_list_file ne '-') and (! &file_exists($input_list_file))) {
+		print STDERR "ERROR: Input list file $input_list_file does not exist\n";
+		exit(1);
+	}
+
+	open(FILE_LIST, $input_list_file) || die "Cannot open input list file $input_list_file : $!\n";
+	while (<FILE_LIST>) {
+		chop;
+		s/^[	 ]+//;
+
+		if (length($_) > 0) {
+			push(@input_files, $_);
+		}
+	}
+
+	close(FILE_LIST);
+
+} else {
+	if (! defined($ARGV[0])) {
+		if (-t 0) {
+			print STDERR "ERROR: Input data from terminal not supported. Must get input via -i option, command line file names, or via non-terminal standard input (STDIN)\n";
+			exit(1);
+		} else {
+			if (! $USE_STDOUT) {
+				print STDERR "ERROR: Cannot use -d option when input is from STDIN\n";
+				exit(1);
+			}
+
+			$USE_STDIN = 1;
+			$input_files[0] = '-';
+		}
+	} else {
+		@input_files = @ARGV;
+	}
+}
+
+
+if (! ($#input_files >= 0)) {
+	print STDERR "ERROR: No input files to clean!\n";
+	exit(1);
+}
+
+if (! $USE_STDIN) {
+	foreach $input_file (@input_files) {
+
+		if (! &file_exists($input_file)) {
+			print STDERR "ERROR: Input file $input_file does not exist!\n";
+			exit(1);
+		}
+
+		$data_type = &get_filename_data_type($input_file);
+
+		if (! defined($data_type)) {
+			print STDERR "ERROR: Unable to determine whether data is NSF\n";
+			exit(1);
+		}
+
+		if ($data_type ne 'NSF') {
+			print STDERR "ERROR: Data type for input file $input_file is not NSF\n";
+			exit(1);
+		}
+
+		$data_source = &get_filename_data_source($input_file);
+
+		if (! defined($data_source)) {
+			print STDERR "ERROR: Unable to determine where data source is from (T, L, H, C, N, P, TC) for $input_file\n";
+			exit(1);
+		}
+
+		# $submitter = "CMS${data_source}";
+
+		if (! $USE_STDOUT) {
+			$fname_date = &get_filename_date($input_file);
+
+			if (! defined($fname_date)) {
+				print STDERR "ERROR: Unable to determine filename date of input file $input_file\n";
+				exit(1);
+			}
+
+			$YYYYMM = substr($fname_date, 0, 6);
+
+			if (defined($opt_d)) {
+				$output_dir = "$output_dir_top/$YYYYMM";
+
+				if (! -d $output_dir) {
+					print STDERR "Note: Creating output month directory $output_dir\n";
+
+					system('mkdir', $output_dir);
+
+					if (! -d $output_dir) {
+						print STDERR "ERROR: Unable to create output month directory $output_dir\n";
+						exit(1);
+					}
+				}
+			}
+
+			$seq = &get_filename_unique_seq($input_file);
+
+			if ($seq == 1) {
+				$seq = '';
+			}
+
+			if (length($seq) > 0) {
+				$seq = "_$seq";
+			}
+
+			$output_file_new_base = "${data_type}c_${data_source}_${fname_date}${seq}.dat.gz";
+			$output_file_new = "$output_dir/$output_file_new_base";
+
+			if ($output_file_new eq $input_file) {
+				print STDERR "ERROR: Output file name is the same as input file name: $output_file_new\n";
+				exit(1);
+			}
+
+			if (exists($outfiles{$output_file_new})) {
+				print STDERR "ERROR: Output file name $output_file_new is the same for at least the following two different input files: $outfiles{$output_file_new} and $input_file\n";
+				exit(1);
+			}
+
+			if (-f $output_file_new) {
+				if ($skip_if_newer) {
+					($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$file_size,$atime,$outfile_mtime,$ctime,$blksize,$blocks) = stat($output_file_new);
+					($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$file_size,$atime,$inputfile_mtime,$ctime,$blksize,$blocks) = stat($input_file);
+
+					if ($outfile_mtime >= $inputfile_mtime) {
+
+						if ($DEBUG) {
+ 	      	   print STDERR "debug: existing output file $output_file_new is newer or same age as input file $input_file . Skipping.\n";
+ 	      	 	}
+
+						next;
+
+					} else {
+						print STDERR "Regenerating older existing file $output_file_new\n";
+					}
+				} else {
+					if ($DEBUG) {
+						print STDERR "debug: existing file $output_file will be overwritten\n";
+					}
+				}
+			} else {
+ 		    print STDERR "New file will be generated: $output_file_new\n";
+			}
+
+			if (! exists($outfiles{$output_file_new})) {
+				$num_output_files++;
+			}
+
+			$outfiles{$output_file_new} = $input_file;
+			$infiles{$input_file} = $output_file_new;
+		} else {
+			$infiles{$input_file} = '-';
+		}
+	}
+} else {
+	$infiles{'-'} = '-';
+}
+
+if (($file_id eq '') and ($num_output_files == 1)) {
+	$file_id = $output_file_new;
+	$file_id_base = $output_file_new_base;
+}
+
+if (defined($opt_s)) {
+	$submitter = uc($opt_s);
+
+	if ($submitter !~ /^CMS([HLCPNT]|TC)$/) {
+		print STDERR "$prog_name: submitter must be CMS[H|L|C|P|N|T|TC]\n";
+		exit(10);
+	}
+} elsif ($USE_STDIN) {
+	print STDERR "ERROR: Must specify submitter id via -s option when input is from STDIN\n";
+	exit(1);
+}
+
+#if (! open(COMPRESS_OUT, "| gzip -c | write_file -f -h $remote_host $output_file")) {
+#	die "Cannot start gzip process to create $output_file : $!\n";
+#}
+
+if ($USE_STDOUT) {
+
+	if (! open(OUTPUT, '>-')) {
+		print STDERR "ERROR: Cannot output STDOUT : $!\n";
+		exit(1);
+	}
+}
+
+sub replace_substr() {
+  my($string, $start, $end, $sub) = (@_);
+  my($begin, $begin_length, $sub_length, $end_length);
+
+$begin = substr($string, 0, ($start - 1));
+$begin_length = $start; 
+$sub_length = $end - $start + 1;
+$end_length = length($string) - $sub_length;
+
+return sprintf("%-0.${begin_length}s%-${sub_length}.${sub_length}s%-0.${end_length}s", substr($string, 0, $begin_length), $sub, substr($string, $begin_length + $sub_length));
+
+}
+
+sub remove_output() {
+
+	if ((! $USE_STDOUT) and ($num_output_files > 0)) {
+			unlink(values %infiles);	# this removes the output files, despite how it looks
+	}
+
+}
+
+$num_input_records = 0;
+
+foreach $input_file (keys %infiles) {
+
+	$outfile = $infiles{$input_file};
+
+	if ($input_file =~ /[.](pgp|gz|zip)$/) {
+		$infile_cmd = "read_file $input_file |";
+
+		if ($submitter eq '') {
+			$data_source = &get_filename_data_source($input_file);
+			$submitter = "CMS${data_source}";
+		}
+	} elsif ($input_file eq '-') {
+		$infile_cmd = '-';
+	} else {
+		$infile_cmd = $input_file;
+
+		if ($submitter eq '') {
+			$data_source = &get_filename_data_source($input_file);
+			$submitter = "CMS${data_source}";
+		}
+	}
+
+	if ($submitter eq '') {
+		print STDERR "ERROR: Cannot determine correct submitter for input file $input_file\n";
+		exit(1);
+	}
+
+	if (! open(INPUT, $infile_cmd)) {
+		print STDERR "ERROR: Cannot open input '$infile_cmd' : $!\n";
+		exit(1);
+	}
+
+	if (! $USE_STDOUT) {
+
+		if (defined($remote_host)) {
+			if (! open(OUTPUT, "| gzip -c | write_file -f -h $remote_host $outfile")) {
+				print STDERR "ERROR: Cannot start output compression process for input file $input_file : $!\n";
+				exit(1);
+			}
+		} else {
+			if (! open(OUTPUT, "| gzip -c > $outfile")) {
+				print STDERR "ERROR: Cannot start output compression process for input file $input_file : $!\n";
+				exit(1);
+			}
+		}
+	}
+
+
+	### NSF CLEAN LOGIC BEGINS HERE ###
+
+	$in_claim = 0;
+	@claim_record = ();
+	$num_claims_input = 0;
+	$unique_claims_output = 0;
+	$num_unterminated_claims = 0;
+	$valid_claims_input = 0;
+	$duplicate_claims_skipped = 0;
+
+	while (<INPUT>) {
+
+		s/^D\301/DA/;	# fix bad DA recs
+		s/\015\012$/\012/;	 # remove CR
+		s/[\0-\011\013-\037\177-\377]/ /g; # remove binary
+
+		$line = $_;
+
+		$num_input_records++;
+
+		$rec_type = substr($line, 0, 3);
+
+		if (! defined($valid_nsf_rec_types{$rec_type})) {
+			if ($line =~ /^[A-Z][A-Z][0-9]/) {
+				$non_standard_records{$rec_type}++;
+			} else {
+				$invalid_records{$rec_type}++;
+			}
+
+			next;
+		}
+
+		if ($line =~ /^[A-BY-Z][A-Z][0-9]/) {
+			if ($in_claim) {
+				$num_unterminated_claims++;
+			}
+
+			@claim_record = ();
+			$in_claim = 0;
+		}
+
+		if ($line =~ /^BA0/) {
+			@batch_record = ($line);
+		} elsif ($line =~ /^B/) {
+			push(@batch_record, $line);
+		} elsif ($line =~ /^CA0/) {
+
+			$num_claims_input++;
+
+			if ($in_claim) {
+				$num_unterminated_claims++;
+			} else {
+				$in_claim = 1;
+			}
+
+			@claim_record = ();
+			push(@claim_record, $line);
+
+			next;
+		} elsif ($line =~ /^XA0/) {
+
+			if (! $in_claim) {
+				$num_orphaned_claim_recs++;
+			} else {
+				push(@claim_record, $line);
+
+				$batch_and_claim_data = join('', @batch_record, @claim_record);
+#				$clm_crc = join('|', crc($batch_and_claim_data, 64));
+				$clm_crc = String::CRC::crc($batch_and_claim_data, 64);
+# print STDERR "claim crc = $clm_crc\n";
+				if (! exists($CLAIM_CRC{$clm_crc})) {
+
+					$CLAIM_CRC{$clm_crc} = 1;
+					$unique_claims_output++;
+
+					foreach $ci (0 .. $#claim_record) {
+						print OUTPUT $claim_record[$ci] || die "ERROR: $input_file - Unable to write concatenated output : $!\n";
+					}
+				} else {
+					$CLAIM_CRC{$clm_crc}++;
+					$duplicate_claims_skipped++;
+				}
+
+				$valid_claims_input++;
+			}
+
+			# empty claim data
+			@claim_record = ();
+			$in_claim = 0;
+			next;
+
+		} elsif ($line =~ /^[C-X][A-Z][0-9]/) {	# all non-CA0/XA0 claim records should be appended to claim record array
+
+ 			if ($in_claim) {
+				push(@claim_record, $line);	# assume valid claim record and push on to claim record arry
+			} else {
+				$num_orphaned_claim_recs++;
+			}
+
+			next;
+
+		} elsif ($line =~ /^AA0/) {
+
+			# blank out submitter information with " " 
+
+			$blanks = " " x 16;
+			$vendor = substr($submitter . $blanks , 0, 16);
+
+			$line =~ s/^(.{3}).{16}/$1$vendor/;
+
+			$blanks = " " x 172;
+			$line =~ s/^(.{40}).{172}/$1$blanks/;
+
+			$blanks = " " x 16;
+			$line =~ s/^(.{266}).{16}/$1$blanks/;
+
+			$blanks = " " x 16;
+			$line =~ s/^(.{291}).{16}/$1$blanks/;
+		} elsif ($line =~ /^YA0/) {
+
+			# fix YA0 recs from H,L,C,N,P sources
+
+			if ($submitter =~ /^CMS[HLCNP]$/) {
+				$rec_length = length($line);
+
+				if ($rec_length == 316) {
+					$data_length = $rec_length - 1;
+					$line = substr($line, 0, 40) . '   ' . substr($line, 40, $data_length - 40) . "  \n";
+				}
+			}
+
+			@batch_record = ();
+		} elsif ($line =~ /^ZA0/) {
+
+			# fix ZA0 recs from H,L,C,N,P sources
+
+			if ($submitter =~ /^CMS[HLCNP]$/) {
+				$rec_length = length($line);
+
+				if ($rec_length == 298) {
+					$data_length = $rec_length - 1;
+					$line = substr($line, 0, 19) . ' ' x 19 . substr($line, 19, $data_length - 19) . "    \n";
+				}
+			}
+
+			@batch_record = ();
+		}
+
+		if (! print OUTPUT $line) {
+			close(OUTPUT);
+			remove_output();
+			die "ERROR: $input_file - Could not write output: $!\n";
+		}
+
+	}  # end: read each line of input file
+
+	if ($in_claim) {
+		$num_unterminated_claims++;
+	}
+
+	if (! $USE_STDOUT) {
+
+		close(OUTPUT);
+
+		if ($? != 0) {
+			print STDERR "ERROR: Error writing output file $outfile : $!\n";
+			remove_output();
+			exit(1);
+		}
+
+		print STDERR "nsf_clean file successfully generated: $outfile\n";
+	}
+
+	if (! $USE_STDIN) {
+
+		close(INPUT);
+
+		if ($? != 0) {
+			print STDERR "ERROR: Error reading input file $input_file : $!\n";
+			remove_output();
+			exit(1);
+		}
+	}
+
+}  # end: read each input file
+
+	if ($valid_claims_input > 0) {
+		$dupe_rate = sprintf('%.1f', 100 * $duplicate_claims_skipped / $valid_claims_input);
+	} else {
+		$dupe_rate = '';
+	}
+
+	if ($STRUCTURED_LOG) {
+
+		map { $scalar_stats{$_} = ${$_} } (qw(num_claims_input unique_claims_output num_unterminated_claims valid_claims_input duplicate_claims_skipped dupe_rate));
+		$now = DateTime->now;
+		$now_text = $now->ymd('/') . ' ' . $now->hms(':');
+
+		if ($file_id_base =~ /[^\d](\d\d\d\d\d\d\d\d)[^\d]/) {
+			$YYYYMMDD = $1;
+		} else {
+			$YYYYMMDD = 'UNKNOWN_YYYYMMDD';
+		}
+
+		foreach $stat_id (keys %scalar_stats) {
+			print STDERR join(',', 'LOG', $now_text, $file_id_base, $YYYYMMDD, 1, $stat_id, $scalar_stats{$stat_id}) . "\n";
+		}
+
+		foreach $stat_hash_id ('non_standard_records', 'invalid_records') {
+			foreach $stat_id (keys %$stat_hash_id) {
+				print STDERR join(',', 'LOG', $now_text, $file_id_base, $YYYYMMDD, 2, $stat_hash_id, $stat_id, ${$stat_hash_id}{$stat_id}) . "\n";
+			}
+		}
+
+		print STDERR "\n";
+	}
+
+	if ($num_unterminated_claims > 0) {
+		print STDERR "Warning: $file_id_base - $num_unterminated_claims incomplete (skipped) claims.\n";
+	}
+
+	if ($num_orphaned_claim_recs > 0) {
+		print STDERR "Warning: $file_id_base - $num_orphaned_claim_recs orphaned claim records that were skipped.\n";
+	}
+
+	if (defined(%non_standard_records)) {
+		print STDERR "Warning: $file_id_base - the following number of non-standard records were skipped:\n";
+
+		foreach $rec_type (keys %non_standard_records) {
+			print STDERR "$file_id_base - $rec_type, $non_standard_records{$rec_type}\n";
+		}
+
+		print STDERR "\n";
+	}
+
+	if (defined(%invalid_records)) {
+		print STDERR "Warning: $file_id_base - the following number of invalid records were skipped:\n";
+
+		foreach $rec_type (keys %invalid_records) {
+			print STDERR "$file_id_base - $key, $invalid_records{$rec_type}\n";
+		}
+
+		print STDERR "\n";
+	}
+
+
+	if (! ($valid_claims_input > 0)) {
+		if (((! $USE_STDOUT) and ($num_output_files > 0)) or ($USE_STDOUT)) {
+			print STDERR "ERROR: nsf_clean: No valid claims found in input file(s) " . join(',', keys %infiles) . "\n";
+			print STDERR "Number of input records: $num_input_records\n";
+
+			if ($num_input_records == 0) {
+				print STDERR "Input file(s) contain no data (i.e. empty)!\n";
+			}
+
+			remove_output();
+
+			exit(9);
+		}
+	} else {
+		print STDERR "Stats : $file_id_base - Valid input claims: $valid_claims_input\n";
+		print STDERR "Stats : $file_id_base - Unique output claims: $unique_claims_output\n";
+		print STDERR "Stats : $file_id_base - Operational duplicate claims removed: $duplicate_claims_skipped\n";
+		print STDERR "Stats : $file_id_base - Operational duplication rate: $dupe_rate %\n";
+		print STDERR "\n";
+	}
+
+exit($success_exit);
+

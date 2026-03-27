@@ -1,0 +1,119 @@
+#!/usr/bin/perl
+
+use BLUELITE::Job;
+use Data::Dumper;
+use strict;
+use warnings;
+
+#	job_remove_workers: Remove workers with the requested status from the JOB_WORKER table, as long as they have not been concatenated via the job_concat command. If no status is specified, only FAILED workers are removed. Use job_remove_post_date to remove already concatenated workers.
+#
+# 3/5/2014
+#
+# - Initial release
+#
+# Version 6.0 - 10/31/2014
+# - Added support for "autohoc" requests (i.e. automated on-demand ad-hoc processing).
+#
+
+our $PGM = $0;
+$PGM =~ s/.*\///g;
+
+if (scalar(@ARGV) == 0) {
+	print "$PGM: Remove workers with the requested status from the JOB_WORKER table, as long as they have not been concatenated via the job_concat command. If no status is specified, only FAILED workers are removed. Use job_remove_post_date to remove already concatenated workers.
+
+Usage: $PGM -app-id app_id -post-date pd_spec [-options]
+
+Options:
+   -request-id i
+   -failed      {default if no other status specified}
+   -completed
+   -queued
+   -processing
+   -incomplete  {shorthand for every status except -completed}
+
+Note: pd_spec may be a comma-separated list of any combination of the following syntaxes:
+
+ YYYYMMDD
+ YYYYMMDD-YYYYMMDD
+ YYYYMM
+ YYYYMM-YYYYMM
+ YYYYMMDD-YYYYMM
+ YYYYMM-YYYYMMDD
+";
+	exit(1);
+}
+
+use Getopt::Long;
+
+my ($app_id, $request_id, $post_date);
+my @status = ();
+my $force = 0;
+my $failed = 0;
+my $completed = 0;
+my $queued = 0;
+my $processing = 0;
+my $all = 0;
+my $quick = 0;
+my $incomplete = 0;
+
+GetOptions(
+            'app-id=s' => \$app_id,
+            'request-id=i' => \$request_id,
+            'post-date=s' => \$post_date,
+						'failed' => \$failed,
+						'completed' => \$completed,
+						'queued' => \$queued,
+						'processing' => \$processing,
+						'all' => \$all,
+						'incomplete' => \$incomplete,
+            'force' => \$force,
+            'quick' => \$quick
+) || exit(1);
+
+die "$PGM: -app-id parameter not provided!\n" if (! defined($app_id));
+die "$PGM: -post-date parameter not provided!\n" if (! defined($post_date));
+die "$PGM: Cannot combine -all option with -failed, -completed, -queued, -processing, or -incomplete options\n" if ($all && ($failed || $completed || $queued || $processing || $incomplete));
+die "$PGM: Cannot combine -incomplete option with -failed, -completed, -queued, or -processing options\n" if ($incomplete && ($failed || $completed || $queued || $processing || $all));
+
+my @opts = ();
+if (defined($request_id)) {
+	push(@opts, request_id => $request_id);
+}
+
+my $job = BLUELITE::Job->new(app_id => $app_id, @opts) || die "Could not obtain BLUELITE::Job object\n";
+
+my @remove_opts = (post_date => $post_date);
+
+push(@status, 'FAILED') if ($failed || $all || $incomplete);
+push(@status, 'COMPLETED') if ($completed || $all);
+push(@status, 'QUEUED') if ($queued || $all || $incomplete);
+push(@status, 'PROCESSING') if ($processing || $all || $incomplete);
+
+@status = ('FAILED') if (! @status);
+push(@remove_opts, status => \@status);
+
+push(@remove_opts, quick => $quick) if ($quick);
+
+if ($force) {
+	push(@remove_opts, force => $force);
+  print "WARNING! This will remove all unconcatenated $app_id workers for $post_date with status " . join(', ', @status) . ", even if they recently changed to QUEUED or PROCESSING status (i.e. they MIGHT still be running or in the queue of an already-running job_launcher)!\nYou should manually verify that this is safe before proceeding (i.e. make sure the job_launcher and all of it's workers are no longer running).\n";
+  print "ARE YOU SURE YOU WISH TO PROCEED? (y/N) : ";
+
+  my $response = <STDIN>;
+
+  if ($response !~ /^\s*(y|yes)\s*$/i) {
+    print "Did not attempt to remove anything\n";
+    exit(1);
+  }
+}
+
+print "Please wait...\n" unless $quick;
+
+my ($workers_removed, $files_removed) = $job->remove_workers(@remove_opts);
+
+if ($workers_removed) {
+	print "Removed $workers_removed workers and $files_removed worker files.\n";
+} else {
+	print "No unconcatenated workers with " . join(', ', @status) . " status within post date $post_date\n";
+}
+

@@ -1,0 +1,209 @@
+#!/usr/bin/perl
+
+# slwrite: compress and encrypt a file via BLUELITE::SLFile::slwrite in-place
+#
+# Author: jmh, Per-Se Technologies
+# Initial release: 12/4/2006
+#
+# Note: The goal of this SL utility is NOT performance.  The goal is to SAFELY replace a file
+# readable via 'read_file' with an SL-formatted version of the file with a ".sl" extension
+# that replaces the original extension.
+#
+# 12/2006 : Initial release
+#
+# 1/18/2007 : Added ability to reconvert existing '.sl' file
+#
+
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Copy;
+use BLUELITE::SLFile qw(slwrite slverify sl_filename $SLFileError $SLFileStatusCode $SL_DEFAULT_ENCRYPT_TYPE $SL_DEFAULT_ENCRYPT_ALGORITHM $SL_DEFAULT_ENCRYPT_MODE $SL_DEFAULT_BLOCKSIZE_10K);
+
+our $PGM = $0;
+$PGM =~ s|.*/||g;
+
+our $DS_BASE_DIR = $ENV{DS_BASE_DIR};
+die "ERROR: DS_BASE_DIR environment variable is '$DS_BASE_DIR', which is not an existing directory\n" if (! ((defined($DS_BASE_DIR)) && (-d $DS_BASE_DIR)));
+
+# defaults
+
+my $keep_original = 0;
+my $exit_success = 0;
+my $verify = 0;
+my $overwrite_output = 0;
+my $success_on_skip = 0;
+my ($min_file_age);
+
+my $DEFAULT_ENCRYPT_KEY_FILE = "$DS_BASE_DIR/common/etc/.al.pp";
+
+my $blocksize10k = $SL_DEFAULT_BLOCKSIZE_10K;
+my $encrypt_type = $SL_DEFAULT_ENCRYPT_TYPE;
+my $encrypt_algorithm = $SL_DEFAULT_ENCRYPT_ALGORITHM;
+my $encrypt_mode = $SL_DEFAULT_ENCRYPT_MODE;
+my $encrypt_key_file = $DEFAULT_ENCRYPT_KEY_FILE;
+my $output_file;
+
+GetOptions(
+						"keep-original" => \$keep_original,
+						"exit=s" => \$exit_success,
+						"verify" => \$verify,
+						"overwrite" => \$overwrite_output,
+						"output-file=s" => \$output_file,
+						"min-file-age=s" => \$min_file_age,
+						"success-on-skip" => \$success_on_skip,
+						"compress-level=s" => \$blocksize10k,
+						"encrypt-type=s" => \$encrypt_type,
+						"encrypt-algorithm=s" => \$encrypt_algorithm,
+						"encrypt-mode=s" => \$encrypt_mode,
+						"encrypt-key_file=s" => \$encrypt_key_file
+) || exit(1);
+
+my $fname = shift(@ARGV);
+
+if ( (! defined($fname)) or (! (length($fname) >= 1)) ) {
+	print STDERR "$PGM: convert file to sl format in-place, with extremely thorough error checking\n\n";
+	print STDERR "Usage: $PGM [-options] infile\n";
+	print STDERR "  Options:\n";
+	print STDERR
+"	-keep-original		Do not replace input file with converted output file
+	-output-file file	Create output named file. Default is {infile}.sl
+	-verify			Perform crc32 content verification between input and output files after conversion
+	-exit #			Exit with status # on successful conversion (default 0)
+	-min-file-age #		Skip conversion if input file is not at least # seconds old
+	-success-on-skip	If conversion skipped, exit with successful status
+	-encrypt_key_file f	Location of file containing encryption key
+	-compress-level #	Range is 1 to 90 (most compression). Default is $SL_DEFAULT_BLOCKSIZE_10K
+
+See Crypt::GCrypt for complete list of possible values for the following options:
+	-encrypt_type e		Defaults to $SL_DEFAULT_ENCRYPT_TYPE
+	-encrypt_algorithm a	Defaults to $SL_DEFAULT_ENCRYPT_ALGORITHM
+	-encrypt_mode m		Defaults to $SL_DEFAULT_ENCRYPT_MODE
+";
+	exit(1);
+}
+
+
+# sanity check input/output filenames
+
+if (! -f $fname) {
+	die "ERROR: $PGM: '$fname' does not exist\n";
+}
+
+if (defined($min_file_age) && ($min_file_age > 0)) {
+	my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$fsize,$atime,$mtime,$ctime,$blksize,$blocks) = stat($fname);
+
+	if ($mtime > (time - $min_file_age)) {
+
+		if ($success_on_skip) {
+			exit($exit_success);
+		} else {
+			die "ERROR: $PGM: The file '$fname' has been modified within the last $min_file_age seconds, and the '-success-on-skip' option was NOT specified\n";
+		}
+
+	}
+}
+
+if ($#ARGV >= 0) {
+	die "ERROR: $PGM: Too many arguments\n";
+}
+
+
+
+my @sl_options = ();
+
+push(@sl_options, blocksize10k => $blocksize10k);
+push(@sl_options, encrypt_type => $encrypt_type);
+push(@sl_options, encrypt_algorithm=> $encrypt_algorithm);
+push(@sl_options, encrypt_mode => $encrypt_mode);
+push(@sl_options, encrypt_key_file => $encrypt_key_file);
+
+my $temp_created;
+
+if (defined($output_file)) {
+
+	$temp_created = 0;
+	push(@sl_options, output_file => $output_file);
+
+} elsif ($fname =~ /[.]sl$/o) {
+
+	if ($keep_original) {
+		die "ERROR: Cannot specify '-keep-original' option for input files already in '.sl' format\n";
+	}
+
+	$temp_created = 1;
+	$output_file = sl_filename($fname) . '.tmp';
+
+	push(@sl_options, output_file => $output_file);
+}
+
+my $IN;
+open($IN, "read_file $fname |") || die "ERROR: $PGM: Cannot read contents of $fname via read_file for conversion process : $!\n";
+push(@sl_options, input => $IN, input_file => $fname);
+
+# convert file to sl format
+
+my $output_file_returned = slwrite(@sl_options);
+
+close($IN);
+
+if ($SLFileStatusCode eq 'EMPTY') {
+	print STDERR "Warning: input file $fname was empty. File unchanged.\n";
+	exit($exit_success);
+}
+
+if (! defined($output_file_returned)) {
+	die "ERROR: $PGM: Problem converting input file '$fname' to sl output file : $SLFileError\n";
+}
+
+if (defined($output_file) && ($output_file ne $output_file_returned)) {
+	die "ERROR: $PGM: slwrite() was requested to create output file name as '$output_file', but it created the following output file name instead: '$output_file_returned'\n";
+}
+
+if (! -f $output_file_returned) {
+	die "ERROR: $PGM: Problem converting input file '$fname' to sl output file : slwrite failed to create output file $output_file_returned : $SLFileError\n";
+}
+
+if ($verify) {
+	if (! slverify($output_file_returned, encrypt_key_file => $encrypt_key_file)) {
+		die "ERROR: $PGM: could not verify output file '$output_file_returned' : $SLFileError\n";
+	}
+}
+
+# set mod times and perms of outfile to same as inputfile
+
+my $ret = system(qq/touch -r $fname $output_file_returned/);
+$ret = $ret >> 8;
+
+if ($ret != 0) {
+	print STDERR "Warning: $PGM: Unable to reset permissions and modification times of output file $output_file_returned\n";
+}
+
+# Conversion worked. File comparison checked out OK.
+# So now we can safely remove the original input file and exit with a successful status
+# (unless SOMEHOW input and output files do not still exist, which would be really weird).
+
+if (-f $fname) {
+	if (-f $output_file_returned) {
+
+		if (! $keep_original) {
+
+			if ($temp_created) {
+				if (! move($output_file, $fname)) {
+					die "ERROR: $PGM: Unable to rename temp output file '$output_file' file back to input file name '$fname' after converting.\n";
+				}
+			} elsif (! unlink($fname)) {
+				die "ERROR: $PGM: Unable to delete the input file $fname after converting to $output_file_returned\n";
+			}
+
+		}
+
+	} else {
+		die "ERROR: $PGM: Output file $output_file_returned mysteriously disappeared after converting from $fname\n";
+	}
+} else {
+	die "ERROR: $PGM: Input file $fname mysteriously disappeared after converting to $output_file_returned\n";
+}
+
+exit($exit_success);
+

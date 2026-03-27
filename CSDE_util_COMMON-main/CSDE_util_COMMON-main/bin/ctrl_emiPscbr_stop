@@ -1,0 +1,15 @@
+#!/usr/bin/bash
+
+
+echo ""
+echo -e "-------dsgrid12-------"
+ssh -q dsgrid12 "/ds/CENTOS/common/bin/emi_pscbr_stop"
+echo ""
+echo -e "-------dsgrid12c-------"
+ssh -q dsgrid12c "/ds/CENTOS/common/bin/emi_pscbr_stop"
+echo ""
+echo -e "-------dsgrid13-------"
+ssh -q dsgrid13 "/ds/CENTOS/common/bin/emi_pscbr_stop"
+echo ""
+echo -e "-------dsgrid25-------"
+ssh -q dsgrid25 "/ds/CENTOS/common/bin/emi_pscbr_stop"

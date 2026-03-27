@@ -1,0 +1,11 @@
+#!/usr/bin/bash
+
+#William Hampton - sdtghy6
+
+now=`date`
+
+if [ $(find /ds/env/prod/SSRX_PC/common/log -name "ssrx_pc_txn_*" -size 0 -mtime -0.25 -type f | wc -l) -gt 0 ]; then
+    echo "There are empty file(s) in /ds/env/prod/SSRX_PC/common/log. Please investigate and notify PharmacyReportsAlerts@McKesson.com that Price Check data might be missing from SSRX_PC_TXN_SUMMARY" | mail -s "Report: Found Empty log file in SSRX_PC log" DataServicesNotification@McKesson.com
+	else
+		echo "There are no empty files during this time $now" | mailx -s "SSRX_PC_TXN_SUMMARY Empty Log Checker" william.hampton@McKesson.com
+    fi

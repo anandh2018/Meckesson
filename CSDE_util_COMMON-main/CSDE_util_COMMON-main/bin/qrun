@@ -1,0 +1,317 @@
+#!/usr/bin/perl
+
+# qrun: Run a sequence of commands until all succeed or one fails. Resume with last failed command from prior run.
+# Author: J Hess, RelayHealth
+#
+# Version 1.0: 2/19/2015
+#
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use IO::Handle;
+use BLUELITE::Common qw(email);
+
+autoflush STDOUT 1;
+autoflush STDERR 1;
+
+our $PGM = $0;
+$PGM =~ s/^.*\///;
+
+our ($FAILURE_EMAIL, $CURRENT_CMD, $COMMAND_FILE);
+our $STEP_HISTORY = '';
+our $QUIET = 0;
+our $SILENT = 0;
+
+sub Usage() {
+	print "\n$PGM: Run a sequence of commands until all succeed or one fails. Resume with last failed command from prior run.\n";
+	print "\nUsage: $PGM [-options] command_file\n";
+	print "Options:\n";
+	print "   -reset                Start w/1st command. Do NOT resume from prior run.\n";
+	print "   -success-email list   Send email to list when last command succeeds.\n";
+	print "   -failure-email list   Send email to list when command fails.\n";
+	print "   -step-email    list   Send email to list between each command.\n";
+	print "   -cd dir               cd to dir prior to running commands.\n";
+	print "   -set var=value        Variable substitutions (use %varname% in command_file). May repeat.\n";
+	print "   -novar                Don't check command_file for unused -set variables\n";
+	print "   -quiet                Only write error messages to STDERR\n";
+	print "   -silent               Never write anything to STDERR\n";
+}
+
+sub mylog($) {
+  my $msg = shift;
+
+	if ($SILENT || $QUIET) {
+		return;
+	}
+
+	print STDERR $msg;
+}
+
+
+sub mydie(;$) {
+	my $msg = shift;
+	no warnings 'uninitialized';
+	chomp($msg);
+
+	if (defined($FAILURE_EMAIL)) {
+		my $subject = "$PGM error";
+
+		if (defined($CURRENT_CMD)) {
+			$subject .= " running $CURRENT_CMD";
+		}
+
+		email(to => $FAILURE_EMAIL, subject => $subject, msg => "Command file: $COMMAND_FILE\n\n${STEP_HISTORY}\n\n${msg}");
+	}
+
+	print STDERR "$PGM ERROR: $msg\n" if (! $SILENT);
+	exit(1);
+}
+
+sub trim_line($) {
+	no warnings 'uninitialized';
+  my $line = shift;
+
+	chomp($line);
+
+	# remove leading/trailing whitespace
+	$line =~ s/^\s+//;
+	$line =~ s/\s+$//;
+
+	if (($line =~ /^#/) || ($line eq '')) {
+		return undef;
+	}
+
+	return $line;
+}
+
+
+####### MAIN ######
+
+if (! @ARGV) {
+	Usage();
+	exit(1);
+}
+
+my $reset = 0;
+my ($success_email, $step_email, $cd);
+my @set = ();
+my $novars = 0;
+
+my $ret = GetOptions(
+	'reset' => \$reset,
+	'success-email=s' => \$success_email,
+	'failure-email=s' => \$FAILURE_EMAIL,
+	'step-email=s' => \$step_email,
+	'cd=s' => \$cd,
+	'set=s@' => \@set,
+	'novars' => \$novars,
+	'QUIET' => \$QUIET,
+	'SILENT' => \$SILENT,
+);
+
+if (! $ret) {
+	Usage();
+	exit(1);
+}
+
+# default $FAILURE_EMAIL to $success_email or $step_email
+
+if (! defined($FAILURE_EMAIL)) {
+	if (defined($success_email)) {
+		$FAILURE_EMAIL = $success_email;
+	} elsif (defined($step_email)) {
+		$FAILURE_EMAIL = $step_email;
+	}
+}
+
+if (@ARGV == 0) {
+	mydie("ERROR: Must specify command_file");
+}
+
+if (@ARGV != 1) {
+	mydie("ERROR: Only one command_file allowed");
+}
+
+if ($QUIET && $SILENT) {
+	mydie("-quiet and -silent cannot be used together");
+}
+
+my %vars = ();
+
+# organize and sanity-check -set variables
+
+foreach my $assignment (@set) {
+	if ($assignment =~ /^([A-Z][A-Z0-9_]*)=(.*)$/i) {
+		$vars{$1} = "$2";
+	} else {
+		mydie("invalid -set option of '$assignment' . Correct syntax is 'varname=value'");
+	}
+}
+
+# open command file for reading
+$COMMAND_FILE = shift(@ARGV);
+open(CF, $COMMAND_FILE) || mydie("Could not open $COMMAND_FILE for reading: $!");
+
+# remove ".done" file if -reset requested
+my @done = ();
+my $done_file = "${COMMAND_FILE}.done";
+
+if ($reset && (-e $done_file) && ! unlink($done_file)) {
+	mydie("Reset requested, but cannot remove file $done_file : $!");
+}
+
+# read previously completed commands from ".done" file
+if (-e $done_file) {
+	open(DF, $done_file) || mydie("Could not open $done_file for reading: $!");
+
+	while (<DF>) {
+		chomp;
+		push(@done, $_);
+	}
+
+	close(DF) || mydie("Could not close $done_file: $!");
+}
+
+
+my $command_num = 0;
+my $line_num = 0;
+my @commands = ();
+my $last_successful_cmd;
+my %found_vars = ();
+
+# Load and sanity-check the command-file to @commands array
+
+while (<CF>) {
+	$line_num++;
+	my $cmd = trim_line($_);
+
+	# ignore blank/comment lines
+	next if (! defined($cmd));
+
+	# do variable substitution, if -set used on command-line
+	foreach my $var_key (keys %vars) {
+		if ($cmd =~ s/%$var_key%/$vars{$var_key}/g) {
+			$found_vars{$var_key} = undef;
+		}
+	}
+
+	# make sure all variables, if any, were substituted
+	if ($cmd =~ /%([A-Z][A-Z0-9_]*)%/i) {
+		mydie("Line $line_num in command file $COMMAND_FILE contains variable '$1' that was not specified via -set option");
+	}
+
+	$command_num++;
+
+	# skip if this command was successful in prior run
+
+	if (exists($done[$command_num - 1])) {
+		my $done_cmd = $done[$command_num - 1];
+
+		if ($done_cmd eq $cmd) {
+			$last_successful_cmd = $cmd;
+			next;
+		} else {
+			mydie("Resume command mismatch: Line $line_num in $COMMAND_FILE: [$cmd] Line $command_num in $done_file: [$done_cmd]");
+		}
+	}
+
+	# add command to list to execute
+	push(@commands, $cmd);
+}
+
+close(CF) || mydie("Could not close $COMMAND_FILE: $!");
+
+if (! $novars) {
+	# make sure all -set variables were found in command file
+
+	foreach my $var (keys %vars) {
+		if (! exists($found_vars{$var})) {
+			mydie("No reference to variable %$var% found in command file $COMMAND_FILE . Specify -novar to ignore.");
+		}
+	}
+}
+
+# do nothing and exit successfully if no commands to run
+my $num_commands_to_run = scalar(@commands);
+
+if ($num_commands_to_run == 0) {
+	exit(0);
+}
+
+# display init stats
+my $num_previous_commands = scalar(@done);
+
+if ($num_previous_commands >= 1) {
+	my $total_commands = $num_previous_commands + $num_commands_to_run;
+	mylog("$PGM: Total commands: $total_commands\n");
+	mylog("$PGM: Previous commands completed: $num_previous_commands\n");
+}
+
+mylog("$PGM: Commands to run: $num_commands_to_run\n");
+
+if ($num_previous_commands >= 1) {
+	mylog("$PGM: Last successful command: [$last_successful_cmd]\n");
+	mylog("$PGM: Resuming...\n");
+}
+
+# open ".done" file in append mode
+open(DF, ">> $done_file") || mydie("Could not open $done_file for appending: $!");
+
+select(DF);
+$|++; # turns on autoflush for DF
+select(STDOUT); # change default filehandle back to stdout
+
+# cd to requested dir if -cd used
+if ($cd && ! chdir($cd)) {
+	mydie("Cannot cd to $cd : $!\n");
+}
+
+my $start_time = time;
+my $email_step_txt = '';
+
+
+# Main command execution loop
+
+foreach my $cmd (@commands) {
+	mylog("$PGM: Running: [$cmd]\n");
+
+	$email_step_txt .= "\nRunning:\n$cmd";
+	$CURRENT_CMD = $cmd;
+	$CURRENT_CMD =~ s/\s.*$//;
+
+	if (defined($step_email)) {
+		email(to => $step_email, subject => "$PGM step: $CURRENT_CMD", msg => "Command file: ${COMMAND_FILE}\n\n${email_step_txt}");
+	}
+
+	my $time0 = time;
+	my $ret = system($cmd);
+	my $elapsed_seconds = time - $time0;
+
+	if ($ret == 0) {
+		mylog("$PGM: Completed in $elapsed_seconds seconds: [$cmd]\n");
+		print DF "$cmd\n" || mydie("Could not append successful command to $done_file due to $! . Command: [$cmd]");
+
+		$email_step_txt = "Completed in $elapsed_seconds seconds: [$cmd]\n";
+		$STEP_HISTORY .= $email_step_txt;
+	} else {
+		my $eight_bit_status = $ret >> 8;
+		mydie("Failed with exit status $eight_bit_status ($ret) in $elapsed_seconds seconds: [$cmd]");
+	}
+
+	$CURRENT_CMD = undef;
+}
+
+# get elapsed time, close ".done" file, and send email (if requested)
+
+my $total_elapsed_seconds = time - $start_time;
+
+close(DF) || mydie("Could not close $done_file");
+
+mylog("$PGM: Time to successfully complete these commands: $total_elapsed_seconds seconds\n");
+
+if (defined($success_email)) {
+	email(to => $success_email, subject => "$PGM complete: $COMMAND_FILE", msg => "Command file: ${COMMAND_FILE}\n\n${STEP_HISTORY}\n\nTime to successfully complete all commands in this run: $total_elapsed_seconds seconds\n");
+}
+

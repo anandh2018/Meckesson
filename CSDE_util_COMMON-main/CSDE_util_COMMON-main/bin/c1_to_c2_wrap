@@ -1,0 +1,155 @@
+#!/usr/bin/perl
+
+use Getopt::Std;
+
+$PGM = $0;
+$EXIT_SUCCESS = 0;
+
+if (! defined($ARGV[0])) {
+	print "Usage: $PGM -d output_dir | -t output_dir_top -h dest_host [-c] [-r modtime_ref_file] input_file
+	-c	Do not generate c2 if it already exists and is newer than input_file
+	-r	Set modification time of generated c2 file to be same as modtime_ref_file\n";
+}
+
+getopts('d:t:h:cdr:');
+
+if (defined($opt_r)) {
+	$modtime_ref_file = $opt_r;
+
+	if (! -f $modtime_ref_file) {
+		print STDERR "$PGM: ERROR: Mod time reference file $modtime_ref_file does not exist!\n";
+		exit(1);
+	}
+}
+
+if (defined($opt_d)) {
+	$DEBUG = 1;
+}
+
+if (defined($opt_c)) {
+	$skip_if_newer = 1;
+}
+
+if (defined($opt_h)) {
+	$host = $opt_h;
+} else {
+	print STDERR "$PGM: ERROR: Must specify remote_host via -h option\n";
+	exit(1);
+}
+
+$input_file = $ARGV[0];
+
+if (length($input_file) == 0) {
+	print STDERR "$PGM: ERROR: No input file specified!\n";
+	exit(1);
+}
+
+if (system("ls $input_file > /dev/null 2>&1") != 0) {
+	print STDERR "$PGM: ERROR: Input file $input_file does not exist!\n";
+	exit(1);
+}
+
+$input_file_basename = $input_file;
+$input_file_basename =~ s|^.*/([^/]+)$|$1|;
+
+if ($input_file_basename =~ /^(NSF|UB)e_([A-Z]+)_([0-9]+)(.*)$/i) {
+	($type, $source, $date, $suffix) = ($1, $2, $3, $4);
+	$output_file_basename = "${type}e2_${source}_${date}${suffix}";
+} else {
+	print STDERR "$PGM: ERROR: Cannot construct output file name from input file name $input_file\n";
+	exit(1);
+}
+
+if (defined($opt_d)) {
+	$output_dir = $opt_d;
+} elsif (defined($opt_t)) {
+	$output_dir_top = $opt_t;
+
+	$month = substr($date, 0, 6);
+
+	if (length($month) != 6) {
+		print STDERR "$PGM: ERROR: determine month for input file $input_file\n";
+		exit(1);
+	}
+
+
+	$output_dir = "${output_dir_top}/${month}";
+
+	#if ( (! -d $output_dir) && (! -l $output_dir)) {
+	#	system('mkdir', $output_dir);
+	#}
+}
+
+if ( (! -d $output_dir) && (! -l $output_dir) ) {
+	print STDERR "$PGM: ERROR: The output directory $output_dir does not exist!\n";
+	exit(1);
+}
+
+sub my_exit() {
+
+	if ((-f $output_file) and (-f $modtime_ref_file)) {
+		system('touch', '-c', '-r', $modtime_ref_file, $output_file);
+	}
+
+	exit($_[0]);
+}
+
+$output_file = "$output_dir/$output_file_basename";
+
+if (-f $output_file) {
+	if ($skip_if_newer) {
+		($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$file_size,$atime,$outfile_mtime,$ctime,$blksize,$blocks) = stat($output_file);
+		($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$file_size,$atime,$inputfile_mtime,$ctime,$blksize,$blocks) = stat($input_file);
+
+		if ($outfile_mtime >= $inputfile_mtime) {
+			if ($DEBUG) {
+				print STDERR "debug: existing output file $output_file is newer or same age as input file $input_file . Skipping c2 generation\n";
+			}
+
+			exit($EXIT_SUCCESS);
+		} else {
+			print STDERR "Regenerating older existing c2 file $output_file\n";
+		}
+	} else {
+		if ($DEBUG) {
+			print STDERR "debug: existing file $output_file will be overwritten\n";
+		}
+	}
+} else {
+	if ($DEBUG) {
+		print STDERR "debug: new c2 file will be generated: $output_file\n";
+	}
+}
+
+if (! open(C2, "c1_to_c2 -c $input_file |")) {
+	print STDERR "$PGM: ERROR: Unable to start c1_to_c2 process on input file $input_file: $!\n";
+	exit(1);
+}
+
+if (! open(OUT, "> $output_file")) {
+	print STDERR "$PGM: ERROR: Unable to create output file $output_file for input file $input_file: $!\n";
+	exit(1);
+}
+
+while (<C2>) {
+	if (! print OUT $_) {
+		print STDERR "$PGM: ERROR: Unable to write line to $output_file for input file $input_file: $!\n";
+		&my_exit(1);
+	}
+}
+
+
+if (! close(C2)) {
+	print STDERR "$PGM: ERROR: Unable to close or read from c1_to_c2 process on input file $input_file: $!\n";
+	&my_exit(1);
+}
+
+if (! close(OUT)) {
+	print STDERR "$PGM: ERROR: Unable to close output file $output_file for input file $input_file: $!\n";
+	&my_exit(1);
+}
+
+print STDERR "c2 file generated: $output_file\n";
+
+&my_exit($EXIT_SUCCESS);
+

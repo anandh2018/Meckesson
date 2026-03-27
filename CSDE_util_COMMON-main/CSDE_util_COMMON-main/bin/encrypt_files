@@ -1,0 +1,300 @@
+#!/usr/bin/perl
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#
+# encrypt_files - Submit request to have a file or files encrypted to your
+#                 public key for analysis.
+#
+# 20160928 - Michael Carey <michael.carey@mckesson.com>
+#
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+use strict;
+use warnings;
+use DateTime;
+use IO::File;
+use File::Spec;
+use File::stat;
+use Getopt::Long;
+use Term::ReadLine;
+use Mail::SendEasy;
+
+# todo: set in common profile during deployment for prod (/ds/env/prod/ENREQ)
+# $ENV{ENREQDIR} = '/ds/env/qaqc/ENREQ';
+
+if ( !$ENV{ENREQDIR} ) {
+	print "The environment variable ENREQDIR must be set to the root application\n";
+	print "directory.  (perhaps /ds/env/prod/ENREQ).\n";
+	exit 1;
+}
+
+my $help       = '';
+my $noconf     = '';
+my $opt_result = GetOptions(
+	'noconf' => \$noconf,
+	'help'   => \$help,
+	);
+
+if ($help) {
+	show_help();
+	exit 0;
+}
+
+if ( !@ARGV ) {
+	print "ERROR: You must specify files to process\n";
+	show_help();
+	exit 1;
+}
+
+my $qdir     = $ENV{ENREQDIR} . '/common/incoming';
+my $udb      = $ENV{ENREQDIR} . '/common/etc/users.txt';
+my $ublfile  = $ENV{ENREQDIR} . '/common/etc/user_blist.txt';
+my $emblfile = $ENV{ENREQDIR} . '/common/etc/email_blist.txt';
+my $user     = getpwuid($>);                                     # get current user name
+
+if ( !$user ) {
+	print "ERROR: Could not determine effective user id\n";
+	exit 1;
+}
+
+# username cannot be from a blacklist
+my $fh = IO::File->new( $ublfile, O_RDONLY ) or die("opening $ublfile, $!");
+my $usermatch = 0;
+while ( my $line = <$fh> ) {
+	$line =~ s/\r|\n//g;
+	if ( !$line )             { next; }                          # skip blank lines
+	if ( $line =~ m/^\s*#+/ ) { next; }                          # skip comments
+	if ( $user eq $line ) { $usermatch = 1; }
+}
+if ( $fh->error() ) { die("reading $ublfile, $!"); }
+$fh->close() or die "closing $ublfile, $!";
+
+if ($usermatch) {
+	print "ERROR: Current user is prohibited from using this application.\n";
+	print "See Data Services.\n";
+	exit 1;
+}
+
+# look for user in file, get associated email address
+my $email = '';
+$fh = IO::File->new( $udb, O_RDONLY ) or die("opening $udb, $!");
+while ( my $line = <$fh> ) {
+	$line =~ s/\r|\n//g;
+	if ( !$line )             { next; }    # skip blank lines
+	if ( $line =~ m/^\s*#+/ ) { next; }    # skip comments
+	my ( $u, $e ) = split( /\|/, $line );
+	if ( $user eq $u ) {
+		$email = $e;
+		last;
+	}
+}
+if ( $fh->error() ) { die("reading $udb, $!"); }
+$fh->close() or die "closing $udb, $!";
+
+if ( !$email ) {
+	print "ERROR: You are not listed as a user for this application.\n";
+	print "See Data Services to be added.\n";
+	exit 1;
+}
+
+# associated email address cannot be from a blacklist
+$fh = IO::File->new( $emblfile, O_RDONLY ) or die("opening $emblfile, $!");
+my $emailmatch = 0;
+while ( my $line = <$fh> ) {
+	$line =~ s/\r|\n//g;
+	if ( !$line )             { next; }    # skip blank lines
+	if ( $line =~ m/^\s*#+/ ) { next; }    # skip comments
+	$line = lc $line;
+	if ( $email eq $line ) { $emailmatch = 1; }
+}
+if ( $fh->error() ) { die("reading $emblfile, $!"); }
+$fh->close() or die "closing $emblfile, $!";
+
+if ($emailmatch) {
+	print "ERROR: Your associated email address is not allowed for this application.\n";
+	print "Your user record has been incorrectly added.  See Data Services.\n";
+	exit 1;
+}
+
+# validate email address, must be mckesson.com, relayhealth.com
+$email = lc $email;
+if ( $email !~ m/^([a-zA-Z0-9_\-\.]+)\@(mckesson\.com|relayhealth\.com)$/ ) {
+	print "ERROR: Associated email address must be \@mckesson.com, \@relayhealth.com.\n";
+	print "Your user record has been incorrectly added.  See Data Services.\n";
+	exit 1;
+}
+
+# iterate
+my %oklist   = ();
+my @faillist = ();
+foreach my $file (@ARGV) {
+	$file =~ s/\r|\n//g;
+
+	# if relative path, prepend working directory
+	if ( $file !~ m/^\// ) { $file = $ENV{PWD} . "/$file"; }
+
+	# we don't want duplicates
+	if ( exists $oklist{$file} ) {
+		push( @faillist, {file => $file, reason => 'file is a duplicate'} );
+		next;
+	}
+
+	# must have a .pgp extension
+	if ( $file !~ m/\.pgp$/ ) {
+		push( @faillist, {file => $file, reason => 'file has no pgp extension'} );
+		next;
+	}
+
+	# must be readable
+	if ( !-r $file ) {
+		push( @faillist, {file => $file, reason => 'file is not readable'} );
+		next;
+	}
+
+	# be a plain file
+	if ( !-f $file ) {
+		push( @faillist, {file => $file, reason => 'file is not a plain file'} );
+		next;
+	}
+
+	# must not be a directory
+	if ( -d $file ) {
+		push( @faillist, {file => $file, reason => 'this is a directory'} );
+		next;
+	}
+
+	# the file must not itself be a link
+	if ( -l $file ) {
+		push( @faillist, {file => $file, reason => 'this is a link'} );
+		next;
+	}
+
+	# must not be zero length
+	if ( -z $file ) {
+		push( @faillist, {file => $file, reason => 'file is zero length'} );
+		next;
+	}
+
+	# must not be a named pipe
+	if ( -p $file ) {
+		push( @faillist, {file => $file, reason => 'this is a named pipe'} );
+		next;
+	}
+
+	# must not be a socket
+	if ( -S $file ) {
+		push( @faillist, {file => $file, reason => 'this is a socket'} );
+		next;
+	}
+
+	# must not be a block special file
+	if ( -b $file ) {
+		push( @faillist, {file => $file, reason => 'this is a block special file'} );
+		next;
+	}
+
+	# must not be a character special file
+	if ( -c $file ) {
+		push( @faillist, {file => $file, reason => 'this is a character special file'} );
+		next;
+	}
+
+	# must have group read permission bit set
+	my $fstat = stat($file);
+	if ( !( $fstat->mode & 0040 ) ) {
+		push( @faillist, {file => $file, reason => 'group read permission is not set'} );
+		next;
+	}
+
+	$oklist{$file} = '';
+} ## end foreach my $file (@ARGV)
+
+# display summary of request
+foreach my $file ( sort keys %oklist ) {
+	print "file: $file\n";
+}
+if ( scalar @faillist ) {
+	foreach my $file ( sort @faillist ) {
+		print "skipped: " . $file->{file} . "\n\t=> " . $file->{reason} . "\n";
+	}
+}
+
+my $numfiles = scalar( keys %oklist );
+print "Total number of valid files for submission: $numfiles\n";
+if ( $numfiles > 100 ) {
+	print "ERROR: You may only submit up to 100 files per request.\n";
+	show_help();
+	exit 1;
+}
+if ( $numfiles < 1 ) {
+	print "WARNING: No files selected.\n";
+	show_help();
+	exit 0;
+}
+
+# prompt the user to create request
+if ( !$noconf ) {
+	my $term     = Term::ReadLine->new('Get Answer');
+	my $response = '';
+	do {
+		$response = $term->readline('Submit Request? [y/n]: ');
+		$response = lc $response;
+	} while ( defined $response && $response !~ m/^y$|^yes$|^no$|^n$/ );
+	if ( !defined $response || $response =~ m/^no$|^n$/ ) {
+		print "Request cancelled by user.\n";
+		exit 0;
+	}
+} ## end if ( !$noconf )
+
+# formulate request
+my $time     = DateTime->now->set_time_zone('America/New_York')->strftime('%Y%m%d%H%M%S');
+my $username = getpwuid($>);
+my $reqfname = File::Spec->catfile( $qdir, "$time-$username.txt" );
+my $request  = '';
+foreach my $file ( sort keys %oklist ) {
+	$request .= "$file\n";
+}
+
+# write request file
+$fh = IO::File->new( $reqfname, O_WRONLY | O_CREAT | O_EXCL | O_APPEND )
+  or die("opening $reqfname, $!");
+print $fh $request;
+if ( $fh->error() ) { die "reading $reqfname, $!"; }
+$fh->close() or die("closing $reqfname, $!");
+
+# send email copy of request to user
+my $m = Mail::SendEasy->new( smtp => 'localhost' );
+if ( defined $m ) {
+	my $s = $m->send(
+		from       => 'dataservicesnotification@relayhealth.com',
+		from_title => 'Data Services',
+		to         => $email,
+		subject    => 'Encryption request submitted',
+		msg        => $request,
+		);
+	if ( !$s ) {
+		print $m->error . "\n";
+		print "Problem encountered while sending email copy of request.\n";
+		print "You will not receive a copy of this request via email.\n";
+	}
+} else {
+	print "Could not connect to local SMTP server.\n";
+	print "You will not receive a copy of this request via email.\n";
+}
+
+print "Request submitted!\n";
+exit 0;
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+sub show_help {
+	print q{
+encrypt_files [-noconf] file1 [file2, *.pgp, 201608*.pgp, ...]
+
+Submit request to have a file or files encrypted to your public key for
+analysis.
+
+ -noconf   Do not prompt before submission.
+};
+	print "\n";
+}

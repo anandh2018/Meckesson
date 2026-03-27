@@ -1,0 +1,62 @@
+#!/usr/bin/perl
+
+use BLUELITE::WorkUnit;
+use Getopt::Std;
+
+# Usage: gen_wu -t UB|RX|NSF -v e|e2|r|c [-s source_list] [-e] begin_month [end_month]
+
+if (! ($#ARGV >= 0)) {
+	print "Usage: gen_wu -t data_type [-v version_list] [-s source_list] [-e] begin_date [end_date]
+-e      Do not exit with error status if no files found
+- syntax for dates is YYYYMM or YYYYMMDD
+- source_list is comma-seperated list of sources.\n";
+	exit(1);
+}
+
+getopts('s:t:v:ew');
+
+$wu = BLUELITE::WorkUnit->new();
+
+if (defined($opt_t)) {
+	$wu->data_type($opt_t);
+}
+
+if (defined($opt_v)) {
+	$wu->data_version($opt_v);
+}
+
+if (defined($opt_s)) {
+	$wu->system(split(',', $opt_s));
+}
+
+if (defined($ARGV[0])) {
+	$wu->begin_date($ARGV[0]);
+}
+
+if (defined($ARGV[1])) {
+	$wu->end_date($ARGV[1]);
+}
+
+if (defined($opt_e)) {
+  $error_on_no_files = 0;
+} else {
+  $error_on_no_files = 1;
+}
+
+$workunits = $wu->workunits;
+
+if (defined($workunits)) {
+	print join("\n", @{$workunits});
+
+	if (scalar(@{$workunits}) > 0) {
+		print "\n";
+	}
+
+	exit(0);
+} elsif ($error_on_no_files) {
+	print STDERR "gen_wu: no workunits generated\n";
+	exit(1);
+} else {
+	exit(0);
+}
+

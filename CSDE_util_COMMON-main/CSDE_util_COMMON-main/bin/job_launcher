@@ -1,0 +1,469 @@
+#!/usr/bin/perl
+
+#use lib '/ds/development/Job/dev/blib/lib';
+
+# job_launcher: Launch job workers via BLUELITE::Job
+#
+# Author(s): Meenu Narang, John Hess		RelayHealth
+#
+# Version history:
+# Version 1.0 - 9/18/2007
+#
+# Version 1.4 - 4/16/2010
+# - Add -post-dates command-line option
+#
+# Version 1.4 - 6/22/2010 (aligned version to match that of BLUELITE::Job package)
+# - Updated Usage display to reflect the fact that -app-dir and -worker-script are optional
+#
+# Version 1.5 - 7/26/2010
+# - Removed 'uninitialized value' warning if we can't get the current date via date command in setup_logging function
+#
+# Version 2.3 - 12/8/2010
+# - If still_running_status returned by launcher is true, launches will not be attempted for any remaining apps.
+# This was done to avoid an app_id launcher ordering issue when using -group-id and minimum_processes is set in job_config.
+#
+# - Aligned version with Job pkg.
+#
+# Version 2.61 - 2/2/2011
+# - Fixed bug in launcher where apps in a group_id could be indefinitely prevented from launching new workers
+# under the following scenario:
+# 1) Launcher 1 launches via -group-id
+# 2) app_id 1 completes its workers
+# 3) app_id 2 workers begin, with some dying without signal handler kicking in (e.g. "out of memory", "kill -9", etc).
+#    These workers are left in 'PROCESSING' state.
+# 4) Launcher 1 exits
+# 5) Launcher 2 launches same -group-id
+# 6) No workers are launched due to "# workers already in PROCESSING state", where # is at least the configured minimum.
+#
+# The above bug was introduced another bug fix (group_id_order issue) in version 2.3, because the launcher no longer
+# continued to try subsequent app_ids in the group after passing the "min_processes running" check. This fix moved the
+# detect_long_work_units call to be moved from the launch method to the job_launcher script.
+#
+# Version 2.7 - 3/28/2011
+#
+# - Added -worker-opts command line option
+# - Removed -worker-script command line option
+#
+# Version 2.8 - 4/26/2011
+#
+# - Added support for flexible date specifications in -post-date option (ranges, months, etc)
+# - Added -ds-format command line option (e.g. so we can run work units as post dates)
+# - Fixed problem that caused logging to screen when -group-id used.
+# - Added -log-dir command line option, plus removal of main log file on normal exit if empty.
+#
+# Version 3.0 5/x/2011
+# - Added -log-level command line option
+# - Changed default logging level from INFO to DEBUG
+#
+# Version 3.3 7/20/2011
+# - Added call to notify_late_delivery method so that notifications will go out even if "still running" result
+#   has been encountered.
+#
+# Version 4.3 10/24/2011
+# - Fixed bug that failed to remove main logfile at end of successful execution. This resulted in lots of junk log
+#   files in bin dir of apps that used preprocessor.
+# - For main logfile, look for log subdir to write to in current or parent dir before resorting to current dir.
+# - Randomize job launch order if files are processed as they stream in and min_processes setting is used.
+#   This effectively ignores the group_id_order setting to avoid app starvation.
+# - Added -config-group-id command line parameter, which allows config settings to be temporarily obtained from the
+# specified group instead of from the job_config table.
+#
+# Version 5.0 3/5/2014
+# - Changed default logging level from DEBUG to INFO
+# - Added -skip-pre-launch-cmd command line option
+#
+# Version 5.1 5/23/2014
+# - Enhanced the way worker_script is checked for existence since that parameter will sometimes be used as
+# a command line instead of just the name of the worker script (e.g. due to use of /ds/bin/run_env.sh)
+#
+# Version 6.0 - 10/31/2014
+# - Added support for "autohoc" requests (i.e. automated on-demand ad-hoc processing).
+#
+# Version 6.4 - 12/01/2015
+# - Skip app from $GROUP_ID if the app is no longer in the $GROUP_ID. Minimizes delay when attempting to
+# stop processing by removing it from a group.
+#
+
+use Getopt::Long;
+use BLUELITE::Job;
+use BLUELITE::Logger;
+use BLUELITE::Mail qw(email);
+use File::Spec;
+use File::PathConvert qw(rel2abs);
+use Data::Dumper;
+use List::Util qw(min shuffle);
+
+use strict;
+use warnings;
+
+our ($APP_ID, $GROUP_ID);
+our $SCREEN_ONLY_LOGGING = 0;
+
+my @dir_parts = File::Spec->splitdir(rel2abs($0));
+our $PGM = pop(@dir_parts);
+
+our ($FAILURE_EMAIL, $LOGGER, $STATS_EMAIL, $REQUEST_ID);
+our $SMTP_SERVER = $ENV{DEFAULT_SMTP_SERVER};
+
+our ($APP_DIR, $logfile);
+our $LOGGING_LEVEL = 'INFO';
+
+sub mydie($) {
+	my $message = shift;
+
+	if (defined($message) && (length($message) >= 1)) {
+		$message .= "\n";
+
+		if (defined($LOGGER)) {
+			$LOGGER->error($message);
+		} else {
+			print STDERR $message;
+		}
+	}
+
+	if (defined($FAILURE_EMAIL)) {
+
+		if ((! defined($message)) || (length($message) == 0)) {
+			$message = "No error message available\n";
+		}
+
+    email(
+      to => $FAILURE_EMAIL,
+      subject => "$APP_ID launcher process FAILED",
+      msg => $message
+    );
+	}
+
+	exit(1);
+}
+
+
+sub Usage() {
+	print "$PGM: Launch BLUELITE::Job worker processes\n\n";
+	print "Usage: $PGM [-options] -app-id i\n";
+  print "OR\n";
+	print "Usage: $PGM [-options] -group-id i\n";
+  print " Parameters\n";
+  print "  -group-id i                  Group id as recorded in JOB_CONFIG table\n";
+  print "  -app-id i                    Application id as recorded in JOB_CONFIG table\n";
+	print " Options:\n";
+  print "  -request-id #                Request ID to process from job_queue table\n";
+  print "  -app-dir d                   Top-level application directory (Can be passed with app-id only)\n";
+  print "  -worker-opts 's'             Extra command line options to pass to worker command\n";
+	print "  -keep-log                    Keep log file (removed if no warnings or errors encountered)\n";
+	print "  -default-failure-email list  Send status to list addresses upon failure (does not override app default)\n";
+	print "  -stats-email list            Send launch stats to list addresses (unless nothing was launched)\n";
+	print "  -log-dir dir                 Log to dir (mostly for non-app-specific logging)\n";
+	print "  -log-level L                 Logging level (DEBUG,INFO,WARN,ERROR,FATAL)\n";
+	print "  -ds-format fmt               Change data_source_format for workers to fmt (e.g. POSTDATE)\n";
+	print "  -config-group-id id          Get default group config params from group_id id\n";
+	print "  -post-date pd_spec           Only launch workers for these post dates\n\n";
+  print "Note: pd_spec may be a comma-separated list of any combination of the following syntaxes:\n";
+  print "  YYYYMMDD\n";
+  print "  YYYYMMDD-YYYYMMDD\n";
+  print "  YYYYMM\n";
+  print "  YYYYMM-YYYYMM\n";
+  print "  YYYYMMDD-YYYYMM\n";
+  print "  YYYYMM-YYYYMMDD\n";
+
+}
+
+
+sub setup_logging() {
+    my ( $log_dir, $orig_log_dir);
+
+    $log_dir = "$APP_DIR/log";
+    $orig_log_dir = $log_dir;
+    
+    if (! -d $log_dir) {
+        $log_dir = '.';
+    }
+    
+    my $dt = `date +%Y%m%d`;
+
+		if (defined($dt)) {
+			chop($dt);
+		} else {
+			$dt = '';
+		}
+
+    $logfile = "$log_dir/launcher.$APP_ID.$dt.$$.log";
+    
+    # Set the options for logger
+    my @screen_options;
+    
+    if ((-t 1) || $SCREEN_ONLY_LOGGING) {
+			initialize_logging(screen_threshold => $LOGGING_LEVEL, screen_only => 1, force => 1);
+    } else {
+			initialize_logging(screen_threshold => 'OFF', file_threshold => $LOGGING_LEVEL, logfile => $logfile, force => 1);
+    }
+    
+    # Intialize the logger
+    
+    $LOGGER = get_logger;
+    $LOGGER->warn("log directory $orig_log_dir does not exist. Logging to current directory instead") if ((! $SCREEN_ONLY_LOGGING) && ($log_dir eq '.'));
+}
+
+
+sub worker_script($) {
+  my @command_line = split(/\s+/, shift);
+
+	if (@command_line) {
+		return $command_line[0];
+	} else {
+		return undef;
+	}
+}
+
+
+my $keep_log = 0;
+
+if (scalar(@ARGV) == 0) {
+  Usage;
+  exit(1);
+}
+
+my ($worker_command, $worker_script, $post_dates, @worker_opts, $data_source_format, $log_dir, $config_group_id);
+my $skip_pre_launch_cmd = 0;
+
+my $ret = GetOptions(
+	'keep-log' => \$keep_log,
+	'screen-only' => \$SCREEN_ONLY_LOGGING,
+	'default-failure-email=s' => \$FAILURE_EMAIL,
+	'stats-email=s' => \$STATS_EMAIL,
+	'group-id=s' => \$GROUP_ID,
+	'app-id=s' => \$APP_ID,
+	'request-id=i' => \$REQUEST_ID,
+	'app-dir=s' => \$APP_DIR,
+	'post-date=s' => \$post_dates,
+	'ds-format=s' => \$data_source_format,
+	'worker-opts=s@' => \@worker_opts,
+	'config-group-id=s' => \$config_group_id,
+	'log-dir=s' => \$log_dir,
+	'log-level=s' => \$LOGGING_LEVEL,
+	'skip-pre-launch-cmd' => \$skip_pre_launch_cmd
+);
+
+mydie "ERROR: $PGM: Invalid options\n" if ((! $ret) || (scalar(@ARGV) >= 1));
+
+mydie "ERROR: app-id or group-id must be specified!\n" if ( ! defined($APP_ID) && ! defined($GROUP_ID));
+mydie "ERROR: Both app-id and group-id can not be specified!\n" if ( defined($APP_ID) && defined($GROUP_ID));
+mydie "ERROR: app-dir can only be specified with app-id!\n" if ( defined($APP_DIR) && defined($GROUP_ID));
+mydie "ERROR: config-group-id cannot be used with group-id!\n" if (defined($config_group_id) && defined($GROUP_ID));
+mydie "ERROR: Both request-id and group-id can not be specified!\n" if ( defined($GROUP_ID) && defined($REQUEST_ID));
+mydie "ERROR: The post-date must be specified when using request-id!\n" if (defined($REQUEST_ID) && ! defined($post_dates));
+
+my (@job_list, $group_id, $job_list, @launch_opts);
+
+# Set the options for logger
+my $id;
+
+if (defined($GROUP_ID)) {
+	$id = $GROUP_ID;
+} else {
+	$id = $APP_ID;
+}
+
+my $screen_threshold;
+
+if (-t 1) {
+	$screen_threshold = $LOGGING_LEVEL;
+} else {
+	$screen_threshold = 'OFF';
+}
+
+if (! defined($log_dir)) {
+	foreach my $ld ('log', '../log', '.') {
+		if (-d $ld) {
+			$log_dir = $ld;
+			last;
+		}
+	}
+}
+
+my $main_logfile = "$log_dir/launcher.$id.$$.log";
+
+if ($SCREEN_ONLY_LOGGING) {
+	initialize_logging(screen_threshold => $LOGGING_LEVEL, force => 1, screen_only => 1);
+} else {
+	initialize_logging(screen_threshold => $screen_threshold, file_threshold => $LOGGING_LEVEL, logfile => $main_logfile, force => 1);
+}
+
+my @launcher_opts = (is_launcher => 1);
+push(@launcher_opts, config_group_id => $config_group_id) if (defined($config_group_id));
+push(@launcher_opts, request_id => $REQUEST_ID) if (defined($REQUEST_ID));
+
+if (defined $APP_ID) {
+   my $job = BLUELITE::Job->new(APP_ID => $APP_ID, @launcher_opts);
+   mydie "ERROR: Unable to obtain a BLUELITE::Job object for APP_ID = '$APP_ID' : $@\n" if (! defined($job));
+
+   @job_list = $job;
+
+	if (defined($APP_DIR)) {
+		$job->app_dir($APP_DIR);
+	}
+
+} else {
+   @job_list = BLUELITE::Job->new(GROUP_ID => $GROUP_ID, @launcher_opts);
+
+   if (scalar(@job_list) == 0) {
+       mydie "ERROR: HERE Unable to obtain any BLUELITE::Job objects for GROUP_ID = '$GROUP_ID' : $@\n";
+   }
+
+	# Randomize job launch order if files are processed as they stream in and min_processes setting is used.
+	# This effectively ignores the group_id_order setting to avoid app starvation.
+
+	my $post_date_complete = 0;
+	my $min_processes_used = 0;
+
+	foreach my $job (@job_list) {
+		$post_date_complete = 1 if ($job->get_post_date_complete =~ /^\s*Y\s*/i);
+		$min_processes_used = 1 if ($job->min_processes >= 2);
+	}
+
+	@job_list = shuffle(@job_list) if ((! $post_date_complete) && $min_processes_used);
+}
+
+my $begin_post_date;
+my @long_work_units_opts = ();
+
+if (defined($post_dates)) {
+	my $post_date_list = BLUELITE::Job->post_date_list($post_dates);
+
+	mydie "ERROR: Could not decipher post date of '$post_dates'\n" if (! defined($post_date_list));
+
+  $begin_post_date = min(@{$post_date_list});
+
+	push(@launch_opts, post_date => $post_date_list);
+	push(@long_work_units_opts, begin_post_date => $begin_post_date);
+}
+
+my @job_stats = ();
+my $stats_email_list;
+my $num_workers_launched = 0;
+my $total_stats;
+my $encountered_still_running = 0;
+
+for my $job (@job_list) {
+
+		# skip app from $GROUP_ID if the app is no longer in the $GROUP_ID
+		if (defined($GROUP_ID)) {
+			my $app_current_group = $job->current_group;
+
+			if (! defined($app_current_group) || ($GROUP_ID ne $app_current_group)) {
+				next;
+			}
+		}
+
+    $FAILURE_EMAIL = $job->failure_email if (defined($job) && defined($job->failure_email));
+    $APP_ID = $job->app_id;
+
+    $APP_DIR = $job->app_dir;
+    mydie "ERROR: The mandatory -app-dir parameter was not passed or defined in JOB_CONFIG table for application $APP_ID!\n" if (! defined($APP_DIR));
+    mydie "ERROR: Application directory $APP_DIR does not exist!\n" if (! -e $APP_DIR);
+    mydie "ERROR: Application directory $APP_DIR is not a directory!\n" if (! -d $APP_DIR);
+
+    $worker_command = $job->worker_script;
+
+    mydie "ERROR: The mandatory -worker-script parameter was not defined in JOB_CONFIG table for application $APP_ID!\n" if (! defined($worker_command));
+
+		$worker_script = worker_script($worker_command);
+
+    mydie "ERROR: worker script $worker_script does not exist!\n" if (! -e $worker_script);
+    mydie "ERROR: worker script $worker_script is a directory!\n" if (-d $worker_script);
+    mydie "ERROR: worker script $worker_script is not executable!\n" if (! -x $worker_script);
+
+    setup_logging;
+
+		# Detect work units which have been processing too long.
+		# This also kills workers running too long, which must be attempted for all app_ids in
+		# the group, even if we stop attempting to launch (due to "still running" status).
+
+		my $num_workers_running_long = $job->detect_long_work_units(@long_work_units_opts);
+
+		# Detect late deliveries.
+		# This is performed for all app_ids in the group, even if we stop attempting to launch
+		# (due to "still running" status).
+
+		my $late_delivery = $job->notify_late_delivery(@long_work_units_opts);
+
+		# don't launch another app_id if previous one encountered "still running" result
+
+		if ($encountered_still_running) {
+			unlink($logfile) if (defined($logfile) && (! $keep_log));
+			next;
+		}
+ 
+		push(@launch_opts, log_file => $logfile) if (! $SCREEN_ONLY_LOGGING);
+#		push(@launch_opts, log_file => 'screen.log') if ($SCREEN_ONLY_LOGGING);
+		push(@launch_opts, worker_opts => \@worker_opts) if (scalar(@worker_opts));
+		push(@launch_opts, skip_pre_launch_cmd => $skip_pre_launch_cmd) if ($skip_pre_launch_cmd);
+
+		$job->data_source_format($data_source_format) if (defined($data_source_format));
+
+    my $launch_result = $job->launch(@launch_opts);
+
+    if ( defined($launch_result)) {
+
+			if ($launch_result->{still_running_status}) {
+				# This prevents the launcher from continuing while another launcher still has control, which avoids
+				# a launch order issue when using minimum processes and group_id_order settings.
+
+				$LOGGER->warn("Minimum workers are still running or queued. This launcher will not attempt any additional apps.");
+				unlink($logfile) if (defined($logfile) && (! $keep_log) && ($num_workers_running_long == 0));
+				$encountered_still_running = 1;
+				next;
+			}
+
+			$num_workers_launched += $launch_result->{num_workers_launched};
+			push(@job_stats, { app_id => $job->app_id, %{$launch_result} });
+
+			map { $total_stats->{$_} += $launch_result->{$_} if ($launch_result->{$_} =~ /^\d+$/) } (keys %{$launch_result});
+
+       if ( ($launch_result->{num_workers_failed} == 0)
+             && ($num_workers_running_long == 0) && ($launch_result->{num_workers_dequeued} == 0)
+    				 && ($launch_result->{prun2_return_status} == 0)
+    			) {
+           unlink($logfile) if (defined($logfile) && ! $keep_log);
+        }
+    } else {
+        $LOGGER->fatal("Error in launching the workers. Please see the logfile $logfile for details");
+    }
+}
+
+if (defined($STATS_EMAIL) && ($num_workers_launched > 0)) {
+	my $msg = '';
+	$msg = "$GROUP_ID " if (defined($GROUP_ID));
+
+	$msg .= "worker launch stats";
+	my $subject = $msg;
+
+	$msg .= ":\n";
+
+	foreach my $job_stat (@job_stats) {
+		$msg .= "\n" . $job_stat->{app_id} . ': ';
+		delete $job_stat->{app_id};
+
+		$msg .= join(', ', map { "$_ = " . $job_stat->{$_} } (sort keys %{$job_stat}));
+	}
+
+	if (scalar(@job_stats) >= 1) {
+		$msg .= "\n\nTotals: ";
+		$msg .= join(', ', map { "$_ = " . $total_stats->{$_} } (sort keys %{$total_stats}));
+	}
+
+	email(
+		to => $STATS_EMAIL,
+		subject => $subject,
+		msg => $msg
+	);
+}
+
+unlink($main_logfile);
+
+if ($encountered_still_running) {
+	exit(99);
+} else {
+	exit(0);
+}
+

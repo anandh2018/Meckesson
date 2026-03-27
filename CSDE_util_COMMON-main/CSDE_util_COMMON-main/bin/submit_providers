@@ -1,0 +1,77 @@
+#!/usr/bin/perl
+
+#=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+# Script:  submit_providers
+# Purpose: RHPS (v2.0) Data Submitter script
+# Author:  Surjit Sahoo, RelayHealth
+#
+# Version history:
+#
+# Jul 20, 2011 - Version 1.0
+# - Initial release
+#
+#=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+use DS::RHPS::Submitter qw(email);
+
+my $Submitter = DS::RHPS::Submitter->new(
+	version_number  => '1.0',
+	version_date    => '07/20/2011',
+);
+
+my $Logger = $Submitter->get_logger;
+
+my ($input_count, $input_string, $rec_hashref, $message);
+
+$input_count = 0;
+$input_string = '';
+
+$Logger->debug("Processing STDIN ...");
+
+while (local $_ = <>) {
+
+	$input_string .= $_, next	if ! /^PROVIDER\|/;
+
+	if (length($input_string) > 0) {
+
+		if ($input_string =~ /^PROVIDER\|/) {
+
+			$input_count++;
+
+			$rec_hashref = $Submitter->build_record($input_string) and
+				$Submitter->process($rec_hashref);
+
+		}
+
+	}
+
+	$input_string = $_;
+
+}
+
+$input_count++;
+
+$rec_hashref = $Submitter->build_record($input_string) and
+	$Submitter->process($rec_hashref);
+
+$message = sprintf("Processed %d of %d %s records",
+	$Submitter->record_count || 0, $input_count,
+		$Submitter->source_id || q{UNKNOWN});
+
+$Logger->info($message);
+
+$Submitter->mydie($message)
+	if $Submitter->record_count != $input_count;
+
+#email(
+#	to      => $Submitter->success_email,
+#	subject => $Submitter->script_name . " Successful",
+#	message => "$message<br><hr>".
+#	"<span class=hilite>env: ".$Submitter->get_environment."</span>",
+#);
+
+$Submitter->myexit;

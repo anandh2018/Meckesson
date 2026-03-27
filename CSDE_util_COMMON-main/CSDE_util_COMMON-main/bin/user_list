@@ -1,0 +1,39 @@
+#!/usr/bin/perl
+
+
+
+$hostname=`hostname -s`;
+chomp $hostname;
+
+open(P, "< /etc/passwd") || die $!;
+
+while(<P>)
+{
+	chomp;
+
+	($userid, $passwd, $x, $y, $desc, $homedir, $login) = split(":");
+
+
+	if ($userid =~ /^(bin|daemon|adm|lp|mail|uucp|games|gopher|ftp|nobody|dbus|vcsa|rpm|haldaemon|nscd|sshd|rpc|rpcuser|nfsnobody|mailnull|smmsp|pcap|xfs|ntp|apache|pegasus|luci|ricci|piranha|root|sync|shutdown|halt|news|operator|tomcat|netdump)$/)
+	{
+		# ignore these users
+		next;
+	}
+
+	if ($login =~ /nologin/)
+	{
+		$login_access = "No";
+	}
+	else
+	{
+		$login_access = "Yes";
+	}
+
+
+	print join(":", "ACCESS", $userid, $desc,  $hostname, $login_access) . "\n";
+
+
+}
+
+close (P);
+

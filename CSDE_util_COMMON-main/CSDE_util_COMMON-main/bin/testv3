@@ -1,0 +1,633 @@
+#	This is the default standard profile provided to a user.
+#	They are expected to edit it to meet their own needs.
+#
+#	THIS SCRIPT MUST BE WRITTEN AS BOURNE SHELL SYNTAX SO
+#	THAT CRON JOBS WILL RUN IT PROPERLY!
+#
+DEBUG=FALSE
+
+PROG="profile_v3"
+SPACE=`echo "$PROG" | sed "s/./ /g"` 
+
+HOST=`hostname`
+TYPE=`uname`
+
+# Intro message
+
+if [ -t 0 ]
+then
+	echo
+	echo "Standard Blue Light Login Profile"
+	echo "================================="
+	echo 
+	echo " -- You are logging into the $HOST system ($TYPE) as $LOGNAME"
+fi
+
+
+# Set the local timzone to Atlanta (Est) with Daylight saving time consideration
+
+# Identify the platform and archicture of this system
+#	OS_SYSTEM will be set to a string identify the OS
+#	ARCH will be set to archicture string used by perl and bluelite for
+#		plateform specific executables
+
+OS_SYSTEM=""
+
+UNAME=`uname -a 2> /dev/null`
+ARCH=`perl -e 'use Config; print $Config{archname};'`
+OS_SYSTEM=`perl -e 'use Config; print $Config{osname};'`
+
+if grep -i 'release 5' /etc/redhat-release > /dev/null
+   then
+		ARCH="${ARCH}_RHEL5"
+		RHEL_VERSION=5
+  else
+		RHEL_VERSION=0
+fi
+
+export OS_SYSTEM ARCH
+
+
+TZ=EST5EDT
+export TZ
+
+
+if [ "$BLUELITE_BASE_DIR" != "" ]
+then
+
+	BASE_DIR="$BLUELITE_BASE_DIR"
+	COMMON_DIR="$BLUELITE_BASE_DIR/common"
+else
+	# Hard Code default values
+
+	BASE_DIR="/ds"
+	COMMON_DIR="/ds/common"
+fi
+
+# Variables used by Craig's scrubbing libary and deid engine (HCFA)
+
+ZIPSEC2_FILE=$BASE_DIR/common/etc/zipsec2
+export ZIPSEC2
+
+# Setup Fax Server Env Variables
+
+VSIHOME=/opt/vsifax
+export VSIHOME
+
+# Identify the location of the server pool file
+
+SERVER_INFO_FILE="$BASE_DIR/common/etc/server.info"
+export SERVER_INFO_FILE
+
+# Setup Oracle
+
+# Mod, John Dennis, 20060628
+# Oracle Server will point to a different ORACLE_HOME
+# so if we are oracle fix that
+
+ORACLE_CLIENT_HOME="/ds/oracle/product/$ARCH/10.2.0.3"
+ORACLE_SRV_HOME=/oracle/product/10.2.0
+
+if [ "$LOGNAME" == "oracle" ]
+then
+	# Since we are Oracle, attempt to use the server home dir, otherwise just use the client home
+
+	if [ -d "$ORACLE_SRV_HOME" ]
+	then
+		ORACLE_HOME=$ORACLE_SRV_HOME
+		[ -t 0 ] && echo " -- ORACLE_HOME configured for server - database can be stopped and started"
+	else
+		[ -t 0 ] && echo " -- ORACLE_HOME configured for client - database can NOT be stopped and started"
+		ORACLE_HOME=$ORACLE_CLIENT_HOME
+	fi
+else
+	ORACLE_HOME=$ORACLE_CLIENT_HOME
+fi
+
+if [ ! -d "$ORACLE_HOME" ]
+then
+	echo 
+	echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+	echo "!"
+	echo "! Warning the ORACLE_HOME directory was NOT accessable!  " 
+	echo "! Database functionality will be affected!"
+	echo "!"
+	echo "! ORACLE_HOME = $ORACLE_HOME"
+	echo "!"
+	echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+	echo 
+fi
+
+ORACLE_SID=BLUELITE
+USERID=bluelite/bluelite@BLUELITE
+export ORACLE_SID
+export ORACLE_HOME
+export USERID
+
+server='dsdb03'
+ORACLE_CONNECT="(DESCRIPTION=(ADDRESS_LIST=(ADDRESS=(PROTOCOL=TCP)(HOST=$server)(PORT=1521)))(CONNECT_DATA=(SID=BLUELITE)))" 
+export ORACLE_CONNECT
+DBHOST="$server"
+DBPORT=1521
+
+
+if [ "$DBHOST" == "" ]
+then
+
+	DBHOST="db01"
+
+	echo 
+	echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+	echo "!"
+	echo "! Warning the BLUELITE database was NOT accessable on any " 
+	echo "! of the following servers: "
+	echo "! `echo $SERVERS | sed 's/ /, /g'`"
+	echo "! Database dependent applications will not run !!"
+	echo "!"
+	echo "! Check that the database and listener are running"
+	echo "! ASSUMING database is on $DBHOST"
+	echo "!"
+	echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+	echo 
+else
+	if [ -t 0 ]
+	then
+		echo " -- Database Configured to use the BLUELITE database on $DBHOST"
+	fi
+fi
+
+
+
+
+ACURIAN_LOGIN="acurian/acurian@dbi:Oracle:host=$DBHOST;sid=BLUELITE;port=$DBPORT"
+export ACURIAN_LOGIN
+
+#EREBATE_LOGIN="erebate/erebate@dbi:Oracle:host=ds03;sid=BLUELITE;port=$DBPORT"
+EREBATE_LOGIN="erebate/erebate@dbi:Oracle:DSPROD"
+
+export EREBATE_LOGIN
+
+AWP_LOGIN='IHR_READ/suCcess@dbi:Sybase:server=AWP';
+export AWP_LOGIN
+
+#VERISPAN_LOGIN="bluelite/bluelite@dbi:Oracle:host=$DBHOST;sid=BLUELITE;port=$DBPORT"
+#export VERISPAN_LOGIN
+
+
+
+
+
+TERMINFO=/usr/share/terminfo
+export TERMINFO
+
+# Set GPG key directory
+
+GNUPGHOME=$BASE_DIR/gnupg
+export GNUPGHOME
+
+DEFAULT_SMTP_SERVER="smtp.ndchealth.com"
+export DEFAULT_SMTP_SERVER
+
+
+# Identify the platform and archicture of this system
+#	OS_SYSTEM will be set to a string identify the OS
+#	ARCH will be set to archicture string used by perl and bluelite for
+#		plateform specific executables
+
+#OS_SYSTEM=""
+#
+#UNAME=`uname -a 2> /dev/null`
+#ARCH=`perl -e 'use Config; print $Config{archname};'`
+#OS_SYSTEM=`perl -e 'use Config; print $Config{osname};'`
+#
+#
+#export OS_SYSTEM ARCH
+
+
+# Setup the Perl and her libraries 
+
+
+if [ "$OS_SYSTEM" = "" ]
+then
+	echo "$PROG: ERROR: Unable to detect platform of this system.  Your not using Windows are you?"
+	echo "$SPACE  Unable to setup perl for this system"
+else
+
+	PRIVLIB_DIR="$BASE_DIR/perl/lib"
+	PRIVLIBARCH_DIR="$PRIVLIB_DIR/$ARCH"
+
+	if [ ! -d "$PRIVLIBARCH_DIR" ] 
+	  then
+			mkdir $PRIVLIBARCH_DIR
+	fi
+
+		# Add the common bluelite modules directory
+
+		if [ "$RHEL_VERSION" -eq 5 ]
+			then
+				perl5add="$PRIVLIBARCH_DIR:$PRIVLIB_DIR"
+			else
+				perl5add="$PERL5LIB:$PRIVLIB_DIR:$PRIVLIBARCH_DIR"
+		fi
+
+		# Add the application library directories and well
+		#perl5add="$perl5add:$BASE_DIR/pal/lib:$BASE_DIR/nrs/lib:$BASE_DIR/common/lib"
+
+		# JD 3/30/2009 Added the CS dev path below.  This should be removed once we are out of dev
+
+		perl5add="$perl5add:/ds/env/dev/CS/common/lib:$BASE_DIR/nrs/lib:$BASE_DIR/common/lib"
+
+		if [ "$PERL5LIB" != "" ]
+		  then
+				PERL5LIB="$perl5add:$PERL5LIB"
+		  else
+				PERL5LIB="$perl5add"
+		fi
+
+		PERL6LIB=$PERL5LIB
+		export PERL5LIB PERL6LIB
+
+		if [ "$DEBUG" = TRUE ]
+		then
+			echo "Info (DEBUG):"
+			echo "$PROG: Successful: Setup perl to support $OS_SYSTEM platform"
+			echo "$SPACE  OS_SYSTEM:     $OS_SYSTEM"
+			echo "$SPACE  LIBRARY:      $PRIVLIB_DIR"
+			echo "$SPACE  ARCHLIBRARY:  $PRIVLIBARCH_DIR"
+			echo "$SPACE  PERL5LIB:     $PERL5LIB"
+		fi
+fi
+
+# Adjust the PATH to remove none existent directory paths
+
+NEW_PATH=""
+
+for DIR in `echo "$PATH" | tr ":" " "`
+do
+	if [ -d "$DIR" -a -r "$DIR" ]
+	then
+		if [ "$NEW_PATH" != "" ]
+		then
+			NEW_PATH="$NEW_PATH:$DIR"
+		else
+			NEW_PATH="$DIR"
+		fi
+	else
+		[ "$DEBUG" = "TRUE" ] && echo "Info (DEBUG): Removing $DIR from PATH"
+	fi
+done
+
+PATH="$NEW_PATH"
+
+export PATH
+
+
+if [ "$DS_BASE_PATH" = "" ]
+then
+  export DS_BASE_PATH=$PATH
+fi
+
+
+# Setup pathing
+
+for DIR in . /bin /usr/bin /usr/local/bin /sbin /usr/sbin $BASE_DIR/vsifax/bin $BASE_DIR/deep_nrs_scan/bin $BASE_DIR/subversion/bin $ORACLE_HOME/bin $BASE_DIR/jdk1.5.0_11/$ARCH/bin
+do
+	if [ -d "$DIR" -a -r "$DIR" ]
+	then
+		PATH="${DIR}:${PATH}"
+		[ "$DEBUG" = "TRUE" ] && echo "Info (DEBUG): $DIR added to PATH"
+	else
+		[ "$DEBUG" = "TRUE" ] && echo "Warning (DEBUG): $DIR added to PATH"
+	fi
+done
+
+for DIR in $BASE_DIR/pal/bin $BASE_DIR/mxdds/bin $BASE_DIR/nrs/bin $COMMON_DIR/bin $BASE_DIR/perl/bin 
+do
+	APP_DIRS=""
+
+	if [ -d "${DIR}/${ARCH}" ]
+	then
+		APP_DIRS="${DIR}/${ARCH}"	
+		[ "$DEBUG" = "TRUE" ] && echo "Info (DEBUG): $DIR/$ARCH added to PATH"
+	else
+		[ "$DEBUG" = "TRUE" ] && echo "Warning (DEBUG): No architecture dir added to PATH for $DIR"
+	fi
+
+	if [ -d "$DIR" ]
+	then
+		if [ "$APP_DIRS" = "" ]
+		then
+			APP_DIRS="$DIR"
+		else
+			APP_DIRS="${APP_DIRS}:$DIR"
+		fi
+		[ "$DEBUG" = "TRUE" ] && echo "Info (DEBUG): $DIR added to PATH"
+	else
+		[ "$DEBUG" = "TRUE" ] && echo "Warning (DEBUG): Dir $DIR NOT added to PATH"
+	fi
+
+	if [ "$APP_DIRS" != "" ]
+	then
+		PATH="${APP_DIRS}:${PATH}"
+	fi
+done
+
+export PATH
+
+# Setup the library path
+
+CPPFLAGS="-I$BASE_DIR/common/include"
+LDFLAGS="-L$BASE_DIR/common/lib/$ARCH"
+export CPPFLAGS
+export LDFLAGS
+
+
+LD_LIBRARY_PATH=$COMMON_DIR/lib:$BASE_DIR/pal/lib:$BASE_DIR/nrs/lib:.:$LD_LIBRARY_PATH:$ORACLE_HOME/lib
+
+if [ -d "$COMMON_DIR/lib/$ARCH" ]
+then
+	LD_LIBRARY_PATH="$COMMON_DIR/lib/$ARCH:$LD_LIBRARY_PATH"
+	export LD_LIBRARY_PATH
+else
+	echo "Warning: Could not modify LD_LIBRARY_PATH to include architecture "
+	echo "         specific lib path of $COMMON_DIR/lib/$ARCH (does not exist)"
+fi
+
+# Adjust the MANPATH - First adjust it to remove none existent directory paths
+
+NEW_MANPATH=""
+for DIR in `echo "$MANPATH" | tr ":" " "`
+do
+	if [ -d "$DIR" -a -r "$DIR" ]
+	then
+		if [ "$NEW_MANPATH" != "" ]
+		then
+			NEW_MANPATH="$NEW_MANPATH:$DIR"
+		else
+			NEW_MANPATH="$DIR"
+		fi
+	else
+	
+		[ "$DEBUG" = "TRUE" ] && echo "Info (DEBUG): Removing $DIR from MANPATH"
+	fi
+done
+
+# Add custom paths
+
+NEW_MANPATH="$NEW_MANPATH:${BASE_DIR}/pal/man"
+
+# Set the MANPATH to the new one
+
+MANPATH="$NEW_MANPATH"
+
+export MANPATH
+
+
+
+FTPKEYS="bluelite/crybaby1,bluelite/galileo1,rxdds/rxuser1"
+
+DS_SECURED_LOGIN="ds/crybaby1"
+
+
+
+#COMMON_LIB="$BASE_DIR/pal/bin/PALcommon_lib_V2.1.pl"
+ENCRYPTION_LICENSE_DIR="$BASE_DIR/common/etc/license_dir"
+
+FAX_SERVER_HOST=rx10
+export FAX_SERVER_HOST
+
+export FTPKEYS
+export COMMON_LIB
+export ENCRYPTION_LICENSE_DIR
+
+
+
+if [ -t 0 ]
+then
+
+	#perl -e 'use Config; print " -- Details: osname=$Config{osname}, osvers=$Config{osvers}, archname=$Config{archname}\n";'
+
+	stty erase '^?'
+	set -o vi
+fi
+
+#MAIL=/usr/mail/${LOGNAME}
+
+
+HOST=`echo "$HOST" | cut -d. -f1`
+
+if [ "$HOST" = "ps450-1" ]
+then
+	HOST=bluelite
+fi
+
+USERNAME=`whoami | tr "[a-z]" "[A-Z]"`
+
+PS1="\u@\h:\$DS_ENV:\$PWD : "
+export PS1
+
+
+TERM=vt220
+EDITOR=vi
+
+
+
+PKZIPCFG=$HOME
+
+
+export TERM LD_LIBRARY_PATH HOME EDITOR PKZIPCFG 
+
+
+# stty -o vi
+
+
+if [ "$USER" = 'ds' ]
+  then
+		# more secure for production users: -rw-r-----
+		umask 027
+  else
+		# more open for non-production users: -rw-rw----
+		umask 007
+fi
+
+
+
+tty_suffix=`tty | tr / .`
+
+HISTFILE=$HOME/.sh_history${tty_suffix}
+export HISTFILE
+
+alias omre=more
+
+VIMINIT="source /ds/common/etc/vimrc"
+export VIMINIT
+
+TNS_ADMIN=$BASE_DIR/common/etc
+export TNS_ADMIN
+
+PERLTIDY=$BASE_DIR/common/etc
+export PERLTIDY
+
+LANG=POSIX
+export LANG
+
+JAVA_HOME=/ds/jdk1.5.0_11/$ARCH
+export JAVA_HOME
+
+CATALINA_HOME=/ds/apache-tomcat-5.5.17
+export CATALINA_HOME
+
+LOG_DIR=/ds/common/log
+export LOG_DIR
+
+# do ". acd_func.sh"
+# acd_func 1.0.5, 10-nov-2004
+# petar marinov, http:/geocities.com/h2428, this is public domain
+
+PRUN2_SERVER_INFO=/ds/common/etc/server.info
+export PRUN2_SERVER_INFO
+
+cd_func ()
+{
+  local x2 the_new_dir adir index
+  local -i cnt
+
+  if [[ $1 ==  "--" ]]; then
+    dirs -v
+    return 0
+  fi
+
+  the_new_dir=$1
+  [[ -z $1 ]] && the_new_dir=$HOME
+
+  if [[ ${the_new_dir:0:1} == '-' ]]; then
+    #
+    # Extract dir N from dirs
+    index=${the_new_dir:1}
+    [[ -z $index ]] && index=1
+    adir=$(dirs +$index)
+    [[ -z $adir ]] && return 1
+    the_new_dir=$adir
+  fi
+
+  #
+  # '~' has to be substituted by ${HOME}
+  [[ ${the_new_dir:0:1} == '~' ]] && the_new_dir="${HOME}${the_new_dir:1}"
+
+  #
+  # Now change to the new dir and add to the top of the stack
+  pushd "${the_new_dir}" > /dev/null
+  [[ $? -ne 0 ]] && return 1
+  the_new_dir=$(pwd)
+
+  #
+  # Trim down everything beyond 11th entry
+  popd -n +11 2>/dev/null 1>/dev/null
+
+  #
+  # Remove any other occurence of this dir, skipping the top of the stack
+  for ((cnt=1; cnt <= 10; cnt++)); do
+    x2=$(dirs +${cnt} 2>/dev/null)
+    [[ $? -ne 0 ]] && return 0
+    [[ ${x2:0:1} == '~' ]] && x2="${HOME}${x2:1}"
+    if [[ "${x2}" == "${the_new_dir}" ]]; then
+      popd -n +$cnt 2>/dev/null 1>/dev/null
+      cnt=cnt-1
+    fi
+  done
+
+  return 0
+}
+
+change_ds_env() {
+
+	if [ "$1" == dsdev ]
+	  then
+			BLUELITE_METADATA_LOGIN="dsdev/dsdev@dbi:Oracle:host=$DBHOST;sid=BLUELITE;port=$DBPORT"
+			DS_CONNECTION="$BLUELITE_METADATA_LOGIN"
+			DS_ENV=dsdev
+
+			export DS_CONNECTION DS_ENV BLUELITE_METADATA_LOGIN
+			[ -t 0 ] && echo " -- Data Services Environment (BLUELITE_METADATA_LOGIN) configured for '$DS_ENV'"
+	elif [ "$1" == dsprod_old ]
+	  then
+			BLUELITE_METADATA_LOGIN="bluelite/bluelite@dbi:Oracle:host=ds03;sid=BLUELITE;port=$DBPORT"
+			DS_CONNECTION="$BLUELITE_METADATA_LOGIN"
+			DS_ENV=dsprod_old
+
+			export DS_CONNECTION DS_ENV BLUELITE_METADATA_LOGIN
+			[ -t 0 ] && echo " -- Data Services Environment (BLUELITE_METADATA_LOGIN) configured for '$DS_ENV'"
+	elif [ "$1" == dsprod ]
+	  then
+			BLUELITE_METADATA_LOGIN="bluelite/bluelite@dbi:Oracle:DSPROD"
+			EMI_PATIENT_TEST_LOGIN="emi_patient_test/bon[midy@dbi:Oracle:DSPROD"
+			EMI_PATIENT_PROD_LOGIN="emi_patient_prod/dy[tagly@dbi:Oracle:DSPROD"
+			EMI_PATIENT_QA_LOGIN="emi_patient_qa/ig!woomf@dbi:Oracle:DSPROD"
+			DIM_TEST_LOGIN='dim_test/gli6ands@dbi:Oracle:DSPROD'
+			DIM_PROD_LOGIN='dim_prod/gli6ands@dbi:Oracle:DSPROD'
+			DIM_QA_LOGIN='dim_qa/ur^urkik@dbi:Oracle:DSPROD'
+			DW_TEST_LOGIN='dw_test/pr7boogi@dbi:Oracle:DSPROD'
+			DW_PBM_TEST_LOGIN='dw_pbm_test/dob9plip@dbi:Oracle:DSPROD'
+			DW_PBM_DEV_LOGIN='dw_pbm_dev/kio8ween@dbi:Oracle:DSPROD'
+			DW_PBM_CERT_LOGIN='dw_pbm_cert/wig)cuow@dbi:Oracle:DSPROD'
+			DW_PBM_PROD_LOGIN='dw_pbm_prod/summer1@dbi:Oracle:DSPROD'
+			DW_PROD_LOGIN='dw_prod/pr7boogi@dbi:Oracle:DSPROD'
+			DW_QA_LOGIN='dw_qa/cub&oodi@dbi:Oracle:DSPROD'
+			DW_AGG_TEST_LOGIN='dw_agg_test/fl0rida1@dbi:Oracle:DSPROD'
+			DW_AGG_PROD_LOGIN='dw_agg_prod/wo*tyian@dbi:Oracle:DSPROD'
+			CS_DEV_LOGIN='cs_dev/ga6pimuo@dbi:Oracle:DSQA'
+			CS_QA_LOGIN='cs_qa/puf9ungr@dbi:Oracle:DSQA'
+			DS_ENV=dsprod
+
+			export DS_ENV BLUELITE_METADATA_LOGIN EMI_PATIENT_TEST_LOGIN EMI_PATIENT_PROD_LOGIN DIM_TEST_LOGIN DW_TEST_LOGIN DW_PBM_TEST_LOGIN DW_PBM_DEV_LOGIN DW_PBM_CERT_LOGIN DW_PBM_PROD_LOGIN DIM_PROD_LOGIN DW_PROD_LOGIN EMI_PATIENT_QA_LOGIN DIM_QA_LOGIN DW_QA_LOGIN DW_AGG_TEST_LOGIN DW_AGG_PROD_LOGIN CS_DEV_LOGIN CS_QA_LOGIN
+			[ -t 0 ] && echo " -- Data Services Environment (BLUELITE_METADATA_LOGIN) configured for '$DS_ENV'"
+	elif [ "$1" != '' ]
+	  then
+			echo "dont know how to change DS environment to '$1'"
+			return 1
+	fi
+
+	return 0
+}
+
+
+#if [ "$LOGNAME" == 'ds' ]
+#  then
+#		change_ds_env dsprod
+#  else
+#		change_ds_env dsprod
+#fi
+
+
+change_ds_env dsprod
+
+
+LS_COLORS='no=00:fi=00:di=01;36:ln=01;36:pi=40;33:so=01;35:bd=40;33;01:cd=40;33;01:or=01;05;37;41:mi=01;05;37;41:ex=01;32:*.cmd=01;32:*.exe=01;32:*.com=01;32:*.btm=01;32:*.bat=01;32:*.sh=01;32:*.csh=01;32:*.tar=01;31:*.tgz=01;31:*.arj=01;31:*.taz=01;31:*.lzh=01;31:*.zip=01;31:*.z=01;31:*.Z=01;31:*.gz=01;31:*.bz2=01;31:*.bz=01;31:*.tz=01;31:*.rpm=01;31:*.cpio=01;31:*.jpg=01;35:*.gif=01;35:*.bmp=01;35:*.xbm=01;35:*.xpm=01;35:*.png=01;35:*.tif=01;35:*.sl=01;31'
+export LS_COLORS
+
+SLCHOOSED_HOST=ds28.ndchealth.com
+export SLCHOOSED_HOST
+
+DS_BASE_DIR='/ds'
+APP_ENV_CONFIG="${DS_BASE_DIR}/common/etc/app_config.xml"
+TMPDIR=/temp
+
+export TMPDIR APP_ENV_CONFIG DS_BASE_DIR
+
+alias cd=cd_func
+
+alias dsdev='change_ds_env dsdev'
+alias dsprod='change_ds_env dsprod'
+alias dsprod_old='change_ds_env dsprod_old'
+
+alias reiszgvim='gvim -U /ds/common/etc/gvimrc_reisz '
+alias dennisgvim='gvim -U /ds/common/etc/gvimrc_dennis '
+alias liugvim='gvim -U /ds/common/etc/gvimrc_liu '
+alias tpjgvim='gvim -U /ds/common/etc/gvimrc_johnson '
+alias setupqaqc='. /ds/bin/setup_cs_qaqc_env.sh'
+
+alias gvi="gvim -U $DS_BASE_DIR/common/etc/gvimrc_$USER "
+
+[ -t 0 ] && echo
+
+

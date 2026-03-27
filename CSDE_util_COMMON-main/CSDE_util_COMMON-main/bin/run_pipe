@@ -1,0 +1,87 @@
+#!/bin/bash
+
+# verbose=true
+
+# run_pipe: Run a series of piped commands, and return error status if any command returns an error status
+#
+
+if [ "$#" -eq 0 ]
+  then
+	bname=`basename $0`
+	echo "Usage: $bname [-e exit_success_code] cmd1 [-options] [| cmd2 [-options]] ..."
+	exit 0
+fi
+
+exit_failure=99
+
+if [ "$1" = -e ]
+  then
+	exit_success=$2
+	shift 2
+  else
+	exit_success=0
+fi
+
+  
+if [ $exit_failure -eq $exit_success ]
+  then
+	echo "ERROR: Success and failure exit codes are the same ($exit_success). Cannot run commands" >&2
+	exit `expr $exit_success + 1`
+fi
+
+args=$*
+
+SAVE_IFS=$IFS
+IFS='|'
+process_num=0
+
+for command in $args
+  do
+	process[$process_num]=$command
+	process_num=`expr $process_num + 1`
+  done
+
+IFS=$SAVE_IFS
+
+for command_string in "${process[@]}"
+  do
+	if [ "$cmd" = '' ]
+	  then
+		cmd="$command_string"
+	  else
+		cmd="$cmd |
+$command_string"
+	fi
+  done
+
+if [ "$verbose" = 'true' ]
+  then
+echo "Running the following command stream:
+$cmd
+" >&2
+fi
+
+eval "
+process_num=0
+$cmd"'
+for return_status in ${PIPESTATUS[*]}
+  do
+	process_name=${process[$process_num]}
+
+	if [ $return_status -ne 0 ]
+	  then
+		echo "run_pipe ERROR: The following process failed with return code $return_status:
+		$process_name" >&2
+		failure=true
+	fi
+
+	process_num=`expr $process_num + 1`
+  done
+
+if [ "$failure" = 'true' ]
+  then
+	exit $exit_failure
+  else
+	exit $exit_success
+fi
+'

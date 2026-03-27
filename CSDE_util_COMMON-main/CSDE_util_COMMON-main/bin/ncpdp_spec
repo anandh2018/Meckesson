@@ -1,0 +1,10 @@
+#!/usr/bin/perl
+
+use BLUELITE::NCPDP::Parser;
+use warnings;
+use strict;
+
+my $parser = BLUELITE::NCPDP::Parser->new(load_default_mod => 1);
+
+$parser->spec->segment_report;
+

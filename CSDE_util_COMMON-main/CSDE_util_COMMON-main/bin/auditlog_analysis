@@ -1,0 +1,106 @@
+#!/usr/bin/perl
+
+use DateTime;
+use BLUELITE::TandemSwitchAuditLog::Analysis;
+use Data::Dumper;
+use Getopt::Long;
+
+our ($system_name) = {  "3"   => "FE3",
+                        "4"   => "CMX",
+                        "5"   => "FE4",
+                        "7"   => "AT2",
+                        "12"  => "DAL",
+                        "13"  => "DV2",
+                        "16"  => "FE6",
+                        "17"  => "FE7",
+                        "19"  => "TR1",
+                        "20"  => "HCB",
+                        "21"  => "DHC",
+                        "22"  => "FE8" };
+
+$report_mode = "TAB";
+$sample_analysis = 0;
+
+$ok_return_status = 0;
+
+$ret = GetOptions(  
+                    "sample|s", \$sample_analysis,
+                    "report|r", sub { $report_mode = "REPORT" },
+										"ret=s", \$ok_return_status,
+                    "tab|t", sub { $report_mode = "TAB" }
+					
+								);
+
+if (! $ret)
+{
+  $log->fatal("Invalid command line options was detected");
+   exit(1);
+}
+
+
+foreach $al (@ARGV)
+{
+	if (! -f $al && ! -l $al)
+	{
+		print STDERR "Cannot locate auditlog file $al\n";
+		exit(1);
+	}
+
+	$analysis = BLUELITE::TandemSwitchAuditLog::Analysis->analyze_auditlog($al , $sample_analysis);
+
+	if (! $analysis)
+	{
+		return 1;
+	}
+
+  @fileinfo = $analysis->auditlog_filename_info;
+
+	if ($report_mode eq "REPORT")
+	{
+	print "AuditLog Analysis [ " . $analysis->auditlog_filename . " ]\n";
+  print "============================================================================================\n";
+  print "\n";
+  print "   AuditLog Date:             " . $analysis->auditlog_datetime . "\n";
+  print "   Block Sample Count:        " . $analysis->block_sample_count . "\n";
+  print "   Transmission Sample Count: " . $analysis->transmission_sample_count . "\n";
+  print "   Blocks in AuditLog:        " . (defined($analysis->block_count) ? $analysis->block_count : "n/a") . "\n";
+  print "   Transmissions in AuditLog: " . (defined($analysis->transmission_count) ? $analysis->transmission_count : "n/a")
+ . "\n";
+  print "   Min Process Datetime:      " . $analysis->min_process_datetime . "\n";
+  print "   Max Process Datetime:      " . $analysis->max_process_datetime . "\n";
+  print "   Transmission Errors:       " . (defined($analysis->transmission_errors) ? $analysis->transmission_errors : 0) .  "\n";
+  print "\n";
+  print "   Block Zero Info\n";
+
+  print "     Full Filename:           " . $analysis->block0_auditlog_filename . "\n";
+  print "     System Number:           " . $fileinfo[0] . " (" . (exists($system_name->{$fileinfo[0]}) ? $system_name->{$fileinfo[0]} : "unknown") . ")\n";
+  print "     Volume Name:             " . $fileinfo[1] . "\n";
+  print "     Directory Name:          " . $fileinfo[2] . "\n";
+  print "     File Name:               " . $fileinfo[3] . "\n";
+  print "     Time Offset (msec):      " . (defined($analysis->time_offset) ? $analysis->time_offset : "n/a") . "\n";
+  print "\n";
+	}
+	else
+	{
+		print join(",", "TAB",
+										$analysis->auditlog_filename,
+										$analysis->auditlog_datetime,
+										($sample_analysis ? "SAMPLE" : "FULL"),
+										$analysis->transmission_sample_count,
+										(defined($analysis->block_count) ? $analysis->block_count : "n/a"),
+										(defined($analysis->transmission_count) ? $analysis->transmission_count : "n/a"),
+										$analysis->min_process_datetime,
+										$analysis->max_process_datetime,
+										(defined($analysis->transmission_errors) ? $analysis->transmission_errors : 0),
+										$fileinfo[0] . " (" . (exists($system_name->{$fileinfo[0]}) ? $system_name->{$fileinfo[0]} : "unknown") . ")",
+										$fileinfo[1],
+										$fileinfo[2],
+										$fileinfo[3],
+										(defined($analysis->time_offset) ? $analysis->time_offset : "n/a")
+		) . "\n";
+	}
+
+}
+
+exit($ok_return_status);
+

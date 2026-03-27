@@ -1,0 +1,9 @@
+#!/bin/bash
+if test -z "$1"
+then
+  echo "Usage aesencrypt  <password>"
+  exit
+fi
+
+export JAVA_HOME=/ds/jdk1.7.0_25/
+/ds/jdk1.7.0_25/bin/java -jar /ds/development/java/AESEncryptor.jar  encrypt  $1 

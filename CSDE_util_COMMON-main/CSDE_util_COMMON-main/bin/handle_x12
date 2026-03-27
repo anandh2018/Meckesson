@@ -1,0 +1,614 @@
+#!/usr/bin/perl
+
+# handle_837: manage reciept of daily 837 files
+#
+# Performs the following actions on received 837 files:
+#
+# 1) verifies integrity of file via zip test
+# 2) compresses and encrypts file via gzip and ds_encrypt processes
+# 3) renames converted file to appropriate name (e.g. adds ".gz.pgp" extention)
+# 4) sets file access and modification times to match that of original incoming file
+# 5) removes original incoming file after successful conversion
+#
+# Notes:
+# - This program uses its own file lock mechanism that is designed to work
+# across multiple servers in a clustered environment with a shared file system.
+# It can be safely executed in parallel on a single and/or multiple servers.
+#
+# - Temporary files are created while processing files, but care has been taken
+# to cleanup these temp files under both normal and abnormal termination conditions.
+#
+# - The program is designed for maximum reliability, not high performance (hence
+#	temp files instead of pipe streams).
+#
+# Version history:
+# 7/27/2006	Initial release
+#
+
+use File::Copy;
+use File::Spec;
+use File::stat;
+use Sys::Hostname;
+use String::CRC32;
+use Cwd;
+use Getopt::Long;
+
+use Data::Dumper;
+use strict;
+use warnings;
+
+use constant LOCKFILE_EXPIRY_SECONDS  => 60 * 60 * 1;	# lock file is stale after 1 hour
+
+use constant FILES_OK                 => 0;
+use constant FILES_UNPROCESSED        => 1;
+use constant FILES_EXTRANEOUS         => 3;
+use constant HAVE_ALL_COMPLETED_FILES => 1;
+use constant MISSING_COMPLETED_FILES  => 0;
+
+our $DESTINATION_AUDITLOG_TOP_DIR = '/ds/data_sources/incoming';
+our $DESTINATION_TOP_DIR          = '/ds/data_sources/';
+
+our $PGM = $0;
+$PGM =~ s|.*/||g;
+
+our $FILES_TO_CLEANUP;	# temp files to remove in signal handler
+our $FILES_TO_UNEXTRACT;  # files in zip to extract
+sub usage() {
+	print "Usage: $PGM [-success-exit #] [-dest-dir-top path] 837_filename [...]\n";
+}
+
+
+sub get_filelock($) {
+	# get a cluster-friendly exclusive file lock	{no, flock() will not work across servers}
+
+  my $lockfile_name = shift;
+  my ($read_hostname, $read_pid);
+
+	return undef if (! defined($lockfile_name));
+
+	if (-f $lockfile_name) {
+		my $stat = stat($lockfile_name);
+
+		# check to see if existing lockfile is stale
+
+		if ((time - $stat->mtime) > LOCKFILE_EXPIRY_SECONDS) {
+			print STDERR "Warning: recreating stale lock file $lockfile_name : was more than " . LOCKFILE_EXPIRY_SECONDS . " seconds old\n";
+		} else {
+			return 0;	# fresh lock file already exists
+		}
+	}
+
+	if (! open(LOCK, "> $lockfile_name")) {
+		print STDERR "Warning: unable to create lock file $lockfile_name : $!\n";
+		return undef;
+	}
+
+  my $hostname = hostname;
+
+	if (! print LOCK "$hostname,$$\n") {
+		close(LOCK);
+		unlink($lockfile_name);
+		print STDERR "Warning: unable to write identifying info to lock file $lockfile_name : $!\n";
+		return undef;
+	}
+
+	if (! close(LOCK)) {
+		unlink($lockfile_name);
+		print STDERR "Warning: unable to close lock file created $lockfile_name : $!\n";
+		return undef;
+	}
+
+	if (! open(LOCK, $lockfile_name)) {
+		print STDERR "Warning: unable to open lock file $lockfile_name for reading : $!\n";
+		return undef;
+	}
+
+	$_ = <LOCK>;
+	chomp($_);
+
+	($read_hostname, $read_pid) = split(',', $_);
+
+	if (! close(LOCK)) {
+		print STDERR "Warning: unable to close lock file $lockfile_name after reading : $!\n";
+		return undef;
+	}
+
+	if (($read_pid != $$) || ($read_hostname ne $hostname)) {
+		print STDERR "Warning: lock file $lockfile_name was overwritten by another process ($read_pid on $read_hostname). Current pid = $$, hostname = $hostname). Yielding to other process...\n";
+		return undef;
+	}
+
+
+	return 1;	# all of that work just to guarantee that we got a cluster-aware exclusive lock created!
+}
+
+
+sub sig_handler() {
+  my $signal = shift;
+
+	print STDERR "$PGM: Received signal $signal ... cleaning up\n";
+
+	print "Simulating removal of files: " . join("\n", keys %{$FILES_TO_CLEANUP}) . "\n";
+	# unlink(keys %{$FILES_TO_CLEANUP});
+
+	exit(1);
+}
+
+sub gzuncompress($$) {
+  my ($compressed_file, $uncompressed_file) = (shift, shift);
+
+	return undef if ((! defined($compressed_file)) || (! defined($uncompressed_file)));
+
+	if ($compressed_file eq $uncompressed_file) {
+		print STDERR "$PGM: ERROR: compressed file name $compressed_file and desired uncompressed file name $uncompressed_file are the same!\n";
+		return undef;
+	}
+
+	my $ret = system("gunzip -c $compressed_file > $uncompressed_file");
+	$ret = $ret >> 8;
+
+	if ($ret != 0) {
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+sub test_integrity($) {
+  my $compressed_collection = shift;
+  my $files_to_extract;  
+
+  return undef if (! defined($compressed_collection) );
+  my $list = `unzip -t $compressed_collection`;
+  my $line = "";
+  my $old_line = "";
+  foreach $line (split /\n/, $list) {
+    chomp $line;
+    $old_line = $line;
+    if ($line =~ m/^\s*testing:\s*(\S*)\s*(.*)$/) {
+      my ($file, $result) = ($1, $2);
+      if ($result ne "OK") {
+        print STDERR "$PGM: ERROR: file $file, compressed in $compressed_collection, failed integrity check.  From unzip: $line\n";
+        return undef;
+      }
+      $file =~ m/^([^;]*);?(.*)$/;
+      my ($file_base, $file_version) = ($1, $2);
+      if (0 == length($file_version) ) {
+        $file_version = "1";
+      }
+      $files_to_extract->{$file_base}->{$file_version} = $file;
+    }
+  }
+  if ($old_line !~ m/^\s*No errors detected/) {
+    print STDERR "$PGM: ERROR: compressed file name $compressed_collection failed integrity check.  From unzip: $old_line\n";
+    return undef;
+  }
+  return $files_to_extract;
+}
+
+sub uncompress($$$) {
+  my ($compressed_collection, $compressed_file, $uncompressed_file) = (shift, shift, shift);
+  return undef if ((! defined($compressed_collection)) || (! defined($compressed_file)) || (! defined($uncompressed_file)));
+
+  #print "unzip -c $compressed_collection '$compressed_file' > '$uncompressed_file'\n";
+  #return 1;
+  my $ret = system("unzip -p $compressed_collection '$compressed_file' > '$uncompressed_file'");
+
+  if ($ret != 0) {
+    return 0;
+  }
+  else {
+    return 1;
+  }
+}
+
+sub gzcompress($$) {
+  my ($uncompressed_file, $compressed_file) = (shift, shift);
+
+	return undef if ((! defined($uncompressed_file)) || (! defined($compressed_file)));
+
+	if ($uncompressed_file eq $compressed_file) {
+		print STDERR "$PGM: ERROR: uncompressed file name $uncompressed_file and desired compressed file name $compressed_file are the same!\n";
+		return undef;
+	}
+
+	my $ret = system("gzip -c $uncompressed_file > $compressed_file");
+	$ret = $ret >> 8;
+
+	if ($ret != 0) {
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+
+sub ds_encrypt($$) {
+  my ($unencrypted_file, $encrypted_file) = (shift, shift);
+
+	return undef if ((! defined($unencrypted_file)) || (! defined($encrypted_file)));
+
+	if ($unencrypted_file eq $encrypted_file) {
+		print STDERR "$PGM: ERROR: unencrypted file name $unencrypted_file and desired encrypted file name $encrypted_file are the same!\n";
+		return undef;
+	}
+
+	my $ret = system("ds_encrypt $unencrypted_file");
+	$ret = $ret >> 8;
+
+	if ($ret != 0) {
+		return 0;
+	} else {
+
+		if (-f $encrypted_file) {
+			return 1;
+		} else {
+			print STDERR "$PGM: ERROR: encrypted file $encrypted_file does not exist after encryption process!\n";
+			return 0;
+		}
+	}
+}
+
+
+sub cleanup_files() {
+
+  my $unlinkables = 0;
+
+	foreach my $fname (keys %{$FILES_TO_CLEANUP}) {
+
+		if (unlink($fname) != 1) {
+			print STDERR "$PGM: ERROR: Could not remove file $fname : $!\n";
+			$unlinkables++;
+		}
+
+		delete $FILES_TO_CLEANUP->{$fname};
+	}
+
+	foreach my $fname (keys %{$FILES_TO_UNEXTRACT}) {
+
+		if (unlink($fname) != 1) {
+			print STDERR "$PGM: ERROR: Could not remove file $fname : $!\n";
+			$unlinkables++;
+		}
+
+		delete $FILES_TO_UNEXTRACT->{$fname};
+	}
+
+	if ($unlinkables) {
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+# Set modification and access times of files (@touch_files) to match that of reference file
+
+sub ref_touch($@) {
+  my ($ref_file) = shift;
+  my @touch_files = @_;
+
+  return undef if (! defined($ref_file));
+
+  my $stat = stat($ref_file);
+  my ($atime, $mtime) = ($stat->atime, $stat->mtime);
+
+  return utime $atime, $mtime, @touch_files;
+}
+
+sub identify_data_source($) {
+  my ($fname) = shift;
+
+  return undef if (! defined($fname));
+
+  my $ret = system("identify_data_source $fname");
+
+	if ($ret != 0) {
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+# gather list of all processed (compressed/encrypted) 837 files 
+# for specified day and determine whether any are missing
+# are extraneous.
+
+sub get_destination_dir($$) {
+  my ($dest_top_dir, $date) = (shift, shift);
+  my $yyyymm = substr($date, 0, 6);
+	my $destination_dir = File::Spec->catdir($dest_top_dir, $yyyymm);
+
+	if (! ((-d $destination_dir) || (-l $destination_dir))) {
+		print STDERR "$PGM: Warning: destination directory $destination_dir does not exist!\n";
+		return undef;
+	}
+
+	return $destination_dir;
+}
+
+
+sub move_all($$$@) {
+  my ($source_dir, $destination_dir, $date) = (shift, shift, shift);
+  my (@moved_files, $source_file);
+
+	foreach my $fname (@_) {
+
+		$source_file = File::Spec->catfile($source_dir, $fname);
+
+		if (! move($source_file, $destination_dir)) {
+			print STDERR "$PGM: ERROR: Unable to move file $source_file to $destination_dir : $!\n";
+			print STDERR "$PGM: relocating $date files from $destination_dir back to $source_dir\n";
+
+			foreach my $moved_fname (@moved_files) {
+
+				if (! move($moved_fname, $source_dir)) {
+					print STDERR "$PGM: ERROR: Cannot move file $moved_fname from $destination_dir back to $source_dir : $!\n";
+
+					if (-f $moved_fname) {
+						print STDERR "$PGM: Warning: (possibly partial) file $moved_fname may exist on both $source_dir and $destination_dir\n";
+					}
+				}
+
+			}
+
+			return 0;
+		} else {
+			push(@moved_files, $source_file);
+		}
+	}
+
+	return $#moved_files + 1;
+}
+
+
+
+########################################################################################
+# main
+########################################################################################
+
+
+
+if (! ($#ARGV >= 0)) {
+	usage();
+	exit(0);
+}
+
+my $exit_success = 0;
+
+GetOptions(
+            "success-exit=s" => \$exit_success,
+            "dest-dir-top=s" => \$DESTINATION_TOP_DIR
+) || exit(1);
+
+# setup signal handler so we can cleanup before getting interrupted
+
+foreach my $sig ('INT', 'QUIT', 'HUP', 'INT', 'TERM', 'ABRT', 'BUS', 'FPE', 'ILL', 'QUIT', 'SEGV', 'SYS', 'TRAP') {
+
+  if ((! defined($SIG{$sig})) || ($SIG{$sig} ne 'IGNORE')) {
+    $SIG{$sig} = \&sig_handler;
+  }
+}
+
+#### Put file arguments into hash w/useful attributes about each file
+
+my $curr_dir = getcwd;
+my $exit_status = 0;
+my @unsupported_files;
+my $file_info;
+
+foreach my $fname (@ARGV) {
+	my ($volume, $dir, $file) = File::Spec->splitpath($fname);
+	if ($dir eq '') {
+		$dir = $curr_dir;
+	}
+
+	if ($file =~ /^(tulsa|indy|Cleveland)_?(835|ub|hcfa|hp|ph|Remits)?_?(\d\d\d\d)(\d\d)(\d\d)(\d\d)?(\d\d)?(\d\d)?([.][A-Za-z]+)?$/) {
+		my ($sender, $format, $yyyy, $mm, $dd, $hour, $minute, $second, $suffix) = ($1, $2, $3, $4, $5, $6, $7, $8, $9);
+    my $yyyymmdd = "${yyyy}${mm}${dd}";
+    my $yyyymm = "${yyyy}${mm}";
+    if (!defined($format)) {
+      $format = "837";
+    }
+		my $file_id = "${sender}${format}${yyyy}${mm}${dd}";
+		my $lock_file = File::Spec->catfile($dir, "lock.$file_id");
+
+		$file_info->{$yyyymmdd}->{$fname} = {
+			source_dir => $dir,
+			base_fname => $file,
+      format     => $format,
+      yyyy       => $yyyy,
+      mm         => $mm,
+      dd         => $dd,
+      hour       => $hour,
+      minute     => $minute,
+      second     => $second,
+      sender     => $sender,
+			file_id    => $file_id,
+			lock_file  => $lock_file,
+			suffix     => $suffix,
+      fname      => $fname,
+		};
+
+	} else {
+		push(@unsupported_files, $fname);
+	}
+
+}
+
+## report status info
+
+if ($#unsupported_files >= 0) {
+	print STDERR "The following files are not supported:\n";
+
+	foreach my $unsup_fname (@unsupported_files) {
+		print STDERR "UNSUPPORTED_FILE,$unsup_fname\n";
+	}
+
+	$exit_status += 2;
+}
+
+my $hostname = hostname;
+my $pid = $$;
+my $errors = 0;
+my $files_extracted = 0;
+my $files_converted = 0;
+
+# handle any 837 files
+
+foreach my $yyyymmdd (sort keys %{$file_info}) {
+	foreach my $fname (keys %{$file_info->{$yyyymmdd}}) {
+
+		my $info = $file_info->{$yyyymmdd}->{$fname};	# create convenient hash ref for this file
+
+		if (! -f $fname) {
+			print STDERR "$PGM: Warning: the following file does not exist: $fname . This will NOT be treated as an error condition\n";
+			next;
+		}
+
+		next if (! get_filelock($info->{lock_file}));	# quietly skip if cannot obtain lock
+
+		$FILES_TO_CLEANUP->{$info->{lock_file}} = 1;
+    
+    my $destination_dir = File::Spec->catfile($DESTINATION_TOP_DIR, lc($info->{sender}), $info->{yyyy}.$info->{mm});
+    if (! -d $destination_dir) {
+      if (! mkdir $destination_dir) {
+        cleanup_files();
+
+        print STDERR "$PGM: Error: Could not create directory $destination_dir: $!\n";
+        $errors++;
+        next;
+      }
+    }
+    $destination_dir = File::Spec->catfile($destination_dir, $yyyymmdd);
+    if (! -d $destination_dir) {
+      if (! mkdir $destination_dir) {
+        cleanup_files();
+
+        print STDERR "$PGM: Error: Could not create directory $destination_dir: $!\n";
+        $errors++;
+        next;
+      }
+    }
+    if ( defined($info->{suffix}) && (lc($info->{suffix}) eq '.zip') ) {
+      #test integrity & get file list
+      my $file_list = undef;
+      $file_list = test_integrity($fname);
+      if (! defined($file_list)) {
+        cleanup_files();
+
+        print STDERR "$PGM: ERROR: at least one file failed integrity test $fname\n";
+        $errors++;
+        next;
+      }
+      #uncompress
+      foreach my $key (keys %{$file_list}) {
+        my @versions = keys %{$file_list->{$key}};
+        foreach my $version (@versions) {
+          my $uncompressed_fname = (File::Spec->splitpath($key))[2];
+          $uncompressed_fname = File::Spec->catfile($destination_dir, $uncompressed_fname);
+          $uncompressed_fname = $uncompressed_fname . '.' . $version;
+          my $compressed_fname = $file_list->{$key}->{$version};
+          if (-e $uncompressed_fname) {
+            cleanup_files();
+        
+            print STDERR "$PGM: ERROR: file $uncompressed_fname already exists!  Will NOT overwrite.\n";
+            $errors++;
+            next;
+          }
+          if (! uncompress($fname, $compressed_fname, $uncompressed_fname)) {
+            cleanup_files();
+
+    				print STDERR "$PGM: ERROR: Could not uncompress compressed file $compressed_fname in $fname to $uncompressed_fname\n";
+		    		$errors++;
+				    next;
+          }
+          $FILES_TO_CLEANUP->{$uncompressed_fname} = 1;        
+          
+          #compress file
+          my $gzipped_fname = $uncompressed_fname . ".gz";
+          if (-e $gzipped_fname) {
+            cleanup_files();
+        
+            print STDERR "$PGM: ERROR: file $gzipped_fname already exists!  Will NOT overwrite.\n";
+            $errors++;
+            next;
+          }
+          if (! gzcompress($uncompressed_fname, $gzipped_fname)) {
+            cleanup_files();
+        
+            print STDERR "$PGM: ERROR: Could not gzip file $uncompressed_fname to $gzipped_fname\n";
+            $errors++;
+            next;
+          }
+          $FILES_TO_CLEANUP->{$gzipped_fname} = 1;
+          
+          #encrypt file
+          my $encrypted_fname = $gzipped_fname . ".pgp";
+          if (-e $encrypted_fname) {
+            cleanup_files();
+
+            print STDERR "$PGM: ERROR: file $encrypted_fname already exists!  Will NOT overwrite.\n";
+            $errors++;
+            next;
+          }
+          if (! ds_encrypt($gzipped_fname, $encrypted_fname)) {
+            cleanup_files();
+
+            print STDERR "$PGM: ERROR: Could not encrypt file $gzipped_fname to $encrypted_fname\n";
+            $errors++;
+            next;
+          }
+          delete $FILES_TO_CLEANUP->{$gzipped_fname};
+          $FILES_TO_UNEXTRACT->{$encrypted_fname} = 1;
+
+      		ref_touch($fname, $encrypted_fname);	# make access/mod times of final file match that of original file
+					$files_extracted++;
+
+          identify_data_source($encrypted_fname); #Register file
+        }
+      }
+      #All files extracted successfully.  Don't unextract.
+      if (0 == $errors) {
+        $FILES_TO_UNEXTRACT = undef;
+      }
+    }
+
+		if (! cleanup_files()) {
+			print STDERR "$PGM: ERROR: Could not remove some temp files for 837 file $fname . Keeping original file.\n";
+			$errors++;
+			next;
+		}
+
+		print "CONVERTED," . $info->{base_fname} . " to $destination_dir\n";
+		$files_converted++;
+	}
+}
+
+## report status info
+
+if ($files_converted) {
+	print "NUM_CONVERTED,$files_converted\n";
+}
+
+if ($files_extracted) {
+	print "NUM_EXTRACTED,$files_extracted\n";
+}
+
+if ($errors) {
+	print STDERR "ERRORS,$errors\n";
+	$exit_status += 4;
+}
+
+## exit with proper exit code
+
+if ($exit_status == 0) {
+	exit($exit_success);
+} else {
+	exit($exit_status);
+}
+
+
+END {
+	cleanup_files();
+}
+

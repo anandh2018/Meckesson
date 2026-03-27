@@ -1,0 +1,25 @@
+
+temp_file=test_ssh.$$.log
+group=rx
+
+num_servers=`grep :${group}\$ /ds/common/etc/server.info | wc -l`
+num_expected=`expr $num_servers \* $num_servers`
+
+echo "Testing $num_servers servers ... expecting $num_expected responses"
+
+mrun "mrun echo WORKED -- $group" -- $group |
+tee $temp_file
+
+num_worked=`grep '^WORKED$' $temp_file | wc -l`
+
+echo "Got $num_worked responses. Expected $num_expected."
+
+if [ $num_worked == $num_expected ]
+  then
+		echo "ALL OK"
+		rm $temp_file
+		exit 0
+  else
+		echo "PROBLEM with ssh setup! See log file $temp_file"
+		exit 1
+fi

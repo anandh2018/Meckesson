@@ -1,0 +1,73 @@
+#!/usr/bin/perl
+
+
+use warnings;
+use strict;
+
+my $dir = $ARGV[0];
+
+#opendir(DIR, $dir) || die "cannot open dir '$dir'\n";
+
+my @sl_files = glob("$dir/*.sl");
+
+print scalar(@sl_files) . " sl files\n";
+
+my ($size, $header, @parms, $candidate_parm, @lengths, $sum_lengths, $header_length, $calculated_size);
+
+foreach my $slfile (@sl_files) {
+	$size = -s $slfile;
+
+	if (! defined($size)) {
+		print "Could not get size of $slfile\n";
+		next;
+	}
+
+	if ($size == 0) {
+		print "$slfile: file is empty\n";
+
+		next;
+	}
+
+	if (! open(FH, $slfile)) {
+		print "Could not open file $slfile : $!\n";
+		next;
+	}
+
+	$header = <FH>;
+	close(FH);
+
+	$header_length = length($header);
+
+	if ($header_length == 0) {
+		print "Header is empty for file $slfile\n";
+		next;
+	}
+
+	@parms = split(',', $header);
+
+	if ($parms[0] ne 'SL') {
+		print "No 'SL' signature in file $slfile\n";
+		next;
+	}
+
+	$sum_lengths = 0;
+
+	foreach $candidate_parm (@parms) {
+
+		if ($candidate_parm =~ /^wrapped_lengths=(.*)$/) {
+			map { $sum_lengths += $_ } split(/\|/, $1);
+		}
+	}
+
+	if ($sum_lengths == 0) {
+		print "Could not grab wrapped_lengths info for $slfile\n";
+		next;
+	}
+
+	$calculated_size = $header_length + $sum_lengths;
+
+	if ($calculated_size != $size) {
+		print "$slfile: calculated size = $calculated_size, actual size = $size\n";
+	}
+}
+

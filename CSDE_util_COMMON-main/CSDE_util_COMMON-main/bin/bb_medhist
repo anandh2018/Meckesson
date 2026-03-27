@@ -1,0 +1,3 @@
+#!/bin/bash
+
+/ds/common/bin/medrecon -v $1:8080 20071001 20081231 ZZZLAST ZZZFIRST 19010101 M 30720

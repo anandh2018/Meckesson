@@ -1,0 +1,111 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Data::Dumper;
+
+use Getopt::Long;
+
+my ($from, $to);
+my $delim = '|';
+
+our $PGM = $0;
+$PGM =~ s/^.*\///;
+
+sub usage() {
+
+	print "Usage: $PGM -from # -to # [-delimiter d] [-rtrim] [-min-length #]\n";
+	print "Note: -delimiter defaults to '|'\n";
+
+}
+
+if (! @ARGV) {
+	&usage;
+	exit(0);
+}
+
+my $rtrim = 0;
+my $min_length;
+
+my $ret = GetOptions(
+  'from=s' => \$from,
+  'to=s' => \$to,
+  'delimiter=s' => \$delim,
+	'rtrim' => \$rtrim,
+	'min-length=s' => \$min_length
+);
+
+
+
+if (! defined($from)) {
+	print STDERR "Must specify -from parameter\n";
+	&usage;
+	exit(1);
+}
+
+if (! defined($to)) {
+	print STDERR "Must specify -to parameter\n";
+	&usage;
+	exit(1);
+}
+
+if ($from !~ /^\s*\d+\s*$/) {
+	die "-from parameter of '$from' is not a positive integer\n";
+}
+
+if ($to !~ /^\s*\d+\s*$/) {
+	die "-to parameter of '$from' is not a positive integer\n";
+}
+
+if ($from < 1) {
+	die "-from parameter must be at least 1\n";
+}
+
+if ($to < 1) {
+	die "-to parameter must be at least 1\n";
+}
+
+if ((! @ARGV) && (-t 0)) {
+	print STDERR "You must specify a file name on the command line or pipe input to this script\n";
+	&usage;
+	exit(1);
+}
+
+my $line_num = 0;
+my $skip = 0;
+my @data;
+my $from_value;
+
+while (<>) {
+	chomp;
+	$line_num++;
+	$skip = 0;
+
+	@data = split(/[$delim]/, $_);
+
+	if (scalar(@data) < $from) {
+		print STDERR "Warning: line $line_num does not have at least $from field values. Skipping field copy for this record\n";
+		$skip = 1;
+	} elsif (scalar(@data) < $to) {
+		print STDERR "Warning: line $line_num does not have at least $to field values. Skipping field copy for this record\n";
+		$skip = 1;
+	}
+
+	$from_value = $data[$from - 1];
+
+	no warnings 'uninitialized';
+
+	if ($rtrim) {
+		$from_value =~ s/\s+$//;
+	}
+
+	if (defined($min_length)) {
+		until (length($from_value) >= $min_length) {
+			$from_value .= ' ';
+		}
+	}
+
+	$data[$to - 1] = $from_value if (! $skip);
+
+	print join($delim, @data) . "\n";
+}

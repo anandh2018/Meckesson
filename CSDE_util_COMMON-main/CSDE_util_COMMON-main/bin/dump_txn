@@ -1,0 +1,470 @@
+#!/usr/bin/perl
+
+# dump_txn: Show entire parsed NCPDP txns in human-readable format, based on various search criteria
+# Author: J Hess, RelayHealth, 2010
+#
+# Version history:
+# v1.0: Initial release
+#
+# v1.1: The '-pdc' criteria will now use the pharmacy filter/index when possible
+#
+# v1.2:
+# Added the following filters to the command line:
+#  -next-bin           {from tail_next_bin_code}
+#  -b2                 {svc provider qualifier}
+#  -exclude-ppe-batch  {Omnicare data capture txns}
+#  -pcn
+#  -pid                {source pid}
+#
+# Changed hop filter name internally from 'PPE' to 'HOP' (new alias in NCPDP parser).
+#
+# Changed the way script name is recognized for run mode of txn vs. transmission dump.
+#
+# v1.3:
+# Added the following filters to the command line:
+#  -resp               {txn response status}
+#
+# v1.4 5/11/2011:
+#
+# 1) Added the following command-line options:
+# -sort
+# -exclude-seg
+# -seg-fields
+# -format
+# -log-level
+#
+# 2) Changed the default parser logging level to ERROR (instead of parser default of INFO)
+#
+#
+# v1.6 2/19/2013
+#
+# 1) Added "raw" format to -format option, which yields raw request/response with a timestamp prefix
+#
+# v1.7 1/29/2014
+#
+# 1) Added -exclude-test command-line option
+#
+# v1.9 9/15/2014
+# 1) Remove include_test and replace with include_pids (including all currently known)
+#
+# v1.95 12/10/2014
+# 1) Change include_pids to 'ALL'
+#
+
+my $time0 = time;
+
+use warnings;
+use strict;
+
+use BLUELITE::NCPDP::Parser;
+use Getopt::Long;
+use Data::Dumper;
+use BLUELITE::Dimension::PharmacyGroup;
+use BLUELITE::TandemSwitchAuditLog::File;
+use BLUELITE::Dimension::Contractual;
+use BLUELITE::Logger;
+
+my $PGM = $0;
+$PGM =~ s/^.*\///g;
+
+sub get_pharmacy_info($) {
+  my $pdc = shift;
+	my $info = { use_filter => 'N' };
+
+	die "PDC is empty!\n" if ($pdc =~ /^\s*$/);
+
+	if ($pdc !~ /^\s*(ALL|12)\s*$/i) {
+		my @stores = ();
+		my $use_filter = 'N';
+
+		my $search_result = BLUELITE::Dimension::Contractual->search( product_code => $pdc, latest_date => 1, status => 'N');
+
+		foreach my $row (@{$search_result}) {
+			if (($row->customer_type eq 'N') || ($row->customer_type eq 'P')) {
+				push(@stores, $row->customer_num);
+				$use_filter = 'Y';
+			} else {
+				print STDERR "Warning: Cannot use pharmacy filter/index with PDC '$pdc' due to inclusion of customer_type '" . $row->customer_type . "'\n";
+				@stores = ();
+				$use_filter = 'N';
+				last;
+			}
+		}
+
+		$info = { use_filter => $use_filter, values => \@stores };
+	}
+
+	if ($pdc =~ /^\s*12\s*$/) {
+		print STDERR "Warning: Cannot use pharmacy filter/index with PDC '$pdc' because that is a 'as was' PDC\n";
+	}
+
+	return $info;
+}
+
+
+my (@pharmacies, @rx, @post_dates, @dos, @txn_id, @auditlog, @prescriber, @ndc, @bin, @next_bin, $hop, @b1, @b2, @script, @cps_group, @pcn, @pid, $pharmacy_fname, @fill, @resp, @txn_type);
+
+my $pdc = 'ALL';
+my $exclude_verboten = 0;
+my $exclude_troop = 0;
+my $exclude_ppe_batch = 0;
+my $sort = 0;
+my @seg_fields = ();
+my @exclude_seg = ();
+my $log_level = 'ERROR';
+my $format = 'full';
+
+if (scalar(@ARGV) == 0) {
+        print "Usage: $PGM -post-date YYYYMMDD|YYYYMMDD-YYYYMMDD [-options]\n";
+				print "  options:\n";
+				print join('   ',
+					"     [-txn-id t]                    {t is Data Svcs txn id}\n",
+					"  [-script rxnum=#,pharmacy=#]   {may use NPI or NABP}\n",
+					"  [-pharmacy-id #]               {may use NPI or NABP}\n",
+					"  [-pharmacy-file fname]         {may use NPI or NABP}\n",
+					"  [-cps-group g]                 {latest stores in CPS group g}\n",
+					"  [-rx #]\n",
+					"* [-fill #]\n",
+					"  [-b1 #]                        {raw Service Provider ID}\n",
+					"* [-b2 #]                        {Service Provider ID qualifier}\n",
+					"* [-dos YYYYMMDD]\n",
+					"  [-prescriber p]\n",
+					"  [-ndc n]\n",
+					"  [-bin b]\n",
+					"* [-next-bin b]\n",
+					"* [-pcn p]\n",
+					"* [-pid p]\n",
+					"* [-resp r]\n",
+					"* [-hop filo|payer|lifo|ppe]\n",
+					"  [-auditlog fname]\n",
+					"  [-pdc p]\n",
+					"* [-txn-type billing|reversals|rebill]\n",
+					"* [-exclude-verboten]\n",
+					"* [-exclude-troop]\n",
+					"* [-exclude-ppe-batch]\n",
+					"  [-sort]\n",
+					"  [-seg-fields field:seg]\n",
+					"  [-exclude-seg seg]\n",
+					"  [-log-level INFO|WARN|ERROR]\n",
+					"  [-format f]                     {f=basic, full (default), raw}\n"
+				) . "\n";
+
+        print "Notes:\n";
+				print "1) Most parameters above may be repeated for multiple values (e.g. -ndc 1 -ndc 2 -ndc 3)\n";
+				print "2) * These fields are NOT indexed.\n";
+				print "3) The -post-date parameter is not required when -txn-id or -auditlog parameter is used\n";
+				print "4) Only txns meeting ALL specified criteria will be found (i.e. parameters are ANDed together)\n";
+        exit(0);
+}
+
+my $ret = GetOptions(
+  'pharmacy-id=s@' => \@pharmacies,
+  'pharmacy-file=s' => \$pharmacy_fname,
+  'rx=s@' => \@rx,
+  'post-date=s' => \@post_dates,
+  'dos=s@' => \@dos,
+  'txn-id=s@' => \@txn_id,
+	'auditlog=s@' => \@auditlog,
+	'prescriber=s@' => \@prescriber,
+	'ndc=s@' => \@ndc,
+	'bin=s@' => \@bin,
+	'next-bin=s@' => \@next_bin,
+	'hop=s' => \$hop,
+	'b1=s@' => \@b1,
+	'b2=s@' => \@b2,
+	'script=s@' => \@script,
+	'txn-type=s@' => \@txn_type,
+	'exclude-verboten' => \$exclude_verboten,
+	'exclude-troop' => \$exclude_troop,
+	'exclude-ppe-batch' => \$exclude_ppe_batch,
+	'pdc=s' => \$pdc,
+	'cps-group=s@' => \@cps_group,
+	'pcn=s@' => \@pcn,
+	'pid=s@' => \@pid,
+	'fill=s@' => \@fill,
+	'resp=s@' => \@resp,
+	'sort' => \$sort,
+	'seg-fields=s@' => \@seg_fields,
+	'exclude-seg=s@' => \@exclude_seg,
+	'log-level=s' => \$log_level,
+	'format=s' => \$format
+);
+
+die "Extraneous parameters on command-line: " . join(' ', @ARGV) . "\n" if (@ARGV);
+
+if ((@txn_id || @auditlog) && (! @post_dates)) {
+	my (%pd, $post_date);
+
+	my $al_file = BLUELITE::TandemSwitchAuditLog::File->new;
+
+	foreach my $txn_id (@txn_id) {
+		$post_date = $al_file->process_date(rx_txn_id => $txn_id);
+		die "Cannot get post_date for txn-id $txn_id\n" if (! defined($post_date));
+		$pd{$post_date} = undef
+	}
+
+	foreach my $al (@auditlog) {
+		$post_date = $al_file->process_date(auditlog_name => $al);
+		$pd{$post_date} = undef;
+	}
+
+	@post_dates = (keys %pd);
+}
+
+sub scrub($) {
+  my $value = shift;
+
+	if (defined($value)) {
+		$value =~ s/^\s+//;
+		$value =~ s/\s+$//;
+		$value = uc($value);
+	}
+
+	return $value;
+}
+
+my $sf_opt;
+
+$format = lc($format);
+
+if (defined($format) && $format eq 'basic') {
+	if (@exclude_seg || @seg_fields) {
+		die "Cannot use -format basic option together with -seg-fields or -exclude-seg options\n";
+	}
+
+	@exclude_seg = ('US');
+	@seg_fields = qw(REQ_P_ARRIVAL_TIME:UQ TRANSACTION_ID:UG PHARM_NPI:UT PHARM_NABP:UT);
+}
+
+if (@exclude_seg) {
+
+	foreach my $segment (@exclude_seg) {
+		my $seg = scrub($segment);
+		$sf_opt->{$seg} = [];
+	}
+}
+
+if (@seg_fields) {
+	foreach my $seg_fld (@seg_fields) {
+		my ($field, $seg) = split(':', $seg_fld);
+		$seg = scrub($seg);
+		$field = scrub($field);
+
+		push(@{$sf_opt->{$seg}}, $field);
+	}
+}
+
+my @dump_opts = ();
+@dump_opts = (segment_fields => $sf_opt) if (defined($sf_opt));
+
+initialize_logging(screen_threshold => $log_level, screen_only => 1);
+
+my $parser = BLUELITE::NCPDP::Parser->new;
+$parser->source_parser_config(include_ndc_prefix => 0, include_ndc_tail_info => 0);
+
+my @filter_opts = (index_required => 1);
+my $include_verboten = $exclude_verboten ? 0 : 1;
+my $include_troop = $exclude_troop ? 0 : 1;
+my $include_ppe_batch = $exclude_ppe_batch ? 0 : 1;
+
+# Add desired filters 
+
+$parser->add_NCPDP_filter(name => 'CONTRACT', include => $pdc, include_verboten => $include_verboten, include_troop => $include_troop, include_ppe_batch => $include_ppe_batch, include_pids => ['ALL']);
+my $pharmacy_info = get_pharmacy_info($pdc);
+$parser->add_NCPDP_filter(name => 'PHARMACY', values => $pharmacy_info->{values}) if ($pharmacy_info->{use_filter} =~ /Y/i);
+$parser->add_NCPDP_filter(name => 'PHARMACY', values_file => $pharmacy_fname) if (defined($pharmacy_fname));
+
+die "The -post-date parameter is required\n" if (! @post_dates);
+
+$parser->add_NCPDP_filter(name => 'PROCESS_DATE', values => \@post_dates) if (scalar(@post_dates) >= 1);
+
+die "Cannot use both -cps-group and -pharmacy-id parameters together\n" if (@cps_group && @pharmacies);
+
+if (@cps_group) {
+	my $pharm_group = BLUELITE::Dimension::PharmacyGroup->new || die "Cannot obtain BLUELITE::Dimension::Pharmacy_Group object : $@\n";
+
+	foreach my $group (@cps_group) {
+		my $result = $pharm_group->search(latest_date => 1, group_id => $group, latest_date => 1);
+
+		foreach my $row (@{$result}) {
+			push(@pharmacies, $row->{ATTRIBUTE}->{npi}) if (defined($row->{ATTRIBUTE}->{npi}));
+			push(@pharmacies, $row->{ATTRIBUTE}->{nabp}) if (defined($row->{ATTRIBUTE}->{nabp}));
+		}
+	}
+
+	die "No pharmacies in requested CPS group codes\n" if (! @pharmacies);
+}
+
+$parser->add_NCPDP_filter(name => 'PHARMACY', values => \@pharmacies, @filter_opts) if (scalar(@pharmacies) >= 1);
+
+$parser->add_NCPDP_filter(name => 'RX', values => \@rx, @filter_opts) if (scalar(@rx) >= 1);
+
+$parser->add_NCPDP_filter(name => 'TRANSACTION_ID', values => \@txn_id) if (scalar(@txn_id) >= 1);
+$parser->add_NCPDP_filter(name => 'AUDITLOG', values => \@auditlog) if (scalar(@auditlog) >= 1);
+
+$parser->add_NCPDP_filter(name => 'PRID', values => \@prescriber, @filter_opts) if (scalar(@prescriber) >= 1);
+$parser->add_NCPDP_filter(name => 'NDC', values => \@ndc, @filter_opts) if (scalar(@ndc) >= 1);
+$parser->add_NCPDP_filter(name => 'BIN', values => \@bin, @filter_opts) if (scalar(@bin) >= 1);
+$parser->add_NCPDP_filter(name => 'NCPDP_FIELD', field_id => 'TAIL_NEXT_BIN_CODE', segment_id => 'UQ', values => \@next_bin) if (scalar(@next_bin) >= 1);
+$parser->add_NCPDP_filter(name => 'HOP', values => [$hop]) if (defined($hop));
+$parser->add_NCPDP_filter(name => 'NCPDP_FIELD', field_id => 'B1', segment_id => 'RQ', values => \@b1, @filter_opts) if (scalar(@b1) >= 1);
+$parser->add_NCPDP_filter(name => 'NCPDP_FIELD', field_id => 'D1', segment_id => 'RQ', values => \@dos) if (scalar(@dos) >= 1);
+$parser->add_NCPDP_filter(name => 'NCPDP_FIELD', field_id => 'A4', segment_id => 'RQ', values => \@pcn) if (scalar(@pcn) >= 1);
+$parser->add_NCPDP_filter(name => 'NCPDP_FIELD', field_id => 'ITB_SID', segment_id => 'UT', values => \@pid) if (scalar(@pid) >= 1);
+$parser->add_NCPDP_filter(name => 'NCPDP_FIELD', field_id => 'AN', segment_id => '21', values => \@resp) if (scalar(@resp) >= 1);
+
+my $tstmp_format = DateTime::Format::Strptime->new( pattern => '%Y%m%d%H%M%S%3N');
+
+my @scripts = ();
+
+if (@script) {
+	foreach my $script (@script) {
+		my @params = split(/\s*,\s*/, $script);
+
+		die "-script param '$script' must contain exactly 2 name/value pairs seperated by comma\n" if (scalar(@params) != 2);
+
+		my ($rx, $phm, $name, $value);
+
+		foreach my $param (@params) {
+			if ($param =~ /^\s*(\w+)\s*=\s*(\w+)\s*$/) {
+				($name, $value) = ($1, $2);
+			} else {
+				die "-script param '$script' contains param '$param', which is not a valid 'name=value' assignment\n";
+			}
+
+			if ($name =~ /^rx/i) {
+				$rx = $value;
+			} elsif ($name =~ /^(ph|nabp|npi)/i) {
+				$phm = $value;
+			} else {
+				die "-script param '$script' contains invalid name of '$name'\n";
+			}
+		}
+
+		die "-script param '$script' does not contain 'rx=####' name/value pair\n" if (! defined($rx));
+		die "-script param '$script' does not contain 'pharmacy=####' name/value pair\n" if (! defined($phm));
+
+		push(@scripts, { phm => $phm, rxnum => $rx });
+	}
+
+	$parser->add_NCPDP_filter(name => 'SCRIPT', values => \@scripts);
+}
+
+$parser->add_NCPDP_filter(name => 'TRANS_TYPE', values => \@txn_type) if (@txn_type);
+
+my $pt;
+my $txn = 0;
+
+my $script = $0;
+$script =~ s/.*\///g;
+
+my $dump_txn;
+
+if ($PGM =~ /mission/i) {
+	$dump_txn = 0;
+} else {
+	$dump_txn = 1;
+}
+
+my %xmissions = ();
+my $num_xmissions = 0;
+my @txns = ();
+
+TXN:
+
+while ($pt = $parser->parse_next_transaction()) {
+
+	if (scalar(@b2) >= 1) {
+		my $b2 = $pt->get_value(field_id => 'B2', segment_id => 'RQ');
+		my $found_matching_b2 = 0;
+
+		B2:
+		foreach my $search_b2 (@b2) {
+			if (
+					(($search_b2 =~ /^\s*\d+\s*$/) && ($b2 =~ /^\s*\d+\s*$/) && ($search_b2 == $b2)) ||
+					($search_b2 eq $b2)
+					) {
+				$found_matching_b2 = 1;
+				last B2;	# at least one B2 we're searching for matches
+			}
+		}
+
+		next TXN if (! $found_matching_b2);
+	}
+
+	if (scalar(@fill) >= 1) {
+		my $fill_num = $pt->get_value(field_id => 'D3');
+		my $found_matching_fill = 0;
+
+		FILL:
+		foreach my $search_fill (@fill) {
+			if (
+					(($search_fill =~ /^\s*\d+\s*$/) && ($fill_num =~ /^\s*\d+\s*$/) && ($search_fill == $fill_num)) ||
+					($search_fill eq $fill_num)
+					) {
+				$found_matching_fill = 1;
+				last FILL;	# at least one fill # we're searching for matches
+			}
+		}
+
+		next TXN if (! $found_matching_fill);
+	}
+
+	if ($dump_txn) {
+
+		if ($sort) {
+			push(@txns, { xmission => $pt, group => $pt->current_group, time => $pt->get_value(field_id => 'REQ_P_ARRIVAL_TIME', segment_id => 'UQ') });
+		} else {
+			if ($format !~ /raw/i) {
+				$pt->dump_transaction(@dump_opts);
+			} else {
+				my $tstamp = $pt->get_value(field_id => 'REQ_P_ARRIVAL_TIME', segment_id => 'UQ');
+				$tstamp->set_formatter($tstmp_format);
+				print $tstamp . '-' . $pt->source_transmission->request() . chr(0x1f) . $pt->source_transmission->response();
+			}
+		}
+
+	} else {
+		my $xmission_id = $pt->get_value(field_id => 'TRANSMISSION_ID');
+
+		if (! exists($xmissions{$xmission_id})) {
+			print "Group " . $pt->current_group . " below is one of the matching txns\n";
+
+			$pt->dump_transmission(@dump_opts);
+			$xmissions{$xmission_id} = undef;
+			$num_xmissions++;
+		}
+	}
+
+	$txn++;
+
+	print "\n\n" if (! $sort);
+}
+
+my $elapsed = time - $time0;
+
+if ($dump_txn) {
+	my $sort_message = '';
+
+	if ($sort) {
+
+		foreach my $txn (sort { $a->{time} <=> $b->{time} } @txns) {
+			if ($format !~ /raw/i) {
+				$txn->{xmission}->dump_transaction(group => $txn->{group}, @dump_opts);
+			} else {
+				my $tstamp = $txn->{xmission}->get_value(field_id => 'REQ_P_ARRIVAL_TIME', segment_id => 'UQ');
+				$tstamp->set_formatter($tstmp_format);
+				print $tstamp . '-' . $txn->{xmission}->source_transmission->request() . chr(0x1f) . $txn->{xmission}->source_transmission->response();
+			}
+			print "\n\n";
+		}
+
+		$sort_message = 'sorted';
+	}
+
+	print "Dumped $txn matching $sort_message txns in $elapsed seconds\n";
+} else {
+	print "Dumped $num_xmissions transmissions containing $txn matching txns in $elapsed seconds\n";
+}
+
+

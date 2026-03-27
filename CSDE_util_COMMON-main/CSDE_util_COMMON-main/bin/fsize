@@ -1,0 +1,77 @@
+#!/usr/bin/perl
+
+# list file sizes and compute total file size
+
+use Getopt::Std;        # for parsing command line arguments
+
+getopts('d:kmgh');
+
+sub Usage() {
+	print "Usage: fsize [-d delimiter [-kmg]] [-h] [file1] [file2] [...]\n";
+}
+
+if (defined($opt_h)) {
+	&Usage;
+	exit(0);
+}
+
+if (defined($opt_d)) {
+	$delimit_only = 1;
+	$delimiter = $opt_d;
+
+	if (defined($opt_g)) {
+		$units = 1024 * 1024 * 1024;
+	} elsif (defined($opt_m)) {
+		$units = 1024 * 1024;
+	} elsif (defined($opt_k)) {
+		$units = 1024;
+	} else {
+		$units = 1;
+	}
+}
+
+if ($#ARGV >= 0) {
+	$use_std_input = 0;
+} else {
+	if (! -t 0) {
+		$use_std_input = 1;
+	} else {
+		&Usage;
+		exit(0);
+	}
+}
+
+while (1 == 1) {
+
+	if ($use_std_input) {
+		if (! eof(STDIN)) {
+			$file = <STDIN>;
+			chop($file);
+		} else {
+			last;
+		}
+	} else {
+		if ($#ARGV >= 0) {
+			$file = pop(@ARGV);
+		} else {
+			last;
+		}
+	}
+
+	($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$file_size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($file);
+	$total_size += $file_size;
+
+	if ($delimit_only) {
+		printf ("%s${delimiter}%.0f\n", $file, $file_size / $units);
+	} else {
+		printf ("%13.0f %s\n", $file_size, $file);
+	}
+}
+
+if (! $delimit_only) {
+	printf ("%13.1f %s\n", $total_size / 1024, 'KB');
+	printf ("%13.1f %s\n", ($total_size / (1024 * 1024)), 'MB');
+	printf ("%13.1f %s\n", ($total_size / (1024 * 1024 * 1024)), 'GB');
+	printf ("%13.0f %s\n", $total_size, 'bytes');
+}
+

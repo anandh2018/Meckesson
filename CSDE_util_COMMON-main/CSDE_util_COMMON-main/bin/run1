@@ -1,0 +1,139 @@
+#!/usr/bin/perl
+
+# This script just runs any other process, as long as the
+# process is not already running with the same command-line
+# arguments. This script was written to deliberately avoid
+# use of dependent libraries in order to minimize chances
+# of I/O blocking on file systems that may be blocked/hung.
+#
+# Author: J Hess, RelayHealth
+#
+
+my $PGM = $0;
+$PGM =~ s/.*\///g;
+
+sub Usage() {
+	print "This command just runs any other process, as long as the process is not already running with the same command-line arguments.\n";
+	print "It can also check for the presence of requested file systems prior to running the process, and will die if any of these checks\n";
+	print "requires more than 10 seconds (to avoid piling on if file system is hung/blocked).\n";
+	print "\n";
+	print "Usage: $PGM [-fscheck fs,..] [-source f,..] cmd [-cmd-options]\n";
+}
+
+# Check and parse command-line options
+
+if (! @ARGV) {
+	Usage;
+	exit(1);
+}
+
+my @args = @ARGV;
+
+for(my $i = 0; $i < $#args; $i++) {
+	my $arg = $args[$i];
+
+	if ($arg =~ /^-fscheck$/) {
+		shift(@ARGV);
+
+		if (! @ARGV) {
+			Usage;
+			exit(1);
+		}
+
+		# check for presence of file systems using timer (in case the check blocks too long)
+
+		my $secs = 10;
+
+		foreach my $fs (split(/\s*,\s*/, shift(@ARGV))) {
+			die "-fscheck argment '$fs' does not begin with a /\n" if ($fs !~ /^\//);
+
+			my $fs_ok = 0;
+			my $PID = fork;
+
+			if ($PID == 0) {
+				# child
+				if (-d $fs) {
+					exit(0);
+				} else {
+					exit(1);
+				}
+			} else {
+				# parent
+				my $waited_pid;
+
+				local $SIG{ALRM} = sub {
+					if (kill(INT, $PID)) {
+						sleep(5);
+
+						if (kill(INT, $PID)) {
+							kill(9, $PID);
+						}
+					}
+				};
+
+				alarm $secs;  # start timer
+				eval { $waited_pid = waitpid($PID, 0); };
+				alarm 0;  # stop timer
+
+				if (($waited_pid == $PID) && ($? == 0)) {
+					$fs_ok = 1;
+				}
+
+			};
+
+			if (! $fs_ok) {
+				die "Could not validate presence of the $fs file system : $@\n";
+			}
+		}
+
+		$i++;
+	} elsif ($arg =~ /^-source$/) {
+		shift(@ARGV);
+
+		if (! @ARGV) {
+			Usage;
+			exit(1);
+		}
+
+		@source = split(/\s*,\s*/, shift(@ARGV));
+		$i++;
+	} else {
+		last;
+	}
+}
+
+
+# setup command to invoke (including any sourcing)
+
+my $cmd;
+
+if (scalar(@source) > 0) {
+	$cmd = '. ' . join(' ; . ', @source);
+	$cmd .= ' ; ';
+}
+
+$cmd .= join(' ', @ARGV);
+
+# what string to look for in ps output
+
+my $look_for = join(' ', @ARGV);
+
+# run ps command and look for existing process already running
+
+open(PS, "ps -e -o cmd |") || die "$!\n";
+
+while (<PS>) {
+	chomp;
+
+	next if ($_ =~ /${PGM}\b/); # ignore this program
+
+	if ($_ =~ /\Q${look_for}\E$/) {
+		exit(0); # process already running, so exit without doing anything
+	}
+}
+
+close(PS) || die "Cannot close ps pipe: $!\n";
+
+# didn't find process running, so it's safe to run it
+exec $cmd;
+

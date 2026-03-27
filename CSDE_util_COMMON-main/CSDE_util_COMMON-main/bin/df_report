@@ -1,0 +1,292 @@
+#!/usr/bin/perl
+
+eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
+
+#
+# Generic Script to run DF collector reports 
+# author: David Liu
+# date: 2/18/2010
+#
+
+#  Future enhancements
+#
+#   1) pass options specific to a report (constituent PDCs to Contractual reports)
+#   2) show status of run (how far along it is) .. could be just how many files completed out of total
+#   3) list dates associated to job_id / input_dir
+#   4) show total file size for list_jobs
+#   5) ? show time estimates for running a report
+#   6) remove the need to have a wrapper script to set env variables for each feed
+#   7) email
+
+use strict;
+use warnings;
+use DS::DataFeed::Analyzer::Collector;
+use DS::DataFeed::Analyzer::ReporterFactory;
+use Data::Dumper;
+use Getopt::Long;
+
+# flush the buffer
+$| = 1;
+
+my $PGM = $0;
+$PGM =~ s|.*/||g;
+my $VERSION = $DS::DataFeed::Analyzer::VERSION;
+
+my $JOB_ID;
+my $REPORT_ID;
+my $INPUT_DIR;
+my $BEGIN_DATE;
+my $END_DATE;
+my $POST_DATE;
+my $DISPLAY_WIDTH;
+my $LOAD_TYPE;
+my $EMAIL_TO;
+my $REPORT_OPTIONS;
+
+my $list_jobs = 0;
+my $list_files = 0;
+my $list_reports = 0;
+my $list_dates = 0;
+
+sub usage() {
+  print "\n\n";
+  print "========================================================================================\n";
+  print "   Program:     $PGM                                            \n";
+  print "   Version:     $VERSION                                        \n";
+  print "   Description: This tool is used for reporting on data feeds   \n";
+  print "                with collected data from the Data Feed Collector\n";
+  print "========================================================================================\n";
+  print "\n";
+  print "    Usage: $PGM [-options] [file1 file2 file3 ... (optional)]\n";   
+  print "\n";
+  print "    TOOL OPTIONS                          DESCRIPTION \n";
+  print "    -----------------------               ------------\n";
+  print "    -list_jobs                            List JOB IDs in INPUT DIR\n";
+  print "    -list_files                           List files in INPUT DIR, based on JOB ID\n";
+  print "    -list_reports                         Display a list of reports\n";
+#  print "    -list_dates                           Lists all dates for a given JOB ID\n";  
+  print "\n";
+  print "    REPORT OPTIONS                        DEFAULT\n";
+  print "    -----------------------               --------------------\n";
+  print "    -job_id                               N/A (required if not given a list of files)\n";
+  print "    -report_id                            N/A (required)\n";  
+  print "    -input_dir                            /temp/df_collector\n";
+  print "    -load_type                            DMP\n";    
+  print "    -begin_date                           N/A\n";
+  print "    -end_date                             N/A\n";
+  print "    -post_date                            N/A\n";  
+  print "    -display_width                        80\n";
+  print "    -email_to                             none (Separate multiple e-mails by commas or semicolons)\n";
+  print "    -report_options                       none (ex. -report_options 'opt1=x,y,z;opt2=w;opt3=t,u')";
+  print "\n\n";
+  exit(1);
+}
+
+
+if(! eval { GetOptions('job_id=s'        => \$JOB_ID,
+                       'report_id=s'     => \$REPORT_ID,
+                       'input_dir=s'     => \$INPUT_DIR,                       
+                       'begin_date=i'    => \$BEGIN_DATE,                       
+                       'end_date=i'      => \$END_DATE,
+                       'post_date=i'     => \$POST_DATE,
+                       'display_width=i' => \$DISPLAY_WIDTH,
+                       'load_type=s'     => \$LOAD_TYPE,
+                       'email_to=s'      => \$EMAIL_TO,
+                       'report_options=s'=> \$REPORT_OPTIONS,                       
+                       'list_jobs'       => \$list_jobs,
+                       'list_files',     => \$list_files,
+                       'list_reports',   => \$list_reports,                       
+                       'list_dates',     => \$list_dates                                 
+                       );
+           }
+) {
+    usage();
+    exit(1);
+}
+
+if($PGM =~ /df_list_jobs/) {
+  $list_jobs = 1;    
+}
+elsif($PGM =~ /df_list_files/) {
+  $list_files = 1;  
+}
+elsif($PGM =~ /df_list_reports/) {
+  $list_reports = 1;
+}
+elsif($PGM =~ /df_list_dates/) {
+  $list_dates = 1;
+}
+
+my @collector_opts;
+my @reporter_opts;
+
+# no modes specified, mode is to report
+if(($list_jobs | $list_files | $list_files | $list_reports) == 0) {
+  
+  # require a REPORT_ID
+  if(! defined $REPORT_ID) {
+    print STDERR "\n\nERROR: Param (report_id) is required!\n";
+    usage();  
+  }  
+  
+  # user specified to collect from files, JOB ID is inferred from files
+  if(scalar (@ARGV) > 0) {
+    push (@collector_opts, files => \@ARGV);     
+  }
+  # otherwise require a JOB_ID
+  elsif(! defined $JOB_ID) {
+    print STDERR "\n\nERROR: Param (job_id) is required\n";
+    usage();
+  }
+  
+  push (@reporter_opts, id => $REPORT_ID);
+  
+  if(defined $JOB_ID) {
+    push (@collector_opts, job_id => $JOB_ID);
+  }
+  
+  if(defined $INPUT_DIR) {
+    push (@collector_opts, input_dir => $INPUT_DIR);
+  } 
+  
+  if(defined $LOAD_TYPE) {
+    push (@collector_opts, load_tpe => $LOAD_TYPE);
+  }  
+  
+  if(defined $POST_DATE) {
+    push (@reporter_opts, post_date => $POST_DATE);
+  }
+  
+  if(defined $BEGIN_DATE) {
+    push (@reporter_opts, begin_date => $BEGIN_DATE);
+  }
+  
+  if(defined $END_DATE) {
+    push (@reporter_opts, end_date => $END_DATE);
+  }  
+  
+  if(defined $EMAIL_TO) {
+    my @emails = split( /[,;]/, $EMAIL_TO);
+    push (@reporter_opts, email_to => \@emails);   
+  }
+  
+  if(defined $REPORT_OPTIONS) {
+    my @options = split (/[;]/, $REPORT_OPTIONS);
+    
+    foreach my $option (@options) {
+      my ($key, $value) = split(/[=]/, $option);
+      if($value =~ /,/) {
+        my @values = split(',',$value);
+        push (@reporter_opts, $key => \@values);         
+      }
+      else {
+        push (@reporter_opts, $key => $value); 
+      }
+    }
+  }
+  
+  # test to see if reporter options are OK before running the report
+  my @test_rpt_opts = @reporter_opts;
+  my $col_obj = DS::DataFeed::Analyzer::Collector->new();
+  push (@test_rpt_opts, collector => $col_obj);
+  my $rpt_obj =  create_reporter(@test_rpt_opts);   
+  
+  print STDERR "[" . scalar(localtime) . "] Running $PGM on " . $ENV{HOSTNAME} . " with process ID " . $$ . "\n";  
+  print STDERR "[" . scalar(localtime) . "] Collecting...\n";  
+  $col_obj = DS::DataFeed::Analyzer::Collector->new(load_flag => 1, @collector_opts);
+    
+  push (@reporter_opts, collector => $col_obj); 
+  
+  print STDERR "[" . scalar(localtime) . "] Reporting...\n";
+
+  $rpt_obj = create_reporter(@reporter_opts);
+  my %opts = @reporter_opts;
+  foreach my $key (sort keys %opts) {
+    my $value = $opts{$key};
+    print STDERR "[" . scalar(localtime) . "]   option: $key, value: $value\n";    
+  }  
+  $rpt_obj->execute();
+  
+  if(defined $DISPLAY_WIDTH) {
+    $rpt_obj->print_text(width => $DISPLAY_WIDTH);
+  }
+  else {
+    $rpt_obj->print_text();
+  }
+  
+  print STDERR "[" . scalar(localtime) . "] Complete!\n";
+  
+}
+# more than 1 mode specified 
+elsif(($list_jobs ^ $list_files ^ $list_dates ^ $list_reports) != 1) {
+  print STDERR "ERROR: Only one mode can be specified [list_jobs | list_files | list_reports | list_dates]\n";
+  exit(1);  
+}
+# list jobs
+elsif($list_jobs) {
+  
+  my %job_ids;
+  if(! defined $INPUT_DIR) {
+    $INPUT_DIR = '/temp/df_collector';
+  }
+  
+  print STDERR "[" . scalar(localtime) . "] Inspecting dir '$INPUT_DIR' for files...\n";
+  
+  if(! opendir(DIR,$INPUT_DIR) ) {
+    print STDERR "ERROR: Cannot open input directory '$INPUT_DIR'";
+    exit(1);   
+  }
+
+  foreach my $file (readdir(DIR)) {;
+    if($file =~ /^([A-Z0-9_\-]+)_\d{8}(?:-\d{8})?_.*$/) {
+      $job_ids{$1}++; 
+    }
+  }
+  
+  closedir DIR;
+  
+  my $format = "%-25.25s %-25.25s\n";
+  
+  print "\n\n";
+  printf $format, "Job ID", "Number of files";
+  print "=" x 80 . "\n";
+  foreach my $id (sort { $job_ids{$b} <=> $job_ids{$a}} keys %job_ids) {
+    printf $format, $id, $job_ids{$id};             
+  }
+  print "\n\n";  
+  
+}
+# list files
+elsif($list_files) {
+  
+  if(defined $INPUT_DIR) {
+    push @collector_opts, input_dir => $INPUT_DIR;
+  }
+  
+  if(! defined $JOB_ID) {
+    print STDERR "\n\nERROR: Param (job_id) is required\n";
+    usage();
+  }
+  
+  push (@collector_opts, job_id => $JOB_ID);    
+  
+  my $obj = DS::DataFeed::Analyzer::Collector->new(@collector_opts);
+  foreach my $f ($obj->list_files) {
+    print "$f\n";
+  }
+}
+# list reports
+elsif($list_reports) {
+  list_reporters();
+}
+# list dates
+elsif($list_dates) {
+  
+}
+
+# should not get here
+else {
+  print STDERR "ERROR: UNKNOWN ERROR OCCURRED";
+  exit(1);
+}

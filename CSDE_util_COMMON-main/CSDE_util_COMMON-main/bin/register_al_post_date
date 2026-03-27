@@ -1,0 +1,68 @@
+#!/usr/bin/perl
+
+use BLUELITE::Data_Source;
+use BLUELITE::Database;
+
+my $env = $ENV{JOBPKG_ENV};
+my $app = 'JOBPKG';
+
+my $dbh = Get_Connection(app_env => $env, app => $app); 
+
+if (! defined($dbh)) {
+	die "ERROR: Could not get database connection for app '$app' in '$env' environment!\n";
+}
+
+my $num_recent_days = 7;
+$num_recent_days = shift(@ARGV) if (@ARGV);
+
+my $get_post_dates_sql = "
+	SELECT post_date, sum(filesize) filesize, sum(physical_filesize) physical_filesize
+	FROM data_source_registery
+	WHERE post_date in (
+		SELECT post_date
+		FROM data_source_registery WHERE format = 'AL' AND standard = 'NCPDP' AND post_date >= to_char(sysdate - $num_recent_days, 'YYYYMMDD') AND post_date_complete = 'Y'
+		MINUS
+		SELECT post_date
+		FROM data_source_registery
+		WHERE format = 'POSTDATE' AND standard = 'NCPDP' AND post_date >= to_char(sysdate - $num_recent_days, 'YYYYMMDD') AND post_date_complete = 'Y'
+	)
+	AND format = 'AL' AND standard = 'NCPDP'
+	AND post_date >= to_char(sysdate - $num_recent_days, 'YYYYMMDD')
+	GROUP BY post_date
+";
+
+my $post_date_info = $dbh->selectall_hashref($get_post_dates_sql, 'POST_DATE');
+my $dsr;
+my $format = 'POSTDATE';
+my $standard = 'NCPDP';
+my $num_errors = 0;
+my $num_registered = 0;
+
+foreach my $post_date (sort keys %{$post_date_info}) {
+	$fname = "ALPD_${format}_${standard}_${post_date}";
+
+	$dsr = BLUELITE::Data_Source->new(filename => $fname);
+	$dsr->filesize($post_date_info->{$post_date}->{FILESIZE});
+	$dsr->physical_filesize($post_date_info->{$post_date}->{PHYSICAL_FILESIZE});
+
+	if ($dsr->register_data_source) {
+		print "Successfully registered auditlog post date $post_date for format $format, standard ${standard}.\n\n";
+		$num_registered++;
+	} else {
+		print STDERR "ERROR: could not register auditlog post date $post_date for format $format, standard ${standard}.\n\n";
+		$num_errors++;
+	}
+}
+
+$dbh->disconnect;
+
+if (($num_registered == 0) && ($num_errors == 0)) {
+	print "No post dates to register for format $format, standard $standard\n" if (-t 1);
+}
+
+if ($num_errors) {
+	exit(1);
+} else {
+	exit(0);
+}
+

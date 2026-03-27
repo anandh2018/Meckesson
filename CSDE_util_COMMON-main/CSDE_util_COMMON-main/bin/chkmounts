@@ -1,0 +1,477 @@
+#!/usr/bin/perl
+
+use Data::Dumper;
+use Sys::Hostname;
+
+use strict;
+use warnings;
+
+our $issue = {};
+our $mountinfofilename = "/ds/common/etc/server_mount.info";
+our $error_status = 0;
+
+
+sub read_mount_info($)
+{
+my $mountinfo = shift;
+my 	($server, $mount, $type, $options) ;
+my $all;
+my $global = {};
+
+
+if (! -f $mountinfo)
+{
+	print STDERR "checkmounts: Unable to locate mount info file \"$mountinfo\"\n";
+	$error_status = 4;
+	goto COMPLETE;
+}
+
+
+
+if (! open (INFO, "< $mountinfo" ))
+{
+	print STDERR "checkmounts: Unable to open mount info file \"$mountinfo\"\n";
+	print STDERR "error: $!\n";
+	$error_status = 4;
+	goto COMPLETE;
+}
+
+while (<INFO>)
+{
+	chomp;
+	# Remove comments
+	s/[#].*$//;
+	# Remove whitspace
+	s/^\s*//;
+	s/\s*$//;
+	# Remove blank lines
+	next if (/^\s*$/);
+
+	($server, $mount, $type, $options) = split('\s*:\s*', $_);
+
+	next if ($server ne "all");
+
+	$all->{$mount}->{TYPE} = $type;
+
+	if ($options ne "")
+	{
+		@{$all->{$mount}->{OPTIONS}} = split(",", $options);
+	}
+	else
+	{
+		@{$all->{$mount}->{OPTIONS}} = ();
+	}
+
+}
+close (INFO);
+
+if (! open (INFO, "< $mountinfo" ))
+{
+	print STDERR "checkmounts: Unable to open mount info file \"$mountinfo\"\n";
+	print STDERR "error: $!\n";
+	$error_status = 4;
+	goto COMPLETE;
+}
+
+while (<INFO>)
+{
+	chomp;
+	# Remove comments
+	s/[#].*$//;
+	# Remove whitspace
+	s/^\s*//;
+	s/\s*$//;
+	# Remove blank lines
+	next if (/^\s*$/);
+
+	($server, $mount, $type, $options) = split('\s*:\s*', $_);
+
+	next if ($server eq "all");
+
+	$global->{$server}->{$mount}->{TYPE} = $type;
+
+	if ($options ne "")
+	{
+		@{$global->{$server}->{$mount}->{OPTIONS}} = split(",", $options);
+	}
+	else
+	{
+		@{$global->{$server}->{$mount}->{OPTIONS}} = ();
+	}
+
+}
+
+
+$global->{STD} = {};
+
+foreach $mount (keys %{$all})
+{
+	foreach $server (keys %{$global})
+	{
+		if (! exists($global->{$server}->{$mount}))
+		{
+			$global->{$server}->{$mount}->{TYPE} = $all->{$mount}->{TYPE};
+			@{$global->{$server}->{$mount}->{OPTIONS}} = @{$all->{$mount}->{OPTIONS}};
+		}
+	}
+
+}
+
+
+return $global;
+
+}
+
+sub record ($$;@)
+{
+	my $hostname = shift;
+	my $mount = shift;
+	my $level = shift;
+	my $message = shift;
+
+	push (@{$issue->{$hostname}->{$mount}},
+				{ LEVEL => $level,
+					MSG => $message });
+}
+
+
+
+
+my $global;
+my $hostname;
+my $use_hostname;
+my @servers;
+my $mount;
+my $option;
+my @option;
+my $type;
+my @hostnames;
+my $open;
+my ($device, $options, $dump, $fsck);
+my $fstab;
+my $error = {};
+my $mounted = {};
+my @mountinfofiles;
+my $ds_msg;
+my @test;
+my $mount_string;
+
+
+if (! ($global = read_mount_info($mountinfofilename)))
+{
+	print STDERR "Unable to read mount info file - Aborting\n";
+	$error_status = 4;
+	goto COMPLETE;
+}
+
+#print Dumper ($global);
+
+if (scalar(@ARGV) != 0)
+{
+	@servers = @ARGV;
+}
+else
+{
+	@servers = (hostname);
+}
+
+# ($host, $aliases, $addrtype, $length, @addrs) = gethostbyname( $host );
+
+
+foreach $hostname (@servers)
+{
+	# Get /etc/fstab
+
+	if (hostname eq $hostname || hostname =~ /^$hostname[.]/)
+	{
+
+		if (! -r "/etc/fstab")
+		{
+			print STDERR "chkmounts: Cannot access local /etc/fstab\n";
+			next;
+		}
+
+		if (! open (FSTAB, "< /etc/fstab"))
+		{
+			print STDERR "chkmounts: Cannot open local /etc/fstab\n";
+			print STDERR "error: $!\n";
+			next;
+		}
+		
+	}
+	else
+	{
+
+		# Test that ssh to the host will work at all
+
+		if (! open (TEST, "ssh -n $hostname echo confirmed  2>&1  |"))
+		{
+			print STDERR "chkmounts: Cannot open remote ssh on $hostname\n";
+			print STDERR "error: $!\n";
+			next;
+		}
+
+		@test = <TEST>;
+
+		if (! grep { $_ =~ /confirmed/ } @test)
+		{
+			close (TEST);
+			print STDERR "chkmounts: Unable to ssh to host $hostname\n";
+			print STDERR "error(s): @test\n";
+			$error_status = 4;
+			goto COMPLETE;
+		}
+
+		close (TEST);
+		
+		if (! open (FSTAB, "ssh -q $hostname cat /etc/fstab |"))
+		{
+			print STDERR "chkmounts: Cannot open remote /etc/fstab on $hostname\n";
+			print STDERR "error: $!\n";
+			next;
+		}
+	}
+
+	$fstab = {};
+
+	while (<FSTAB>)
+	{
+		chomp;
+		# Remove comments
+		s/[#].*$//;
+		# Remove whitspace
+		s/^\s*//;
+		s/\s*$//;
+		# Remove blank lines
+		next if (/^\s*$/);
+
+		($device, $mount, $type, $options, $dump, $fsck) = split('\s+', $_);
+
+		$fstab->{$mount}->{DEVICE} = $device;
+		$fstab->{$mount}->{TYPE} = $type;
+		$fstab->{$mount}->{DUMP} = $dump;
+		$fstab->{$mount}->{FSCK} = $fsck;
+		@{$fstab->{$mount}->{OPTIONS}} = split(",", $options);
+
+	}
+
+	close (FSTAB);
+
+
+
+	if (hostname eq $hostname || hostname =~ /^$hostname[.]/)
+	{
+		if (! open (MOUNT, "mount |"))
+		{
+			print STDERR "chkmounts: Cannot exec mount\n";
+			print STDERR "error: $!\n";
+			next;
+		}
+		
+	}
+	else
+	{
+		if (! open (MOUNT, "ssh -q $hostname mount |"))
+		{
+			print STDERR "chkmounts: Cannot run remote mount on $hostname\n";
+			print STDERR "error: $!\n";
+			next;
+		}
+	}
+
+	$mount = {};
+
+	while (<MOUNT>)
+	{
+		chomp;
+		# Remove comments
+		s/[#].*$//;
+		# Remove whitspace
+		s/^\s*//;
+		s/\s*$//;
+		# Remove blank lines
+		next if (/^\s*$/);
+
+		if (/^(\S+)\s+on\s+(\S+)\s+type\s+(\S+)\s+[(](\S+)[)]/)
+		{
+			($device, $mount, $type, $options) = ($1, $2, $3, $4);
+		}
+		elsif (/^(\S+)\s+on\s+(\S+)\s+type\s+(\S+)/)
+		{
+			($device, $mount, $type) = ($1, $2, $3);
+		}
+		else
+		{
+			record("GLOBAL", "GLOBAL", 1,
+							"chkmounts ($hostname) - Can't parse mount output line: $_");
+		}
+
+		$mounted->{$mount}->{DEVICE} = $device;
+		$mounted->{$mount}->{TYPE} = $type;
+		@{$mounted->{$mount}->{OPTIONS}} = split(",", $options);
+
+	}
+
+	close (MOUNT);
+
+
+
+
+	$use_hostname = $hostname;
+
+	if (! exists($global->{$use_hostname}))
+	{
+		$use_hostname =~ s/[.].*$//;
+
+		if (! exists($global->{$use_hostname}))
+		{
+			# Can find a reference to current hostname so I'll use the standard one
+
+			$use_hostname = "STD";
+
+			if (! exists($global->{$use_hostname}))
+			{
+				print STDERR "chkmounts: Don't have mounts for servers not referenced in mount info file - assuming no mounts\n";
+				$global->{$hostname} = {}; # No mounts
+				$use_hostname = $hostname;			
+			}
+		}
+		
+	}
+
+
+	# Check Mounts
+
+	foreach $mount (keys %{$global->{$use_hostname}})
+	{
+		if (exists($fstab->{$mount}))
+		{
+			if ($fstab->{$mount}->{TYPE} ne $global->{$use_hostname}->{$mount}->{TYPE})
+			{
+	
+				record($hostname, $mount, 3,
+							"Mount \"$mount\" - required type of \"$global->{$use_hostname}->{$mount}->{TYPE}\" different than current \"$fstab->{$mount}->{TYPE}\" in /etc/fstab");
+			}
+
+			foreach $option (@{$global->{$use_hostname}->{$mount}->{OPTIONS}})
+			{
+				if (! grep { $_ eq $option } @{$fstab->{$mount}->{OPTIONS}})
+				{
+					if ($option eq "ro")
+					{
+						record($hostname, $mount, 3,
+							"Mount \"$mount\" - required readonly option not active - options = \"" . join(",", @{$fstab->{$mount}->{OPTIONS}}) . "\"");
+					}
+					else
+					{
+						record($hostname, $mount, 2,
+							"Mount \"$mount\" - required option of \"$option\" not active - options = \"" . join(",", @{$fstab->{$mount}->{OPTIONS}}) . "\"");
+					}
+				}
+				
+			}
+
+			if (exists($mounted->{$mount}))
+			{
+				$mount_string = $mount;
+				$mount_string =~ s!^.*[/]!!;
+
+				opendir(DIR, $mount) || die "can't opendir $mount: $!";
+    		@mountinfofiles = grep { -f "$mount/$_" && $_ =~ /^fs_.*[.]info$/} readdir(DIR);
+    		closedir DIR;
+#print "MOUNT: $mount\n";
+#print Dumper (\@mountinfofiles);
+
+				if (scalar(@mountinfofiles) == 0)
+				{
+					# No fs.*.info file on this filesystem - assume that is ok
+					record($hostname, $mount, 1,
+						"Mount \"$mount\" does not appear to have a fs_XXXX.info file on the mount root");
+				}
+				elsif (grep { s/^fs_//; s/[.]info$//; $_ eq $mount_string } @mountinfofiles)
+				{
+					1; # OK
+				}
+				else
+				{
+					record($hostname, $mount, 3,
+						"Mount \"$mount\" is cross mounted to " . join(" or ", @mountinfofiles) . "!!! Unmount now!!!");
+				}
+				
+			
+			}
+			else
+			{
+				record($hostname, $mount, 3,
+					"Mount \"$mount\" is not mounted!");
+			}
+			
+				
+		}
+		else
+		{
+			record($hostname, $mount, 3,
+				"Mount \"$mount\" not in /etc/fstab as required on server \"$hostname\"");
+		}
+
+
+	}
+
+	
+
+
+
+}
+
+
+COMPLETE:
+
+
+foreach $hostname (sort keys %{$issue})
+{
+	print "Server $hostname Issues\n";
+	print "=======================================\n";
+	foreach $mount (sort keys %{$issue->{$hostname}})
+	{
+		foreach $ds_msg (sort { $a->{LEVEL} <=> $b->{LEVEL} } @{$issue->{$hostname}->{$mount}})
+		{
+			print "    ($ds_msg->{LEVEL}) $ds_msg->{MSG}\n";
+			if ($ds_msg->{LEVEL} > $error_status)
+			{
+				$error_status = $ds_msg->{LEVEL};
+			}
+		}
+		print "\n";
+	}
+}
+
+
+print STDERR "\n";
+
+if ($error_status == 0)
+{
+	print STDERR "chk_mounts($error_status): Successful check of filesystems with no issues\n";
+}
+elsif ($error_status == 1)
+{
+	print STDERR "chk_mounts($error_status): Minor issues detected - please notify Data Services via Email\n";
+}
+elsif ($error_status == 2)
+{
+	print STDERR "chk_mounts($error_status): Medium level issues detected - please notify Data Services via Email\n";
+}
+elsif ($error_status == 3)
+{
+	print STDERR "chk_mounts($error_status): Major issues detected - please notify Data Services immediately\n";
+}
+else
+{
+	print STDERR "chk_mounts($error_status): Check Mount program was unable to execute successfully - please notify Data Services immediately\n";
+}
+
+
+
+exit($error_status);
+
+
+

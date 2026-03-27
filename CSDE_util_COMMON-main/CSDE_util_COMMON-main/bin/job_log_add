@@ -1,0 +1,65 @@
+#!/usr/bin/perl
+
+use BLUELITE::Job;
+use Data::Dumper;
+use strict;
+use warnings;
+
+our $PGM = $0;
+$PGM =~ s/.*\///g;
+
+if (scalar(@ARGV) == 0) {
+	print "$PGM: Manually add an entry into the BLUELITE::Job log table for an app_id.
+
+This can be used by support personnel to temporarily force a specific external alert
+status.  For example, to set BigBrother alert status to green for at least 2 hours:
+
+$PGM -app-id DUMMY -message 'Temporarily set to green by John Hess' -event-code SPSTATUS -log-date +2h
+
+To limit max BigBrother alert status to yellow for at least 45 minutes:
+
+$PGM -app-id DUMMY -message 'Limiting max alert status to yellow for 45 mins (M Narang)' -event-code SPSTATUS -log-date +45m -log-type WARN
+
+Usage: $PGM -app-id app_id -message 'your quoted message' [-options]
+Options:
+
+-post-date YYYYMMDD
+-event-code code         {use 'SPSTATUS' to force BB status}
+-log-type INFO|WARN|LATE
+-log-date 'YYYYMMDD HH:MI' | +#m | +#h
+
+-log-date defaults to current date/time. Examples:
+1) -log-date '20101022 13:59'    {future dates allowed}
+2) -log-date +90m   {90 minutes from now}
+3) -log-date +1h    { 1 hour    from now}
+\n";
+	exit(1);
+}
+
+use Getopt::Long;
+
+my ($app_id, $post_date, $event_code, $message, $log_type, $log_date);
+
+GetOptions(
+            'app-id=s' => \$app_id,
+            'post-date=s' => \$post_date,
+            'event-code=s' => \$event_code,
+            'message=s' => \$message,
+            'log-type=s' => \$log_type,
+            'log-date=s' => \$log_date
+) || exit(1);
+
+
+die "$PGM: -app-id parameter not provided!\n" if (! defined($app_id));
+die "$PGM: -message parameter not provided!\n" if (! defined($message));
+
+my $job = BLUELITE::Job->new(app_id => $app_id) || die "Could not obtain BLUELITE::Job object\n";
+
+my @log_parameters = (message => $message);
+
+push(@log_parameters, post_date => $post_date) if (defined($post_date));
+push(@log_parameters, event_code => $event_code) if (defined($event_code));
+push(@log_parameters, log_type => $log_type) if (defined($log_type));
+push(@log_parameters, log_date => $log_date) if (defined($log_date));
+
+$job->log(@log_parameters);

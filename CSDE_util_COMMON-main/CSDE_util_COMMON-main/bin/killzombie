@@ -1,0 +1,46 @@
+
+user=$USER
+match=$1
+
+if [ "$match" != '' ]
+  then
+		match_expr="$match"
+  else
+		match_expr=.
+fi
+
+delay=4
+
+while :
+ do
+	pids=`ps -fwu $user |
+	egrep "$match_expr" |
+	egrep -v "gvim|java|qas" |
+	sed 's/  */ /g' |
+	cut -d' ' -f2,3 |
+	grep ' 1$' |
+	cut -d' ' -f1`
+
+	if [ "$pids" = '' ]
+  then
+			echo all done
+			exit 0
+	fi
+
+	echo About to kill these processes...
+
+	ps -o cmd $pids
+
+	echo hit CTRL-C within $delay secs to avoid killing processes and terminate script
+
+	sleep $delay
+	sleep 1
+
+	echo killing $pids
+
+	kill $pids
+
+	sleep 1
+ done
+
+

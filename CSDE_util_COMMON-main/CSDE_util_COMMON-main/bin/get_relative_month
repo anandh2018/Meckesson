@@ -1,0 +1,6 @@
+#!/usr/bin/perl
+
+use BLUELITE::Common;
+
+print get_relative_month($ARGV[0]);
+

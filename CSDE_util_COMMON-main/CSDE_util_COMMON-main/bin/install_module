@@ -1,0 +1,82 @@
+#!/usr/bin/perl
+
+
+if ($ARGV[0] eq "-install")
+{
+	shift (@ARGV);
+	$install = uc(shift(@ARGV));
+}
+else
+{
+	print STDERR "make_makefile: Must specify option where the package is to be installed\n";
+	print STDERR "\n";
+	print STDERR "Usage: make_makefile -install common | std ... (other options)\n";
+	print STDERR "\n";
+	exit(1);
+}
+
+if ($install =~ /^COMMON|BLUELITE$/i)
+{
+	print "\n";
+	print " *  Makefile will be generated to install into the *Common Bluelite* directories\n";
+	print "\n";
+	$install_base = "/ds/common";
+}
+elsif ($install =~ /^STD|STANDARD|PERL$/i)
+{
+	print "\n";
+	print " * Makefile will be generated to install into the *Bluelite Perl* directories\n";
+	print "\n";
+	$install_base = "/ds/perl";
+
+}
+else
+{
+	print STDERR "make_makefile: Must specify where the package is to be installed\n";
+	print STDERR "\n";
+	print STDERR "Usage: make_makefile -install common | std ... (other options)\n";
+	print STDERR "\n";
+	
+	exit(1);
+}
+
+$ARCH = $ENV{ARCH};
+$install_lib = "$install_base/lib";
+$install_man = "$install_base/man";
+$install_bin = "$install_base/bin";
+$install_arch = "$install_lib/$ARCH";
+
+die "No install_base directory: $install_base\n" if (! -d $install_base);
+die "No install_lib directory: $install_lib\n" if (! -d $install_lib);
+die "No install_man directory: $install_man\n" if (! -d $install_man);
+die "No install_bin directory: $install_bin\n" if (! -d $install_bin);
+	
+
+@parms = ();
+push (@parms, "INSTALLDIRS=perl");
+
+push (@parms, "LIB=$install_lib");
+push (@parms, "INSTALLPRIVLIB=$install_lib");
+
+push (@parms, "INSTALLMAN1DIR=$install_man");
+push (@parms, "INSTALLMAN3DIR=$install_man");
+
+push (@parms, "INSTALLBIN=$install_bin");
+push (@parms, "INSTALLSCRIPT=$install_bin");
+
+push (@parms, "INSTALLARCHLIB=$install_arch");
+
+$cmd = "perl Makefile.PL " . join(" ", @parms) . " " . join(" ", @ARGV);
+
+print "$cmd\n";
+
+$ret = system ($cmd);
+$ret = $ret >> 8;
+
+if ($ret != 0) 
+{
+	print STDERR "\n";
+	print	STDERR "ERROR: make_makefile: perl Makefile.PL failed!!!\n";
+	print STDERR "\n";
+}
+

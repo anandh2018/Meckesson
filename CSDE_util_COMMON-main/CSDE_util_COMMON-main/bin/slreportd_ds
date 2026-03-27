@@ -1,0 +1,250 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Proc::ProcessTable;
+use Schedule::Load::Hosts;
+use Data::Dumper;
+
+# This program is designed to keep the slreportd daemon running with the latest
+# prun2 server.info file group information (which is translated into server class
+# designations for slreportd).  It should be run every few minutes via cron.
+#
+
+
+sub get_slreportd_pids() {
+
+	my $cmd;
+  my @pids = ();
+	my $pt = new Proc::ProcessTable;
+
+	foreach my $p (@{$pt->table}) {
+
+		$cmd = $p->cmndline;
+
+		if ($cmd =~ /([^A-Za-z_]slreportd[^A-Za-z_])|(^slreportd$)|(^slreportd[^A-Za-z_])|([^A-Za-z_]slreportd)$/) {
+			push(@pids, $p->pid);
+		}
+	}
+
+	return @pids;
+}
+
+
+my $server_info_file;
+
+if (exists($ENV{PRUN2_SERVER_INFO})) {
+	$server_info_file = $ENV{PRUN2_SERVER_INFO};
+} else {
+	$server_info_file = '/ds/common/etc/server.info';
+}
+
+die "ERROR: server info file '$server_info_file' does not exist!\n" if (! -e $server_info_file);
+die "ERROR: server info file '$server_info_file' is not a regular file!\n" if (! -f $server_info_file);
+die "ERROR: no permission to read server info file '$server_info_file'\n" if (! -r $server_info_file);
+
+
+my ($server_name, $processors, $speed, $rsh_cmd, $group, $line_num, $original_line, %server_info, %server_groups);
+
+if (! open(SI, "$server_info_file")) {
+	die "ERROR: Unable to open server info file $server_info_file : $!\n";
+}
+
+$line_num = 0;
+
+while (<SI>) {
+	chomp;
+	$line_num++;
+	$original_line = $_;
+
+	$_ =~ s/^ +//;
+	$_ =~ s/ +$//;
+
+	next if ($_ =~ /^#/);
+	next if ($_ !~ /[:,]/);
+
+	($server_name, $processors, $speed, $rsh_cmd, $group) = split('[:,]', $_);
+
+	if ($server_name eq '') {
+		print STDERR "Warning: Server name missing from line $line_num of server info file $server_info_file : line = '$original_line'\n";
+		next;
+	}
+
+	if ($processors !~ /^[0-9]+$/) {
+		print STDERR "Warning: Number of physical processors for server $server_name is not valid ($processors). Forcing to 1.\n";
+		$processors = 1;
+	}
+
+	$server_info{$server_name}{'processors'} = $processors;
+
+	if (($rsh_cmd ne 'rsh') and ($rsh_cmd ne 'ssh')) {
+		print STDERR "Warning: rsh_cmd for $server_name is not rsh or ssh ($rsh_cmd). Assuming rsh\n";
+		$rsh_cmd = 'rsh';
+	}
+
+	$server_info{$server_name}{'rsh_method'} = $rsh_cmd;
+
+	if ($speed > 0) {
+		$server_info{$server_name}{'server_speed'} = $speed;
+	} else {
+		$server_info{$server_name}{'server_speed'} = 0;
+	}
+
+	if (length($group) > 0) {
+		$server_info{$server_name}{'server_group'} = $group;
+		$server_groups{$group}{'servers'}{$server_name} = 1;
+	} else {
+		$server_info{$server_name}{'server_group'} = '';
+	}
+
+}
+
+close(SI);
+
+my $hostname = `hostname`;
+
+die "ERROR: Could not get hostname\n" if (! defined($hostname));
+
+chomp($hostname);
+
+die "ERROR: Could not get hostname\n" if (length($hostname) == 0);
+
+my $hostname_full = $hostname;
+
+$hostname =~ s/[.].*$//;
+
+$group = '';
+
+if (! exists($server_info{$hostname})) {
+	print STDERR "Warning: hostname '$hostname' not found in server info file '$server_info_file'\n";
+} elsif (! exists($server_info{$hostname}{server_group})) {
+	print STDERR "Warning: hostname '$hostname' has no group in server info file '$server_info_file'\n";
+} else {
+	no warnings;
+
+	$group = $server_info{$hostname}{server_group};
+	$group =~ s/^\s+//;
+	$group =~ s/\s+$//;
+
+	if ($group =~ /^\s*$/) {
+		print STDERR "Warning: hostname '$hostname' has no group in server info file '$server_info_file'\n";
+	}
+
+	$processors = $server_info{$hostname}{processors};
+	$processors =~ s/^\s+//;
+	$processors =~ s/\s+$//;
+
+	if ($processors !~ /^\d+$/) {
+		print STDERR "Warning: hostname '$hostname' has no number of processors in server info file '$server_info_file' , defaulting to 1\n";
+		$processors=1;
+	}
+}
+
+my $hosts = Schedule::Load::Hosts->fetch();
+die "ERROR: could not get Hosts object!\n" if (! defined($hosts));
+my @reportd_groups = ();
+
+my $reporterd_running = 0;
+
+foreach my $host ($hosts->hosts_match(match_cb => sub { if ($_[0]->hostname =~ /^${hostname}[.]|^${hostname}$/) { return 1; } else { return 0;} } )) {
+	$reporterd_running = 1;
+	push(@reportd_groups, grep { $_ =~ /^class_grp_(.+)$/ } ($host->fields));
+}
+
+foreach my $grp (@reportd_groups) {
+	$grp =~ s/^class_grp_//;
+}
+
+my %reportd_groups = map { $_ => 1 } @reportd_groups;
+
+my $groups_differ = 0;
+
+if ($reporterd_running) {
+	map { $_ =~ s/^class_grp_// } @reportd_groups;
+	print "groups = " . join(', ', @reportd_groups) . "\n";
+
+	foreach my $temp_grp ($group) {
+		if (! exists($reportd_groups{$temp_grp})) {
+			$groups_differ = 1;
+			last;
+		}
+	}
+
+	foreach my $temp_grp (@reportd_groups) {
+		if ($temp_grp ne $group) {
+			$groups_differ = 1;
+			last;
+		}
+	}
+}
+
+my $cmd;
+
+if (defined($ARGV[0])) {
+	$cmd = $ARGV[0];
+} else {
+	$cmd = '';
+}
+
+if ($groups_differ || ($cmd =~ /^\s*restart\s*$/i) ) {
+	print "debug: groups differ\n" if ($groups_differ);
+	my @reporter_pids = (get_slreportd_pids);
+
+	if (scalar(@reporter_pids) >= 1) {
+		my $attempts = 0;
+		my $reporter_pids_killed = 0;
+
+		while ($attempts < 10) {
+
+			$attempts++;
+print "debug: attempting to kill existing reporter\n";
+			if (kill(9, @reporter_pids) == 0) {
+				$reporter_pids_killed = 1;
+				last;
+			}
+
+			sleep 5 unless ($attempts == 1);
+		}
+
+		die "ERROR: Could not kill of existing reporter pids of " . join(', ', @reporter_pids) . "\n" if (! $reporter_pids_killed);
+
+		$hosts = Schedule::Load::Hosts->fetch();
+
+		foreach my $host ($hosts->hosts_match(match_cb => sub { if ($_[0]->hostname =~ /^${hostname}[.]|^${hostname}$/) { return 1; } else { return 0;} } )) {
+			die "ERROR: reporter daemon still seems to be running, even though I killed it off due to groups differing\n";
+		}
+
+		$reporterd_running = 0;
+	}
+}
+
+if ($reporterd_running) {
+	print "debug: no need to start new reporter daemon process\n";
+	exit(0);
+}
+
+my @daemon_opts = ();
+
+$group = 'none' if ($group =~ /^\s*$/);
+
+push(@daemon_opts, "class_grp_${group}=1");
+#$processors *= 2;
+
+push(@daemon_opts, "load_limit=$processors");
+#push(@daemon_opts, "load_pctcpu=1");
+push(@daemon_opts, "dynamic_cache_timeout=3");
+#push(@daemon_opts, "class_id_${hostname_full}=1");
+
+print "Starting slreportd with the following options: " . join(' ', @daemon_opts) . "\n";
+
+my $ret = system('slreportd', @daemon_opts);
+$ret = $ret >> 8;
+
+if ($ret != 0) {
+	print STDERR "ERROR: slreportd failed with return code $ret !\n";
+} else {
+	print "slreportd now running\n";
+}
+
+exit($ret);
+

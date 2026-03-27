@@ -1,0 +1,263 @@
+#!/usr/bin/perl
+
+# job_delivery_update: Mark BLUELITE::Job deliverable as having been "delivered" (transmitted) to client
+#
+# Author(s): John Hess, RelayHealth
+#
+# Version history:
+# Version 1.0 - 9/18/2007
+#
+# Version 6.0 - 10/31/2014
+# - Added support for "autohoc" requests (i.e. automated on-demand ad-hoc processing).
+#
+# Version 6.2 - 5/22/2015
+# - Added -suffix command line option (e.g. to find feed_20150325.txt when given feed_20150325.txt.pgp with -source-app-id)
+#
+
+use BLUELITE::Job;
+use BLUELITE::Logger;
+use Getopt::Long;
+use DateTime;
+use DateTime::Duration;
+
+use warnings;
+use strict;
+
+our $PGM = $0;
+$PGM =~ s/.*\///g;
+
+our $FAILURE_EMAIL;
+our $SMTP_SERVER = $ENV{DEFAULT_SMTP_SERVER};
+
+
+our $DS_BASE_DIR = $ENV{DS_BASE_DIR};
+die "ERROR: environment variable DS_BASE_DIR not set!\n" if ((! defined($DS_BASE_DIR)) || (length($DS_BASE_DIR) == 0));
+die "ERROR: environment variable DS_BASE_DIR points to $DS_BASE_DIR, which does not exist!\n" if (! -d $DS_BASE_DIR);
+
+our $REMOVE_LOG_ON_SUCCESS = 1;
+our ($LOGFILE, $APP_ID, $SOURCE_APP_ID);
+
+
+sub email(%) {
+  my %option = @_;
+
+  my $mail = new Mail::SendEasy( smtp => $SMTP_SERVER);
+
+  my $logger = get_logger;
+
+  if (! defined($mail) ) {
+    $logger->warn("Unable to establish a SMTP connection to $SMTP_SERVER. Cannot send email.");
+    return undef;
+  }
+
+  if (exists($option{msg}) && ! exists($option{html})) {
+    $option{html} = $option{msg};
+    $option{html} =~ s/\n/<br>/g;
+  }
+
+  my $status = $mail->send(
+    from => 'dataservicesnotification@relayhealth.com',
+    from_title => 'RelayHealth Data Services',
+    %option
+  );
+
+  if (! $status) {
+    $logger->warn($mail->error);
+    return undef;
+  }
+
+  return 1;
+}
+
+
+
+sub mydie(;$) {
+  my $message = shift;
+  my $exit_code;
+
+  if (defined($message)) {
+  	chomp($message);
+		$message .= "\n\nSee logfile $LOGFILE for more details.\n" if (defined($LOGFILE));
+	}
+
+ 	my $logger = get_logger;
+	$logger->error($message);
+
+  if (defined($FAILURE_EMAIL)) {
+		$logger->info("Sending email to $FAILURE_EMAIL");
+
+    email(
+      to => $FAILURE_EMAIL,
+      subject => "$APP_ID delivery update process FAILED",
+      msg => $message
+    );
+  }
+
+  exit(1);
+}
+
+
+sub Usage() {
+	print STDOUT "Usage 1: $PGM -app-id a [options] filename\n";
+	print STDOUT "Usage 2: $PGM -source-app-id a [options] filename\n";
+	print STDOUT "Options:\n";
+	print STDOUT "   -destination-host hostname\n";
+	print STDOUT "   -log-dir dir\n";
+	print STDOUT "   -keep-log\n";
+	print STDOUT "   -logging-level level           (DEBUG, INFO, WARN, ERROR, FATAL)\n";
+	print STDOUT "   -smtp-server smtp\n";
+}
+
+
+################ MAIN ##############
+
+if (scalar(@ARGV) == 0) {
+        Usage;
+        exit(1);
+}
+
+my ($destination_host, $keep_log, $log_dir, $suffix);
+my $logging_level = 'INFO';
+
+my $ret = GetOptions(
+											'app-id=s' => \$APP_ID,
+											'source-app-id=s' => \$SOURCE_APP_ID,
+											'destination-host=s' => \$destination_host,
+											'keep-log' => \$keep_log,
+											'logging-level=s' => \$logging_level,
+											'failure-email=s' => \$FAILURE_EMAIL,
+											'smtp-server=s' => \$SMTP_SERVER,
+											'log-dir=s' => \$log_dir,
+											'suffix=s' => \$suffix
+
+);
+
+die "$PGM: ERROR: Invalid options\n" if (! $ret);
+
+my $fname = $ARGV[0];
+
+die "Mandatory -app-id or -source-app-id parameter not specified!" if (! (defined($APP_ID) || defined($SOURCE_APP_ID)));
+die "Cannot use -app-id and -source-app-id parameters together!" if (defined($APP_ID) && defined($SOURCE_APP_ID));
+
+if (defined($SOURCE_APP_ID)) {
+	$APP_ID = $SOURCE_APP_ID;
+}
+
+die "app-id cannot be empty" if (length($APP_ID) == 0);
+
+# Set the options for logger
+
+$REMOVE_LOG_ON_SUCCESS = 0 if (defined($keep_log));
+my @screen_options;
+my $screen_logging = 0;
+
+if (-t 1) {
+  @screen_options = (screen_threshold => $logging_level);
+	$screen_logging = 1;
+} else {
+  @screen_options = (screen_threshold => 'OFF');
+}
+
+my @file_options = ();
+
+if (defined($log_dir)) {
+	if (-d $log_dir) {
+		my $outfile_suffix = $fname;
+
+		$outfile_suffix =~ s/.*\///g;
+		$outfile_suffix =~ s/[.].*$//g;
+
+		$LOGFILE = $log_dir . "/${APP_ID}_delivery_update." . $outfile_suffix . '.log';
+		@file_options = (file_threshold => $logging_level, logfile => $LOGFILE);
+	} else {
+		die "Log directory $log_dir does not exist!\n";
+	}
+} else {
+	@file_options = (screen_only => 1) if ($screen_logging);
+}
+
+initialize_logging(@screen_options, @file_options);
+
+my $logger = get_logger;
+
+{
+	no warnings;
+
+
+	if (length($ARGV[0]) == 0) {
+		print STDERR "$PGM: ERROR: Filename not provided\n";
+		Usage;
+		exit(1);
+	}
+}
+
+
+mydie "Delivery file $fname does not exist!" if (! -f $fname);
+
+my (@job_opts, $request_id);
+
+
+if (defined($SOURCE_APP_ID)) {
+	my $search_fname = $fname;
+
+	if (defined($suffix)) {
+		$suffix =~ s/^\.//;  # remove leading "." from suffix
+		$suffix = quotemeta($suffix);  # escape non-"word" characters (e.g. ".")
+		$search_fname =~ s/\.${suffix}$//;  # remove suffix from filename
+	}
+
+	my $select = "
+			select q.rq_request_id
+			from job_queue q, job_delivery d
+			where q.rq_source_app_id = '$SOURCE_APP_ID'
+				and q.app_id = d.app_id
+				and d.delivery_output_file = '$search_fname'
+			order by creation_date desc";
+
+	my @request_id = BLUELITE::Job->dbh->selectrow_array($select);
+
+	if (! @request_id) {
+		mydie "Could not determine request ID for app_id = '$SOURCE_APP_ID', filename '$fname'";
+	}
+
+	$request_id = $request_id[0];
+	push(@job_opts, app_id => $SOURCE_APP_ID, request_id => $request_id);
+} else {
+	push(@job_opts, app_id => $APP_ID);
+}
+
+my $job;
+eval { $job = BLUELITE::Job->new(@job_opts) };
+
+if (! defined($job)) {
+	my $message = "Unable to obtain a BLUELITE::Job object for app_id = '$APP_ID', filename = '$fname'";
+	$message .= ", request ID '$request_id'";
+	mydie $message . "\n";
+}
+
+$FAILURE_EMAIL = $job->failure_email if (! defined($FAILURE_EMAIL));
+
+my @opts = ();
+my $destination_message = '';
+
+if (defined($destination_host)) {
+	push(@opts, destination_host => $destination_host);
+	$destination_message = "Destination host = '$destination_host'";
+}
+
+if (defined($suffix)) {
+	push(@opts, suffix => $suffix);
+}
+
+$APP_ID = $job->app_id;
+
+if (! $job->update_delivery_date(fname => $fname, @opts)) {
+	mydie "Unable to update delivery date in JOB_DELIVERY table for app_id = '$APP_ID' and filename = '$fname'";
+}
+
+$logger->info("Successfully updated $APP_ID delivery info for $fname . $destination_message");
+
+unlink($LOGFILE) if ($REMOVE_LOG_ON_SUCCESS && defined($LOGFILE));
+
+exit(0);
+

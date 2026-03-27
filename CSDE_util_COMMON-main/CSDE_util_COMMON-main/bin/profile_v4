@@ -1,0 +1,473 @@
+#
+#	THIS SCRIPT MUST BE WRITTEN AS BOURNE SHELL SYNTAX SO
+#	THAT CRON JOBS WILL RUN IT PROPERLY!
+#
+DEBUG=FALSE
+
+# Source global definitions
+etc_bashrc=/etc/bashrc
+
+if [ -f $etc_bashrc ]; then
+	if . $etc_bashrc
+	  then
+			profiles_sourced=$etc_bashrc
+	  else
+			profiles_failed=$etc_bashrc
+	fi
+fi
+
+PROG="profile_v4"
+
+# Intro message
+
+[ -t 0 ] && echo "- You are logging into $HOSTNAME system as $LOGNAME"
+
+# Set the local timzone to Atlanta (Est) with Daylight saving time consideration
+
+# Identify the platform and archicture of this system
+#	ARCH will be set to archicture string used by perl and bluelite for
+# plateform specific executables
+
+TZ=EST5EDT
+export TZ
+
+if [ "$BLUELITE_BASE_DIR" != "" ]
+then
+
+	BASE_DIR="$BLUELITE_BASE_DIR"
+	COMMON_DIR="$BLUELITE_BASE_DIR/common"
+else
+	# Hard Code default values
+
+	BASE_DIR="/ds"
+	BASE_OS_DIR=$BASE_DIR/CENTOS
+	COMMON_DIR=$BASE_OS_DIR/common
+fi
+
+ARCH=`/usr/bin/perl -e 'use Config; print $Config{archname};'`
+
+if /bin/grep -i 'release 5' /etc/redhat-release > /dev/null
+  then
+		ARCH="${ARCH}_RHEL5"
+		PERL_BASE_DIR=$BASE_DIR
+		PRIVLIB_DIR="$PERL_BASE_DIR/perl/lib"
+		PRIVLIBARCH_DIR="$PRIVLIB_DIR/$ARCH"
+	else
+		PERL_BASE_DIR="${BASE_DIR}/CENTOS"
+		PRIVLIB_DIR="$PERL_BASE_DIR/perl/lib"
+fi
+
+export ARCH
+
+# Variables used by Craig's scrubbing libary and deid engine (HCFA)
+
+ZIPSEC2_FILE=$BASE_DIR/common/etc/zipsec2
+export ZIPSEC2
+
+# Setup Fax Server Env Variables
+
+VSIHOME=/opt/vsifax
+export VSIHOME
+
+# Identify the location of the server pool file
+
+SERVER_INFO_FILE="$BASE_DIR/common/etc/server.info"
+export SERVER_INFO_FILE
+
+# Setup Oracle
+
+#ORACLE_SRV_HOME=/oracle/product/10.2.0
+ORACLE_HOME=/ds/oracle/product/12c
+
+if [ ! -d "$ORACLE_HOME" ]
+then
+	echo 
+	echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+	echo "!"
+	echo "! Warning the ORACLE_HOME directory was NOT accessable!  " 
+	echo "! Database functionality will be affected!"
+	echo "!"
+	echo "! ORACLE_HOME = $ORACLE_HOME"
+	echo "!"
+	echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+	echo 
+fi
+
+ORACLE_SID=BLUELITE
+export ORACLE_SID
+export ORACLE_HOME
+export USERID
+
+server='dsdb03'
+ORACLE_CONNECT="(DESCRIPTION=(ADDRESS_LIST=(ADDRESS=(PROTOCOL=TCP)(HOST=$server)(PORT=1521)))(CONNECT_DATA=(SID=BLUELITE)))" 
+export ORACLE_CONNECT
+DBHOST="$server"
+DBPORT=1521
+
+
+TERMINFO=/usr/share/terminfo
+export TERMINFO
+
+# Set GPG key directory
+
+if [ "$USER" = 'ds' ]
+  then
+		GNUPGHOME=$BASE_DIR/gnupg
+  else
+		GNUPGHOME=~/.gnupg
+fi
+
+export GNUPGHOME
+
+DEFAULT_SMTP_SERVER=localhost
+export DEFAULT_SMTP_SERVER
+
+		# Add the common bluelite modules directory
+
+		if [ "$PRIVLIBARCH_DIR" = '' ]
+		  then
+				perl5add="$PRIVLIB_DIR"
+		  else
+				perl5add="$PRIVLIBARCH_DIR:$PRIVLIB_DIR"
+		fi
+
+		perl5add="$perl5add:$BASE_DIR/nrs/lib:$PERL_BASE_DIR/common/lib"
+
+		if [ "$PERL5LIB" != "" ]
+		  then
+				PERL5LIB="$perl5add:$PERL5LIB"
+		  else
+				PERL5LIB="$perl5add"
+		fi
+
+		PERL6LIB=$PERL5LIB
+		export PERL5LIB PERL6LIB
+
+		if [ "$DEBUG" = TRUE ]
+		then
+			echo "Info (DEBUG):"
+			echo "$PROG: Successful: Setup perl to support linux platform"
+			echo "LIBRARY:      $PRIVLIB_DIR"
+			echo "ARCHLIBRARY:  $PRIVLIBARCH_DIR"
+			echo "PERL5LIB:     $PERL5LIB"
+		fi
+
+export PATH
+
+if [ "$DS_SYSTEM_PATH" = "" ]
+then
+  export DS_SYSTEM_PATH=$PATH
+fi
+
+if [ "$DS_SYSTEM_LD_LIBRARY_PATH" = "" ]
+then
+  export DS_SYSTEM_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
+fi
+
+
+# Setup pathing
+
+for DIR in . /bin /usr/bin /usr/local/bin /sbin /usr/sbin $BASE_DIR/vsifax/bin $BASE_DIR/deep_nrs_scan/bin $BASE_DIR/subversion/bin $ORACLE_HOME/bin $BASE_DIR/jdk1.5.0_11/$ARCH/bin
+do
+	if [ -d "$DIR" -a -r "$DIR" ]
+	then
+		PATH="${DIR}:${PATH}"
+		[ "$DEBUG" = "TRUE" ] && echo "Info (DEBUG): $DIR added to PATH"
+	else
+		[ "$DEBUG" = "TRUE" ] && echo "Warning (DEBUG): $DIR not added to PATH"
+	fi
+done
+
+for DIR in $BASE_OS_DIR/python3/bin $BASE_DIR/pal/bin $BASE_DIR/mxdds/bin $BASE_DIR/nrs/bin $COMMON_DIR/bin $PERL_BASE_DIR/perl/bin 
+do
+	APP_DIRS=""
+
+	if [ -d "${DIR}/${ARCH}" ]
+	then
+		APP_DIRS="${DIR}/${ARCH}"	
+		[ "$DEBUG" = "TRUE" ] && echo "Info (DEBUG): $DIR/$ARCH added to PATH"
+	else
+		[ "$DEBUG" = "TRUE" ] && echo "Warning (DEBUG): No architecture dir added to PATH for $DIR"
+	fi
+
+	if [ -d "$DIR" ]
+	then
+		if [ "$APP_DIRS" = "" ]
+		then
+			APP_DIRS="$DIR"
+		else
+			APP_DIRS="${APP_DIRS}:$DIR"
+		fi
+		[ "$DEBUG" = "TRUE" ] && echo "Info (DEBUG): $DIR added to PATH"
+	else
+		[ "$DEBUG" = "TRUE" ] && echo "Warning (DEBUG): Dir $DIR NOT added to PATH"
+	fi
+
+	if [ "$APP_DIRS" != "" ]
+	then
+		PATH="${APP_DIRS}:${PATH}"
+	fi
+done
+
+export PATH
+
+# Setup the library path
+
+CPPFLAGS="-I$BASE_DIR/common/include"
+LDFLAGS="-L$BASE_DIR/common/lib/$ARCH"
+export CPPFLAGS
+export LDFLAGS
+
+
+LD_LIBRARY_PATH=$COMMON_DIR/lib:$BASE_DIR/pal/lib:$BASE_DIR/nrs/lib:.:$LD_LIBRARY_PATH:$ORACLE_HOME/lib:$BASE_OS_DIR/openssl/lib
+
+if [ -d "$COMMON_DIR/lib/$ARCH" ]
+then
+	LD_LIBRARY_PATH="$COMMON_DIR/lib/$ARCH:$LD_LIBRARY_PATH"
+	export LD_LIBRARY_PATH
+else
+	echo "Warning: Could not modify LD_LIBRARY_PATH to include architecture "
+	echo "         specific lib path of $COMMON_DIR/lib/$ARCH (does not exist)"
+fi
+
+export MANPATH
+
+FTPKEYS="bluelite/crybaby1,bluelite/galileo1,rxdds/rxuser1"
+
+DS_SECURED_LOGIN="ds/crybaby1"
+
+
+ENCRYPTION_LICENSE_DIR="$BASE_DIR/common/etc/license_dir"
+
+export FTPKEYS
+export ENCRYPTION_LICENSE_DIR
+
+if [ -t 0 ]
+then
+	stty erase '^?'
+	set -o vi
+fi
+
+PS1="\u@\h:\$DS_ENV:\$PWD : "
+export PS1
+
+TERM=vt220
+EDITOR=vi
+
+PKZIPCFG=$HOME
+
+export TERM LD_LIBRARY_PATH HOME EDITOR PKZIPCFG 
+
+if [ "$USER" = 'ds' -o "$USER" = 'adhoc' ]
+  then
+		# more secure for production users: -rw-r-----
+		umask 027
+  else
+		# more open for non-production users: -rw-rw----
+		umask 007
+fi
+
+let "rand = $RANDOM % 20"
+export HISTFILE=$HOME/.sh_history.$rand
+
+vim_init_file="$BASE_DIR/development/$USER/.vimrc"
+
+if [ ! -f $vim_init_file ]
+  then
+		vim_init_file="$BASE_DIR/common/etc/vimrc"
+fi
+
+if [ -f $vim_init_file ]
+  then
+		export VIMINIT="source $vim_init_file"
+fi
+
+gvim_init_file="$BASE_DIR/development/$USER/.gvimrc"
+
+if [ ! -f $gvim_init_file ]
+  then
+		gvim_init_file="$BASE_DIR/common/etc/gvimrc"
+fi
+
+if [ -f $gvim_init_file ]
+  then
+		export GVIMINIT="source $gvim_init_file"
+fi
+
+
+TNS_ADMIN=$BASE_DIR/common/etc
+export TNS_ADMIN
+
+PERLTIDY=$BASE_DIR/common/etc
+export PERLTIDY
+
+LANG=POSIX
+export LANG
+
+JAVA_HOME=/ds/jdk1.5.0_11/$ARCH
+export JAVA_HOME
+
+CATALINA_HOME=/ds/apache-tomcat-5.5.17
+export CATALINA_HOME
+
+LOG_DIR=/ds/common/log
+export LOG_DIR
+
+# do ". acd_func.sh"
+# acd_func 1.0.5, 10-nov-2004
+# petar marinov, http:/geocities.com/h2428, this is public domain
+
+PRUN2_SERVER_INFO=/ds/common/etc/server.info
+export PRUN2_SERVER_INFO
+
+cd_func ()
+{
+  local x2 the_new_dir adir index
+  local -i cnt
+
+  if [[ $1 ==  "--" ]]; then
+    dirs -v
+    return 0
+  fi
+
+  the_new_dir=$1
+  [[ -z $1 ]] && the_new_dir=$HOME
+
+  if [[ ${the_new_dir:0:1} == '-' ]]; then
+    #
+    # Extract dir N from dirs
+    index=${the_new_dir:1}
+    [[ -z $index ]] && index=1
+    adir=$(dirs +$index)
+    [[ -z $adir ]] && return 1
+    the_new_dir=$adir
+  fi
+
+  #
+  # '~' has to be substituted by ${HOME}
+  [[ ${the_new_dir:0:1} == '~' ]] && the_new_dir="${HOME}${the_new_dir:1}"
+
+  #
+  # Now change to the new dir and add to the top of the stack
+  pushd "${the_new_dir}" > /dev/null
+  [[ $? -ne 0 ]] && return 1
+  the_new_dir=$(pwd)
+
+  #
+  # Trim down everything beyond 11th entry
+  popd -n +11 2>/dev/null 1>/dev/null
+
+  #
+  # Remove any other occurence of this dir, skipping the top of the stack
+  for ((cnt=1; cnt <= 10; cnt++)); do
+    x2=$(dirs +${cnt} 2>/dev/null)
+    [[ $? -ne 0 ]] && return 0
+    [[ ${x2:0:1} == '~' ]] && x2="${HOME}${x2:1}"
+    if [[ "${x2}" == "${the_new_dir}" ]]; then
+      popd -n +$cnt 2>/dev/null 1>/dev/null
+      cnt=cnt-1
+    fi
+  done
+
+  return 0
+}
+
+
+DS_BASE_DIR=/ds
+
+# Add sourcing of readable profiles 6/21/2011 - J Hess
+
+profile_dir=$DS_BASE_DIR/common/profile
+oldpwd=$PWD
+
+if cd $profile_dir
+  then
+		for p in profile_*.bash
+			do
+				if [ ! -r $p ]
+					then
+						continue
+				fi
+
+				case $p in
+					profile_$USER.bash)  user_script=$p
+																continue;;
+				esac
+
+				if . $p; then
+					profiles_sourced="$profiles_sourced $p"
+				else
+					profiles_failed="$profiles_failed $p"
+				fi
+
+			done
+
+		if [ -r "$user_script" ]
+			then
+				if . $user_script; then
+					profiles_sourced="$profiles_sourced $user_script"
+				else
+					profiles_failed="$profiles_failed $user_script"
+				fi
+		fi
+
+		if [ "$profiles_failed" != '' ]; then
+			echo >&2
+			echo "- $BASE_DIR PROFILES UNABLE TO SOURCE!:$profiles_failed" >&2
+		fi
+
+		if [ -t 0 ]; then
+			echo "- $BASE_DIR profiles sourced: $profiles_sourced"
+		fi
+
+		cd $oldpwd
+  else
+		echo "Could not cd to $profile_dir to source profiles!" >&2
+fi
+
+export PDC_CONFIG_INFO="${DS_BASE_DIR}/common/etc/dr_config.xml"
+
+LS_COLORS='no=00:fi=00:di=01;36:ln=01;36:pi=40;33:so=01;35:bd=40;33;01:cd=40;33;01:or=01;05;37;41:mi=01;05;37;41:ex=01;32:*.cmd=01;32:*.exe=01;32:*.com=01;32:*.btm=01;32:*.bat=01;32:*.sh=01;32:*.csh=01;32:*.tar=01;31:*.tgz=01;31:*.arj=01;31:*.taz=01;31:*.lzh=01;31:*.zip=01;31:*.z=01;31:*.Z=01;31:*.gz=01;31:*.bz2=01;31:*.bz=01;31:*.tz=01;31:*.rpm=01;31:*.cpio=01;31:*.jpg=01;35:*.gif=01;35:*.bmp=01;35:*.xbm=01;35:*.xpm=01;35:*.png=01;35:*.tif=01;35:*.sl=01;31'
+export LS_COLORS
+
+SLCHOOSED_HOST=dsgrid01a.ndchealth.com:dsgrid02a.ndchealth.com
+export SLCHOOSED_HOST
+
+APP_ENV_CONFIG="${DS_BASE_DIR}/common/etc/app_config.xml"
+TMPDIR=/ds/tmp
+
+export TMPDIR APP_ENV_CONFIG DS_BASE_DIR
+
+# J Hess (5/5/2010). Workaround to avoid ssh sometimes hanging when desktop ssh client uses agent forwarding.
+# This disables ssh agent forwarding, which was suggested by RedHat as a workaround.
+
+unset SSH_AUTH_SOCK
+
+alias cd=cd_func
+alias omre=more
+
+alias reiszgvim='gvim -U /ds/common/etc/gvimrc_reisz '
+alias dennisgvim='gvim -U /ds/common/etc/gvimrc_dennis '
+alias liugvim='gvim -U /ds/common/etc/gvimrc_liu '
+alias tpjgvim='gvim -U /ds/common/etc/gvimrc_johnson '
+alias setupqaqc='source /ds/bin/setup_cs_env.sh qaqc '
+alias setupdev='source /ds/bin/setup_cs_env.sh dev '
+alias setup_cs_env='source /ds/bin/setup_cs_env.sh '
+alias setup_build='source /ds/bin/setup_build.sh '
+alias setup_env='source /ds/bin/setup_env.sh '
+alias setpy_env='source /ds/bin/setpy_env.sh '
+alias run_env='source /ds/bin/run_env.sh '
+alias pmver='perl -le '\''$m = shift; $loc = "Location: " . `perldoc -l $m`; chomp $loc; print $loc; eval qq(require $m) or die qq(module "$m" is not installed\n); print "Version:  " . $m->VERSION'\'''
+
+alias gvi="gvim -U $DS_BASE_DIR/common/etc/gvimrc_$USER "
+
+[ -t 0 ] && echo
+
+# Leave the ":" below there! It forces a "true"/success exit status for scripts that check that!
+
+if [ "$profiles_failed" = '' ]; then
+	:
+else
+	! :
+fi
+

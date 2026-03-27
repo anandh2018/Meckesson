@@ -1,0 +1,211 @@
+#!/usr/bin/perl
+use BLUELITE::Database;
+use Data::Dumper;
+use strict;
+use Date::Calc qw(Delta_Days);
+use Getopt::Long;
+
+my $add_create;
+my $add_failed;
+
+GetOptions(  "add_create" => \$add_create,
+             "add_failed" => \$add_failed
+ );
+
+my $detail_report_header;
+my $enabled_indexes;
+my $creating_indexes;
+my $failed_indexes;
+my $all_indexes;
+
+my $temp_row;
+my $key;
+
+my $dbh = Get_Connection( env => 'ALPI_LOGIN');
+
+my $sql_main = qq{ SELECT INDEX_ID, DESCRIPTION, PROCESS_DATE_BEGIN, to_char(sysdate - 1, 'yyyymmdd') PROCESS_DATE_END FROM ALPI_INDEX ORDER BY DESCRIPTION};
+my $sth_main =  $dbh->prepare( $sql_main );
+$sth_main->execute();
+
+while ( $temp_row = $sth_main->fetchrow_hashref() )
+{
+   $all_indexes->{$temp_row->{'INDEX_ID'}}{'PROCESS_DATE_BEGIN'} = $temp_row->{'PROCESS_DATE_BEGIN'};
+   $all_indexes->{$temp_row->{'INDEX_ID'}}{'PROCESS_DATE_END'} = $temp_row->{'PROCESS_DATE_END'};
+   $all_indexes->{$temp_row->{'INDEX_ID'}}{'DESCRIPTION'} = $temp_row->{'DESCRIPTION'};
+}
+
+my $sql_dtl = qq{ SELECT INDEX_ID, PROCESS_DATE, STATUS FROM ALPI_INDEX_PROCESS_DATE };
+
+my $sth_dtl = $dbh->prepare( $sql_dtl );
+$sth_dtl->execute();
+
+while ( $temp_row = $sth_dtl->fetchrow_hashref() )
+{
+
+     if ( $temp_row->{'STATUS'} eq 'ENABLED' ) {
+    			push(@{$enabled_indexes->{$temp_row->{'INDEX_ID'}}}, $temp_row->{'PROCESS_DATE'});
+     }
+     elsif ( $temp_row->{'STATUS'} eq 'CREATING' ) {
+    			push(@{$creating_indexes->{$temp_row->{'INDEX_ID'}}}, $temp_row->{'PROCESS_DATE'});
+     }
+     else {
+    			push(@{$failed_indexes->{$temp_row->{'INDEX_ID'}}}, $temp_row->{'PROCESS_DATE'});
+     }
+}
+
+
+foreach $key (keys %{$enabled_indexes}) {
+   @{$enabled_indexes->{$key}} = sort @{$enabled_indexes->{$key}};
+}
+
+foreach $key (keys %{$creating_indexes}) {
+   @{$creating_indexes->{$key}} = sort @{$creating_indexes->{$key}};
+}
+
+foreach $key (keys %{$failed_indexes}) {
+   @{$failed_indexes->{$key}} = sort @{$failed_indexes->{$key}};
+}
+
+
+my $index_id;
+my $index_desc;
+
+write_enable_summary();
+write_detail();
+
+sub write_enable_summary {
+
+    my $start_date;
+    my $end_date;
+    my $enable_start_date;
+    my $enable_end_date;
+    my $last_element;
+    my $days_found;
+    my $days_missing;
+    my $days_between;
+    my $date_range;
+    
+    my $start_date_year;
+    my $start_date_month;
+    my $start_date_day;
+    
+    my $end_date_year;
+    my $end_date_month;
+    my $end_date_day;
+    
+    my $enable_report_header = 'ENABLED INDEX SUMMARY';
+    
+    format INDEX_TOP =
+    
+    @|||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+    $enable_report_header
+    
+    ==============================================================================================================================
+    @<<<<<<<  @<<<<<<<<<<<<<<<<<<<<<<<<<<  @|||||||||||||||||   @<<<<<<<<<<<  @<<<<<<<<<<  @<<<<<<<<<<  @<<<<<<<<<<<  @<<<<<<<<<<<
+    'INDEX ID', 'INDEX NAME','DATE RANGE','DAYS BETWEEN','START DATE','END DATE','DAYS ENABLED','DAYS MISSING'
+    ==============================================================================================================================
+.
+    
+    format INDEX =
+    @<<<<<<<  @<<<<<<<<<<<<<<<<<<<<<<<<<<  @<<<<<<<<<<<<<<<<<   @|||||||||||  @<<<<<<<<<<  @<<<<<<<<<<  @|||||||||||  @|||||||||||
+    $index_id, $index_desc, $date_range, $days_between, $enable_start_date, $enable_end_date, $days_found, $days_missing
+.
+    
+    $~ ='INDEX_TOP';
+    write;
+    
+    $~ ='INDEX';
+    foreach $key (sort keys %{$all_indexes}){
+    
+       $index_id = $key;
+    
+       $index_desc =  $all_indexes->{$key}{'DESCRIPTION'};
+    
+       $start_date = $all_indexes->{$key}{'PROCESS_DATE_BEGIN'};
+       $end_date = $all_indexes->{$key}{'PROCESS_DATE_END'};
+    
+       $date_range = "$start_date-$end_date";
+    
+       $start_date_year = substr($start_date, 0, 4);
+       $start_date_month = substr($start_date, 4, 2);
+       $start_date_day = substr($start_date, 6, 2);
+    
+    
+       $end_date_year = substr($end_date, 0, 4);
+       $end_date_month = substr($end_date, 4, 2);
+       $end_date_day = substr($end_date, 6, 2);
+ 
+       $days_between = Delta_Days( $start_date_year, $start_date_month, $start_date_day,  $end_date_year,  $end_date_month, $end_date_day)+1;
+    
+       $last_element = $#{$enabled_indexes->{$key}};
+       $enable_start_date = ${$enabled_indexes->{$key}}[0];
+       $enable_end_date = ${$enabled_indexes->{$key}}[$last_element];
+    
+       $days_found = scalar(@{$enabled_indexes->{$key}});
+    
+       $days_missing = $days_between-$days_found;
+    
+        write;
+    }
+}
+
+sub write_detail {
+    
+    my $index_date;
+    
+    format DETAIL_TOP =
+    
+    @||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+    $detail_report_header
+    
+    =========================================================
+    @<<<<<<<    @<<<<<<<<<<<<<<<<<<<<<<<<<<     @<<<<<<<<<<<<
+    'INDEX ID','INDEX NAME','DATE'
+    =========================================================
+.
+    
+    
+    format DETAIL =
+    @<<<<<<<    @<<<<<<<<<<<<<<<<<<<<<<<<<<     @<<<<<<<<<<<<
+    $index_id, $index_desc, $index_date
+.
+    
+
+    if ($add_create) {
+
+        $detail_report_header = 'CREATING INDEXES - DETAIL';
+        $~ = 'DETAIL_TOP';
+        write;
+        $~ = 'DETAIL';
+       
+
+         foreach $key (sort keys %{$creating_indexes}){
+            $index_id = $key;
+            $index_desc =  $all_indexes->{$key}{'DESCRIPTION'};
+            foreach $a (@{$creating_indexes->{$key}}) {
+               $index_date = $a;
+               write;
+            }
+        }
+    }
+
+    if ($add_failed) {
+
+        $detail_report_header = 'FAILED INDEXES - DETAIL';
+        $~ = 'DETAIL_TOP';
+        write;
+        $~ = 'DETAIL';
+
+         foreach $key (sort keys %{$failed_indexes}){
+            $index_id = $key;
+            $index_desc =  $all_indexes->{$key}{'DESCRIPTION'};
+            foreach $a (@{$failed_indexes->{$key}}) {
+               $index_date = $a;
+               write;
+            }
+         }
+
+    }
+}
+
+$dbh->disconnect;

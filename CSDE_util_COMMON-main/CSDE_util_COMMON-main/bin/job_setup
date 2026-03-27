@@ -1,0 +1,285 @@
+#!/usr/bin/perl
+
+# Program: job_setup - Create directories, template scripts, and add job_config row for new BLUELITE::Job application
+# Author: John Hess, RelayHealth
+
+# Version 1.0 - 5/10/2011
+# Initial release
+#
+# Version 4.0 - 8/17/2011
+# Reduced # of parameters with defaults, to bring into alignment with new job_param_default view.
+# Changed app_dir setting in job_config table to relative path.
+#
+
+use Getopt::Long;
+use File::Path qw(mkpath);
+use File::Copy;
+use Fcntl qw( :mode );
+use DateTime;
+use BLUELITE::Job;
+use Data::Dumper;
+
+use strict;
+use warnings;
+
+our $PGM = $0;
+$PGM =~ s/^[.\/]+//;
+
+our $APP_DIR;
+our $WARN_EMAIL;
+
+sub Usage() {
+	print "$PGM: Setup new BLUELITE::Job application\n\n";
+	print "Usage: $PGM -app-id app_id [-options]\n";
+	print "Options (with defaults):\n";
+	print "  -subdir subdir   Create in $APP_DIR/app_id/subdir ($APP_DIR/app_id)\n";
+	print "  -dir dir         Create in dir ($APP_DIR/app_id)\n";
+	print "  -warn-email e    Set warning_email address to e\n";
+	print "  -? | -help       Display this help\n";
+}
+
+
+sub copy_scripts($$$) {
+  my $meta = shift;
+  my $worker_script = shift;
+  my $wrapper_script = shift;
+
+	if (exists($meta->{SCRIPT})) {
+		my $source_dir = $meta->{SCRIPT}->{source_dir};
+
+		if (-d $source_dir) {
+			my $bin_dir = "$APP_DIR/bin";
+			my $wrapper_script_source = "$source_dir/" . $meta->{SCRIPT}->{wrapper};
+			my $extract_script_source = "$source_dir/" . $meta->{SCRIPT}->{extract};
+
+			if (-f $wrapper_script_source) {
+				if (-f $extract_script_source) {
+					my $output_worker = "$bin_dir/$worker_script";
+					my $perms = S_IRWXU | S_IRGRP | S_IXGRP;
+					if (copy($extract_script_source, $output_worker)) {
+						chmod $perms, $output_worker;
+					} else {
+						print STDERR "Warning: unable to copy extract script '$extract_script_source' to $bin_dir : $!\n";
+					}
+
+					my $output_wrapper = "$bin_dir/$wrapper_script";
+
+					if (system("sed 's/app_extract[.]pl/$worker_script/g' $wrapper_script_source > $output_wrapper") != 0) {
+						print STDERR "Warning: unable to copy extract wrapper script '$wrapper_script_source' to $bin_dir : $!\n";
+					} else {
+						chmod $perms, $output_wrapper;
+					}
+				} else {
+					print STDERR "Warning: the extract script '$extract_script_source' does not exist\n";
+				}
+			} else {
+				print STDERR "Warning: the extract wrapper script '$wrapper_script_source' does not exist\n";
+			}
+		} else {
+			print STDERR "Warning: the source template script directory '$source_dir' does not exist\n";
+		}
+	}
+}
+
+
+my ($help, $app_id, $subdir, $dir);
+my $env = BLUELITE::Job->env;
+
+my $first_post_date = DateTime->today(time_zone => 'local')->subtract(days => 1)->ymd('');
+my $max_run_date = DateTime->today(time_zone => 'local')->add(months => 3)->ymd('');
+my $base_dir = $ENV{DS_BASE_DIR};
+
+my %meta = (
+	ENV => {
+		DEV => {
+			root_app_dir => "$base_dir/development/data_feeds",
+			root_outgoing_dir => "$base_dir/outgoing/development"
+		},
+
+		ADHOC => {
+			root_app_dir => "$base_dir/adhocs",
+			root_outgoing_dir => "$base_dir/outgoing/adhocs"
+		}
+	},
+	SCRIPT => {
+		source_dir => "$base_dir/common/etc/job",
+		extract => "app_extract.pl",
+		wrapper => "app_extract.sh"
+	}
+);
+
+my %config_app = ();
+my $outgoing_dir;
+
+if (exists($meta{ENV}->{$env})) {
+	$APP_DIR = $meta{ENV}->{$env}->{root_app_dir} if (exists($meta{ENV}->{$env}->{root_app_dir}));
+	$outgoing_dir = $meta{ENV}->{$env}->{root_outgoing_dir} if (exists($meta{ENV}->{$env}->{root_outgoing_dir}));
+} else {
+	die "ERROR: The '$env' environment is not recognized\n";
+}
+
+my $ret = GetOptions(
+	'help|?' => \$help,
+	'app-id=s' => \$app_id,
+	'subdir=s' => \$subdir,
+	'dir=s' => \$dir,
+	'warn-email=s' => \$WARN_EMAIL
+);
+
+if (! $ret) {
+	print STDERR "Could not parse command-line options\n";
+	Usage;
+	exit(2);
+}
+
+if (defined($help)) {
+	Usage;
+	exit(0);
+}
+
+eval "use BLUELITE::Job";
+
+if ($@) {
+	print STDERR "The Data Services environment was not properly sourced!\n";
+	print STDERR $@ . "\n\n";
+	Usage;
+	exit(2);
+}
+
+if (! defined($app_id)) {
+	Usage;
+	exit(1);
+}
+
+$app_id =~ s/^\s+//g;
+$app_id =~ s/\s+$//g;
+$app_id = uc($app_id);
+my $app_id_lc = lc($app_id);
+
+if (defined($dir) && defined($subdir)) {
+	die "ERROR: The -dir and -subdir options are mutually exclusive!\n";
+}
+
+my ($app_symlink_to, $app_symlink_from);
+
+$APP_DIR .= "/$app_id_lc";
+my $config_app_dir = $APP_DIR;
+my $config_app_dir_setting = $app_id_lc;
+
+$outgoing_dir .= "/$app_id_lc" if (defined($outgoing_dir));
+
+if (defined($subdir)) {
+	$subdir =~ s|^\s+||;
+	$subdir =~ s|\s+$||;
+	$subdir =~ s|^\.?/||;
+	$subdir =~ s|/+$||;
+
+	$config_app_dir = "$APP_DIR/dev";
+	$config_app_dir_setting = "$app_id_lc/dev";
+	$APP_DIR .= "/$subdir";
+	$app_symlink_to = $config_app_dir;
+	$app_symlink_from = $subdir;
+} elsif (defined($dir)) {
+	$APP_DIR = $dir;
+	$config_app_dir_setting = $APP_DIR;
+	$outgoing_dir = undef;
+}
+
+my %config_opts = ();
+
+if (-d $APP_DIR) {
+	die "ERROR: The application directory '$APP_DIR' already exists!\n";
+}
+
+$config_app{app_dir} = $config_app_dir_setting;
+my $worker_script = "${app_id_lc}_extract.pl";
+my $wrapper_script = "${app_id_lc}_extract.sh";
+
+my %config_defaults = (
+	deliverable_encoding => 'gzip',
+	group_id_order => 999,
+	first_post_date => $first_post_date,
+	max_run_date => $max_run_date,
+	worker_script => $wrapper_script,
+	trigger_fname_sprintf => "${app_id}_%s.dat.done.gz", trigger_fname_vars => 'post_date', trigger_encoding => 'gzip',
+	deliverable_fname_sprintf => "${app_id}_%s.dat.gz", deliverable_fname_vars => 'post_date',
+	warn_notify_email => $WARN_EMAIL
+);
+
+if (! BLUELITE::Job->new_app_config(app_id => $app_id, defaults => \%config_defaults, %config_app)) {
+	die "ERROR: Could not add new app_id '$app_id'\n";
+}
+
+# create directories
+
+my @created_dirs = ();
+my @links_created = ();
+
+my @subdirs = qw(bin wu log worker);
+push(@subdirs, 'deliverables') if (! defined($outgoing_dir));
+
+foreach my $dir (@subdirs) {
+	my $dir_to_create = "$APP_DIR/$dir";
+
+	if (! mkpath($dir_to_create)) {
+		map { rmdir($_) } (@created_dirs, $APP_DIR);
+		die "Could not create application directory '$dir_to_create' : $!\n";
+	}
+
+	push(@created_dirs, $dir_to_create);
+}
+
+# create deliverables dir with symlink, if appropriate
+
+if (defined($outgoing_dir)) {
+	if (! -d $outgoing_dir) {
+		if (! eval { mkpath($outgoing_dir) }) {
+			map { rmdir($_) } (@created_dirs, $APP_DIR);
+			die "ERROR: Could not create outgoing directory '$outgoing_dir' : $@\n";
+		}
+
+		push(@created_dirs, $outgoing_dir);
+	}
+
+	my $deliverables_link_to = "$APP_DIR/deliverables";
+
+	if (! symlink($outgoing_dir, $deliverables_link_to)) {
+		map { rmdir($_) } (@created_dirs, $APP_DIR);
+		die "ERROR: Could not create symbolic link to $outgoing_dir : $!\n";
+	} else {
+		push(@links_created, $deliverables_link_to);
+	}
+}
+
+if (defined($app_symlink_to)) {
+	if (! symlink($app_symlink_from, $app_symlink_to)) {
+		unlink(@links_created);
+		map { rmdir($_) } (@created_dirs, $APP_DIR);
+		die "ERROR: Could not create symbolic link to $app_symlink_to : $!\n";
+	}
+}
+
+# copy template scripts to bin dir
+
+copy_scripts(\%meta, $worker_script, $wrapper_script);
+
+# commit database insert
+
+eval { BLUELITE::Job->dbh->commit };
+
+# remove created dirs if commit failed
+
+if ($@) {
+	print STDERR "$@\n";
+	map { rmdir($_) } (@created_dirs, $APP_DIR);
+}
+
+# display info about what was setup
+
+print "Added -app-id '$app_id' to the $env environment:\n";
+print "	app_dir=$APP_DIR\n";
+print "	first_post_date=$first_post_date\n";
+print "	max_run_date=$max_run_date\n";
+print "	warn_notify_email=$WARN_EMAIL\n" if (defined($WARN_EMAIL));
+
+

@@ -1,0 +1,554 @@
+#!/usr/bin/perl
+
+# al_index_manager: Audit Log Index Manager
+# This is a command-line interface to the BLUELITE::TandemSwitchAuditLog::Index_Mgr modules
+#
+# Author: jmh
+#
+# Version history:
+# 1/10/2006 - Initial release
+# 6/4/2007  - Added completion email capability
+# 2/2/2016  - Added 'prune_al_index' capability to clean down indexes by retention period 
+
+use warnings;
+use strict;
+
+use Data::Dumper;
+use Params::Validate qw(:all);
+use BLUELITE::TandemSwitchAuditLog::Index_Mgr;
+use BLUELITE::Logger;
+use Mail::SendEasy;
+
+our $VERSION = '1.1';
+our $TEMP_DIR = $ENV{TMPDIR};	# temp files for building indexes will go here
+
+our $DS_BASE_DIR = $ENV{DS_BASE_DIR};
+our $SMTP_SERVER = $ENV{DEFAULT_SMTP_SERVER};
+
+die "ERROR: DS_BASE_DIR environment variable is '$DS_BASE_DIR', which is not an existing directory\n" if (! ((defined($DS_BASE_DIR)) && (-d $DS_BASE_DIR)));
+
+initialize_logging(logfile => "$DS_BASE_DIR/common/log/al_index_mgr.$$.log", screen_only => 0, screen_threshold => 'ERROR', file_threshold => 'ERROR');
+
+my %params_date_spec_required = (
+	process_date => {
+		description => "Mandatory range or comma-seperated list of process_dates (e.g. YYYYMMDD,YYYYMMDD or YYYYMMDD-YYYYMMDD)",
+		type => SCALAR,
+		optional => 0
+	}
+);
+
+my %params_date_spec_optional = (
+	process_date => {
+		description => "Optional range or comma-seperated list of process_dates (e.g. YYYYMMDD,YYYYMMDD or YYYYMMDD-YYYYMMDD)",
+		type => SCALAR,
+		optional => 1
+	}
+);
+
+my %params_index_spec_required = ( index_id => { description => 'Comma-seperated list of unique index_ids', type => SCALAR, optional => 0 } );
+my %params_index_spec_optional = ( index_id => { description => 'Comma-seperated list of unique index_ids', type => SCALAR, optional => 1 } );
+my %params_connection_var = ( connection_var => { description => 'Name of environment variable for database connection', type => SCALAR, optional => 1 } );
+
+my %params_agg_buckets_optional = ( agg_buckets => { description => 'Number of work units to spread aggregation phase over (e.g. 10, 20, 35, etc)', type => SCALAR, optional => 1, default => '35' } );
+
+#my %params_host_spec = ( parallel_hosts => { description => "Host list/group spec for parse phase (e.g. 'rx', 'ds01:2', 'ds02:2,ds03:3,ds04', etc.)", type => SCALAR, optional => 1, default => 'rx' } );
+my %params_host_spec = ( parallel_hosts => { description => "Host list/group spec for parse phase (e.g. 'rx', 'ds01:2', 'ds02:2,ds03:3,ds04', etc.)", type => SCALAR, optional => 1 } );
+
+#my %params_agg_host_spec = ( parallel_agg_hosts => { description => "Host list/group spec for INSERT phase (e.g. 'rx', 'ds01:2', 'ds02:2,ds03:3,ds04', etc.)", type => SCALAR, optional => 1, default => 'rx' } );
+my %params_agg_host_spec = ( parallel_agg_hosts => { description => "Host list/group spec for INSERT phase (e.g. 'rx', 'ds01:2', 'ds02:2,ds03:3,ds04', etc.)", type => SCALAR, optional => 1 } );
+
+my %params_build_priority_spec = ( build_priority => { description => "CPU scheduling priority (nice value from 0 to 19)", type => SCALAR, optional => 1, default => '19' } );
+
+#my %params_limited_host_spec = ( parallel_hosts => { description => "Host list/group spec (e.g. 'rx', 'rx:2', 'rx3:2,rx6:3,rx7', etc.)", type => SCALAR, optional => 1, default => 'rx:2' } );
+my %params_limited_host_spec = ( parallel_hosts => { description => "Host list/group spec (e.g. 'rx', 'rx:2', 'rx3:2,rx6:3,rx7', etc.)", type => SCALAR, optional => 1 } );
+
+my %params_index_profile_attributes = (
+                description         =>  { description => 'Description of index (duh)', type => SCALAR, optional => 1},
+                field_id            =>  { description => 'Unique parser/NCPDP field id', type => SCALAR, optional => 1},
+                segment_id          =>  { description => 'Unique parser/NCPDP segment id', type => SCALAR, optional => 1},
+                normalize_function  =>  { description => 'Name of BLUELITE::Normalize function', type => SCALAR, optional => 1},
+                normalize_params    =>  { description => 'Parameters for normalize_function', type => SCALAR, optional => 1},
+                valid_only_ind      =>  { description => "Set to 1 to limit indexing to 'valid' values when using normalize_function", type => SCALAR, optional => 1},
+                hash_method         =>  { description => "Name of BLUELITE::Normalize hash_method to apply (e.g. 'crc16')", type => SCALAR, optional => 1},
+                process_date_begin  =>  { description => 'First process date for index (YYYYMMDD)', type => SCALAR, optional => 1},
+                process_date_end    =>  { description => 'Last process date for index (YYYYMMDD)', type => SCALAR, optional => 1}
+);
+
+our $script_name = $0;
+$script_name =~ s|.*/||g;	# get basename
+
+our $command_meta = {
+
+	build_al_index => {
+		description => 'Build index (unconditional)',
+
+		param_validation => {
+			%params_date_spec_required,
+			%params_index_spec_optional,
+			%params_host_spec,
+			%params_agg_host_spec,
+			%params_agg_buckets_optional,
+			%params_build_priority_spec,
+			%params_connection_var
+		},
+
+		method => \&build_al_index
+	},
+
+	create_al_index => {
+		description => 'Define profile for new index',
+
+		param_validation => {
+			%params_index_spec_required,
+			%params_index_profile_attributes,
+			%params_connection_var
+		},
+
+		method => \&create_al_index
+	},
+
+	drop_al_index => {
+		description => 'Remove all index data and profile',
+
+		param_validation => {
+			%params_index_spec_required,
+			%params_limited_host_spec,
+			%params_connection_var
+		},
+
+		method => \&drop_al_index
+	},
+
+	enable_al_index => {
+		description => 'Build index only on process dates not yet enabled',
+
+		param_validation => {
+			%params_index_spec_optional,
+			%params_date_spec_optional,
+			%params_host_spec,
+			%params_agg_host_spec,
+			%params_agg_buckets_optional,
+			%params_build_priority_spec,
+			%params_connection_var
+		},
+
+		method => \&enable_al_index
+	},
+
+	remove_al_index => {
+		description => 'Remove index data',	
+
+		param_validation => {
+			%params_index_spec_required,
+			%params_date_spec_optional,
+			%params_limited_host_spec,
+			%params_connection_var
+		},
+
+		method => \&remove_al_index
+	},
+	
+	update_al_index => {
+		description => 'Update profile for existing index',
+
+		param_validation => {
+			%params_index_spec_required,
+			%params_index_profile_attributes,
+			%params_limited_host_spec,
+			%params_connection_var
+		},
+
+		method => \&update_al_index
+	},
+	
+	prune_al_index => {
+		description => 'Remove expired process dates for existing indexes',
+
+		param_validation => {
+			%params_index_spec_required,
+			%params_date_spec_optional,
+		},
+
+		method => \&prune_al_index
+	},
+};
+
+
+sub general_usage() {
+
+	print "$script_name version $VERSION\n";
+	print "Usage:                         $script_name -email addresses -command -command_parameters\n";
+	print "Alternate (equivalent) usage:  command -command_parameters\n\n";
+	print "Supported commands are:\n\n";
+
+	foreach my $command (keys %{$command_meta}) {
+		print "$command	" . $command_meta->{$command}->{description} . "\n";
+	}
+
+	print "\nTo get command-specific help use '$script_name -command -help'  or  'command -help'\n";
+}
+
+sub command_usage($) {
+  my $command = shift;
+
+	print "Usage: $command -parameters\n";
+	print "\nRequired parameters:\n";
+
+	foreach my $option (keys %{$command_meta->{$command}->{param_validation}}) {
+		if (exists($command_meta->{$command}->{param_validation}->{$option}->{optional}) && (! $command_meta->{$command}->{param_validation}->{$option}->{optional})) {
+			print "	-$option";
+
+			if (exists($command_meta->{$command}->{param_validation}->{$option}->{description})) {
+				print "	" . $command_meta->{$command}->{param_validation}->{$option}->{description};
+			}
+
+			print "\n";
+		}
+	}
+
+	print "\nOptional parameters:\n";
+
+	foreach my $option (keys %{$command_meta->{$command}->{param_validation}}) {
+		if ((! exists($command_meta->{$command}->{param_validation}->{$option}->{optional})) ||
+			(exists($command_meta->{$command}->{param_validation}->{$option}->{optional}) && $command_meta->{$command}->{param_validation}->{$option}->{optional})
+		) {
+			print "	-$option";
+
+			if (exists($command_meta->{$command}->{param_validation}->{$option}->{description})) {
+				print "	" . $command_meta->{$command}->{param_validation}->{$option}->{description};
+			}
+
+			print "\n";
+		}
+	}
+
+	print "	-email	Comma-seperated list of email addresses to send to upon completion\n";
+}
+
+
+my $command;
+
+if (! exists($command_meta->{$script_name})) {
+	$command = lc(shift @ARGV);
+	$command =~ s/^--?//;
+
+	if (($command =~ /^-?-?help/i) or ($command eq '')) {
+		general_usage;
+		exit(1);
+	}
+
+	if (! exists($command_meta->{$command})) {
+		die "ERROR: Command '$command' is not supported by the index manager\n";
+	}
+} else {
+	$command = $script_name;
+}
+
+if (! exists($command_meta->{$command}->{param_validation})) {
+	die "ERROR: Command '$command' has no 'param_validation' info in source code!\n";
+}
+
+if ((! defined($ARGV[0])) or ($ARGV[0] =~ /^-?-?help/i)) {
+	command_usage($command);
+	exit(1);
+}
+
+my %option = validate_with (
+	params  => \@ARGV,
+	spec    => {
+							%{$command_meta->{$command}->{param_validation}},
+							email => { type => SCALAR, optional => 1 }
+							},
+	called  => $command,
+	normalize_keys => sub { my $k = shift; $k =~ s/^--?//; return uc $k }
+);
+
+
+our @CONNECT_VAR_OPTS = ();
+if (exists($option{CONNECTION_VAR})) {
+	push(@CONNECT_VAR_OPTS, connection_var => $option{CONNECTION_VAR});
+	delete $option{CONNECTION_VAR};
+}
+
+#print Dumper \@CONNECT_VAR_OPTS;
+
+our $index_mgr = BLUELITE::TandemSwitchAuditLog::Index_Mgr->new(@CONNECT_VAR_OPTS);
+
+if (! defined($index_mgr)) {
+	die "ERROR: Unable to get new object from BLUELITE::TandemSwitchAuditLog::Index_Mgr\n";
+}
+
+##############################################
+
+sub create_al_index($) {
+  my $option = shift;
+
+  my $index_profile = $index_mgr->new_index_profile(%{$option}, @CONNECT_VAR_OPTS);
+
+	if (! defined($index_profile)) {
+		die "ERROR: Could not create new index profile object\n";
+	}
+
+	return undef if (! defined($index_profile->save_index_profile));
+
+	return 1;
+}
+
+
+sub prune_al_index($) {
+  my $option = shift;
+  
+	foreach my $index_id (split(/[,\s]+/, uc($option->{INDEX_ID}))) {
+				
+    my $maint_grp = BLUELITE::TandemSwitchAuditLog::Index_Mgr::Maint_Group->new(index_id => $index_id, @CONNECT_VAR_OPTS);
+    
+	  if (! defined($maint_grp)) {
+	  	die "ERROR: Could not create Maint_Group object for index : '$index_id'\n";
+	  }
+		
+	  return undef if (! defined($maint_grp->prune_index_data));
+	  print "\n";
+	}
+	
+	return 1;
+}
+
+
+sub update_al_index($) {
+  my $option = shift;
+  my $parallel_hosts;
+
+  my $index_profile = $index_mgr->load_index_profile($option->{INDEX_ID}, @CONNECT_VAR_OPTS);
+
+	if (! defined($index_profile)) {
+		die "ERROR: Could not load existing index profile object\n";
+	}
+
+	if (defined($option{PARALLEL_HOSTS})) {
+		$parallel_hosts = $option{PARALLEL_HOSTS};
+		delete $option{PARALLEL_HOSTS};
+	}
+
+	$index_profile->save_index_profile(%{$option});
+
+  my $maint_grp = BLUELITE::TandemSwitchAuditLog::Index_Mgr::Maint_Group->new(index_id => $option->{INDEX_ID}, @CONNECT_VAR_OPTS);
+
+	if (! defined($maint_grp)) {
+		die "ERROR: Could not create Maint_Group object\n";
+	}
+
+	if (defined($parallel_hosts)) {
+		$maint_grp->parallel_hosts($parallel_hosts);
+	}
+
+	return undef if (! defined($maint_grp->prune_index_data));
+
+	return 1;
+}
+
+
+sub index_ids_to_objects($) {
+  my $index_ids = shift;
+  my %index_list;
+
+	foreach my $index_id (split(/[,\s]+/, $index_ids)) {
+
+		$index_list{$index_id} = $index_mgr->load_index_profile($index_id, @CONNECT_VAR_OPTS);
+
+		if (! defined($index_list{$index_id})) {
+			die "ERROR: Could not obtain index object for index_id '$index_id'\n";
+		}
+
+	}
+
+	return %index_list;
+}
+
+
+sub convert_process_dates($) {
+  my $options = shift;
+  my (%process_dates);
+
+	if (defined($options->{PROCESS_DATE})) {
+		foreach my $element (split(/[,\s]+/, $options->{PROCESS_DATE})) {
+			if ($element =~ /^\s*(\d\d\d\d\d\d\d\d)\s*$/) {
+
+				$process_dates{$1} = 1;
+
+			} elsif ($element =~ /^\s*(\d\d\d\d\d\d\d\d)\s*-\s*(\d\d\d\d\d\d\d\d)\s*$/) {
+
+				if (! exists($options->{PROCESS_DATE_BEGIN})) {
+					$options->{PROCESS_DATE_BEGIN} = $1;
+					$options->{PROCESS_DATE_END} = $2;
+				} else {
+					die "ERROR: Currently, only 1 process date range may be specified\n";
+				}
+
+			} else {
+				die "ERROR: process date spec of '$element' is not valid\n";
+			}
+		}
+
+		if (scalar(keys %process_dates) >= 1) {
+			@{$options->{PROCESS_DATES}} = (sort keys %process_dates);
+		}
+
+		delete $options->{PROCESS_DATE};
+	}
+
+	return $options;
+}
+
+
+sub build_al_index($) {
+  my $option = convert_process_dates(shift);
+
+  my $maint_grp = BLUELITE::TandemSwitchAuditLog::Index_Mgr::Maint_Group->new(%{$option}, @CONNECT_VAR_OPTS);
+
+	if (! defined($maint_grp)) {
+		die "ERROR: Could not create Maint_Group object\n";
+	}
+
+	return undef if (! defined($maint_grp->rebuild));
+
+	return 1;
+}
+
+
+sub enable_al_index($) {
+  my $option = convert_process_dates(shift);
+
+  my $maint_grp = BLUELITE::TandemSwitchAuditLog::Index_Mgr::Maint_Group->new(%{$option}, temp_dir => $TEMP_DIR, @CONNECT_VAR_OPTS);
+
+	if (! defined($maint_grp)) {
+		die "ERROR: Could not create Maint_Group object\n";
+	}
+
+	# get a list of all defined indexes if none specified on command line
+
+	if (! exists($option->{INDEX_ID})) {
+		foreach my $index_id ($index_mgr->all_indexes) {
+			$maint_grp->add_index($index_id);
+		}
+	}
+
+	return undef if (! defined($maint_grp->enable));
+
+	return 1;
+}
+
+
+sub remove_al_index($) {
+  my $option = convert_process_dates(shift);
+
+  my $maint_grp = BLUELITE::TandemSwitchAuditLog::Index_Mgr::Maint_Group->new(%{$option}, @CONNECT_VAR_OPTS);
+
+	if (! defined($maint_grp)) {
+		die "ERROR: Could not create Maint_Group object\n";
+	}
+
+	return $maint_grp->delete;
+}
+
+
+sub drop_al_index($) {
+  my $option = shift;
+	my %indexes = index_ids_to_objects($option->{INDEX_ID});
+  my $undeleted_profiles = 0;
+#print "HEY\n";
+#print Dumper \@CONNECT_VAR_OPTS;
+  my $maint_grp = BLUELITE::TandemSwitchAuditLog::Index_Mgr::Maint_Group->new(%{$option}, @CONNECT_VAR_OPTS);
+
+	if (! defined($maint_grp)) {
+		die "ERROR: Could not create Maint_Group object\n";
+	}
+
+	if (! $maint_grp->delete) {
+		return undef;
+	}
+
+	foreach my $index_id (keys %indexes) {
+
+		if (! $indexes{$index_id}->delete_index_profile) {
+
+			print STDERR "ERROR: All index data deleted for index '$index_id', but unable to remove it's index profile definition from database\n";
+			$undeleted_profiles++;
+		}
+	}
+
+	if ($undeleted_profiles) {
+		return undef;
+	} else {
+		return 1;
+	}
+}
+
+
+sub email(@) {
+
+  my $mail = new Mail::SendEasy( smtp => $SMTP_SERVER);
+
+  if (! defined($mail) ) {
+    print STDERR "ERROR: Unable to establish a SMTP connection to $SMTP_SERVER\n";
+    return undef;
+  }
+
+  my $status = $mail->send(
+    from => 'data.services@relayhealth.com',
+    from_title => 'RelayHealth Data Services',
+    @_
+  );
+
+  if (! $status) {
+    print STDERR "ERROR: Failed to be send email\n";
+    return undef;
+  }
+
+  return 1;
+}
+
+
+##############################################
+
+my ($exit_status, $email);
+
+if (defined($option{EMAIL})) {
+	$email = $option{EMAIL};
+	delete $option{EMAIL};
+}
+
+if ((exists($command_meta->{$command}->{method})) && (exists(&{$command_meta->{$command}->{method}}))) {
+	my $ret;
+
+	eval { $ret = $command_meta->{$command}->{method}(\%option) };
+
+	warn $@ if $@;
+
+  my $completion_status;
+
+	if (! defined($ret)) {
+		$exit_status = 1;
+		$completion_status = 'failed';
+	} else {
+		$exit_status = 0;
+		$completion_status = 'succeeded';
+	}
+
+	if (defined($email)) {
+
+		my $option_list = Dumper(\%option);
+		$option_list =~ s/\$VAR1/options/;
+
+		email(
+			to => $email,
+			subject => "$command process $completion_status",
+			msg => "The following $command process ${completion_status}:\n\n$option_list\n" . join("\n", $@) . "\n"
+		);
+	}
+
+	exit($exit_status);
+} else {
+	die "ERROR: Interface for '$command' not yet supported\n";
+}
+
+

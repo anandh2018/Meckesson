@@ -1,0 +1,61 @@
+#!/usr/bin/perl
+
+#----------------------------------------------------------------------#
+# $Id: filed,v 0.1 2003/03/18 15:00:00 swilson@ndchealth.com Exp $    #
+# $Log: filed,v $                                                      #
+#----------------------------------------------------------------------#
+
+# -- @INC needs our local lib
+#BEGIN {
+#  use lib '/opt/filed/lib';
+#}
+
+# -- our package name
+package Filed;
+
+# -- strict, warnings
+use strict;
+use warnings;
+
+# -- required packages
+use Crypt::Simple;
+
+# -- turn off buffering
+$|=1;
+
+# -- define variables
+my $password;
+my $password2;
+
+# -- turn off local echo
+system('stty -echo');
+
+while (! $password){
+
+  # -- prompt for password
+  print "Enter the password:\n";
+  chomp($password = <STDIN>);
+
+  next unless $password;
+
+  # -- verify passwd
+  while (! $password2){
+
+    # -- prompt for password
+    print "Enter the password again:\n";
+    chomp($password2 = <STDIN>);
+
+  }
+  
+  if ($password ne $password2){
+    print "Passwords don't match - please try again\n";
+    $password  = undef;
+    $password2 = undef;
+  }
+
+}
+
+print "\nEncrypted password is:\n\n",encrypt($password),"\n\n";
+
+# -- turn on local echo
+system('stty echo');

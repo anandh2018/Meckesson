@@ -1,0 +1,55 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+my $pgm = $0;
+$pgm =~ s|.*/||g;
+
+if ((scalar(@ARGV) == 0) && (-t 0)) {
+	print "Usage:\n$pgm store_id_file1 store_id_file2 ...\n";
+	exit(1);
+}
+
+
+print "SELECT group_id, count(*)
+FROM dim_pharmacy_group
+where post_date = (SELECT max(post_date) FROM dim_pharmacy_group)
+and (\n";
+
+my $total = 0;
+
+while (<>) {
+	chomp;
+
+	my $id = $_;
+
+	next if ($id =~ /^\s*$/);
+
+	$id =~ s/^\s+//;
+	$id =~ s/\s+$//;
+
+	my $output;
+
+	if ($id =~ /^\d{7}$/) {
+		$output = "nabp = '$id'\n";
+	} elsif ($id =~ /^\d{10}$/) {
+		$output = "npi = '$id'\n";
+	} else {
+		print STDERR "Warning: value '$id' is not a NPI or NABP! Ignoring...\n";
+		next;
+	}
+
+	$total++;
+
+	if ($total > 1) {
+		$output = "or $output";
+	}
+
+	print $output || die "Could not write to output file : $!\n";
+}
+
+print ")
+group by group_id
+order by 1\n";
+

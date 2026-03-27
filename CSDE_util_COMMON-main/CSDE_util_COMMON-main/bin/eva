@@ -1,0 +1,1712 @@
+#!/usr/bin/perl
+
+#========================================================================
+#  
+#  
+#  Extract Validation and Analysis (EVA)
+#  
+#  
+#  Requires:	Perl 5.001m of greater
+#  
+#  Version:	1.30
+#  
+#  Modification History
+#  
+#  	John Dennis - August 1995
+#  
+#  	Modified EVA to support fixed-length extract files.  This
+#  	required a modification to the configuration file layout.
+#  
+#  	John Dennis - June 1996
+#  
+#  	Modified EVA to support UNIX and Windows 95/DOS with only one
+#  	version of source code.  This version supports Windows 95
+#  	Perl 5.001m or greater.
+#  
+#  	John Dennis - May 1999
+#  
+#  	Corrected several bugs within the code
+#  
+#  Copyright 1994
+#  Dennis & Hess
+#  
+#  
+#========================================================================
+
+$Platform = "UNIX";
+
+if ($ENV{"COMSPEC"})
+{
+	$Platform = "DOS";
+}
+else
+{
+	$Platform = "UNIX";
+}
+
+
+use Getopt::Std;
+use Text::ParseWords;
+
+format STDOUT =
+      @<<<<<<<<<<<<<<<<<<<<<<<<<<<< @######  @####.##%
+$Format_Value, $Format_Occurences, $Format_Pct
+.
+
+$Cutoff = 25;
+$Default_Delimiter = "|";
+$Debug = 0;
+$Check_Primary_Key = "N";
+srand;
+
+
+
+$Display_Non_Printable_Char[0] = "^@";
+$Display_Non_Printable_Char[1] = "^A";
+$Display_Non_Printable_Char[2] = "^B";
+$Display_Non_Printable_Char[3] = "^C";
+$Display_Non_Printable_Char[4] = "^D";
+$Display_Non_Printable_Char[5] = "^E";
+$Display_Non_Printable_Char[6] = "^F";
+$Display_Non_Printable_Char[7] = "^G";
+$Display_Non_Printable_Char[8] = "^H";
+$Display_Non_Printable_Char[9] = "^I";
+$Display_Non_Printable_Char[10] = "^J";
+$Display_Non_Printable_Char[11] = "^K";
+$Display_Non_Printable_Char[12] = "^L";
+$Display_Non_Printable_Char[13] = "^M";
+$Display_Non_Printable_Char[14] = "^N";
+$Display_Non_Printable_Char[15] = "^O";
+$Display_Non_Printable_Char[16] = "^P";
+$Display_Non_Printable_Char[17] = "^Q";
+$Display_Non_Printable_Char[18] = "^R";
+$Display_Non_Printable_Char[19] = "^S";
+$Display_Non_Printable_Char[20] = "^T";
+$Display_Non_Printable_Char[21] = "^U";
+$Display_Non_Printable_Char[22] = "^V";
+$Display_Non_Printable_Char[23] = "^W";
+$Display_Non_Printable_Char[24] = "^X";
+$Display_Non_Printable_Char[25] = "^Y";
+$Display_Non_Printable_Char[26] = "^Z";
+$Display_Non_Printable_Char[27] = "^[";
+$Display_Non_Printable_Char[28] = "^{backslash}";
+$Display_Non_Printable_Char[29] = "^]";
+$Display_Non_Printable_Char[30] = "^^";
+$Display_Non_Printable_Char[31] = "^_";
+$Display_Non_Printable_Char[32] = "{space}";
+$Display_Non_Printable_Char[33] = "!";
+$Display_Non_Printable_Char[34] = "{double quote}";
+$Display_Non_Printable_Char[35] = "#";
+$Display_Non_Printable_Char[36] = "\$";
+$Display_Non_Printable_Char[37] = "%";
+$Display_Non_Printable_Char[38] = "&";
+$Display_Non_Printable_Char[39] = "{single quote}";
+$Display_Non_Printable_Char[40] = "(";
+$Display_Non_Printable_Char[41] = ")";
+$Display_Non_Printable_Char[42] = "*";
+$Display_Non_Printable_Char[43] = "+";
+$Display_Non_Printable_Char[44] = ",";
+$Display_Non_Printable_Char[45] = "-";
+$Display_Non_Printable_Char[46] = ".";
+$Display_Non_Printable_Char[47] = "/";
+$Display_Non_Printable_Char[48] = "0";
+$Display_Non_Printable_Char[49] = "1";
+$Display_Non_Printable_Char[50] = "2";
+$Display_Non_Printable_Char[51] = "3";
+$Display_Non_Printable_Char[52] = "4";
+$Display_Non_Printable_Char[53] = "5";
+$Display_Non_Printable_Char[54] = "6";
+$Display_Non_Printable_Char[55] = "7";
+$Display_Non_Printable_Char[56] = "8";
+$Display_Non_Printable_Char[57] = "9";
+$Display_Non_Printable_Char[58] = ":";
+$Display_Non_Printable_Char[59] = ";";
+$Display_Non_Printable_Char[60] = "<";
+$Display_Non_Printable_Char[61] = "=";
+$Display_Non_Printable_Char[62] = ">";
+$Display_Non_Printable_Char[63] = "?";
+$Display_Non_Printable_Char[64] = "@";
+$Display_Non_Printable_Char[65] = "A";
+$Display_Non_Printable_Char[66] = "B";
+$Display_Non_Printable_Char[67] = "C";
+$Display_Non_Printable_Char[68] = "D";
+$Display_Non_Printable_Char[69] = "E";
+$Display_Non_Printable_Char[70] = "F";
+$Display_Non_Printable_Char[71] = "G";
+$Display_Non_Printable_Char[72] = "H";
+$Display_Non_Printable_Char[73] = "I";
+$Display_Non_Printable_Char[74] = "J";
+$Display_Non_Printable_Char[75] = "K";
+$Display_Non_Printable_Char[76] = "L";
+$Display_Non_Printable_Char[77] = "M";
+$Display_Non_Printable_Char[78] = "N";
+$Display_Non_Printable_Char[79] = "O";
+$Display_Non_Printable_Char[80] = "P";
+$Display_Non_Printable_Char[81] = "Q";
+$Display_Non_Printable_Char[82] = "R";
+$Display_Non_Printable_Char[83] = "S";
+$Display_Non_Printable_Char[84] = "T";
+$Display_Non_Printable_Char[85] = "U";
+$Display_Non_Printable_Char[86] = "V";
+$Display_Non_Printable_Char[87] = "W";
+$Display_Non_Printable_Char[88] = "X";
+$Display_Non_Printable_Char[89] = "Y";
+$Display_Non_Printable_Char[90] = "Z";
+$Display_Non_Printable_Char[91] = "[";
+$Display_Non_Printable_Char[92] = "{backslash}";
+$Display_Non_Printable_Char[93] = "]";
+$Display_Non_Printable_Char[94] = "^";
+$Display_Non_Printable_Char[95] = "_";
+$Display_Non_Printable_Char[96] = "{aposterphe}";
+$Display_Non_Printable_Char[97] = "a";
+$Display_Non_Printable_Char[98] = "b";
+$Display_Non_Printable_Char[99] = "c";
+$Display_Non_Printable_Char[100] = "d";
+$Display_Non_Printable_Char[101] = "e";
+$Display_Non_Printable_Char[102] = "f";
+$Display_Non_Printable_Char[103] = "g";
+$Display_Non_Printable_Char[104] = "h";
+$Display_Non_Printable_Char[105] = "i";
+$Display_Non_Printable_Char[106] = "j";
+$Display_Non_Printable_Char[107] = "k";
+$Display_Non_Printable_Char[108] = "l";
+$Display_Non_Printable_Char[109] = "m";
+$Display_Non_Printable_Char[110] = "n";
+$Display_Non_Printable_Char[111] = "o";
+$Display_Non_Printable_Char[112] = "p";
+$Display_Non_Printable_Char[113] = "q";
+$Display_Non_Printable_Char[114] = "r";
+$Display_Non_Printable_Char[115] = "s";
+$Display_Non_Printable_Char[116] = "t";
+$Display_Non_Printable_Char[117] = "u";
+$Display_Non_Printable_Char[118] = "v";
+$Display_Non_Printable_Char[119] = "w";
+$Display_Non_Printable_Char[120] = "x";
+$Display_Non_Printable_Char[121] = "y";
+$Display_Non_Printable_Char[122] = "z";
+$Display_Non_Printable_Char[123] = "{";
+$Display_Non_Printable_Char[124] = "|";
+$Display_Non_Printable_Char[125] = "}";
+$Display_Non_Printable_Char[126] = "~";
+$Display_Non_Printable_Char[127] = "^?";
+$Display_Non_Printable_Char[128] = "M-^@";
+$Display_Non_Printable_Char[129] = "M-^A";
+$Display_Non_Printable_Char[130] = "M-^B";
+$Display_Non_Printable_Char[131] = "M-^C";
+$Display_Non_Printable_Char[132] = "M-^D";
+$Display_Non_Printable_Char[133] = "M-^E";
+$Display_Non_Printable_Char[134] = "M-^F";
+$Display_Non_Printable_Char[135] = "M-^G";
+$Display_Non_Printable_Char[136] = "M-^H";
+$Display_Non_Printable_Char[137] = "M-^I";
+$Display_Non_Printable_Char[138] = "M-^J";
+$Display_Non_Printable_Char[139] = "M-^K";
+$Display_Non_Printable_Char[140] = "M-^L";
+$Display_Non_Printable_Char[141] = "M-^M";
+$Display_Non_Printable_Char[142] = "M-^N";
+$Display_Non_Printable_Char[143] = "M-^O";
+$Display_Non_Printable_Char[144] = "M-^P";
+$Display_Non_Printable_Char[145] = "M-^Q";
+$Display_Non_Printable_Char[146] = "M-^R";
+$Display_Non_Printable_Char[147] = "M-^S";
+$Display_Non_Printable_Char[148] = "M-^T";
+$Display_Non_Printable_Char[149] = "M-^U";
+$Display_Non_Printable_Char[150] = "M-^V";
+$Display_Non_Printable_Char[151] = "M-^W";
+$Display_Non_Printable_Char[152] = "M-^X";
+$Display_Non_Printable_Char[153] = "M-^Y";
+$Display_Non_Printable_Char[154] = "M-^Z";
+$Display_Non_Printable_Char[155] = "M-^[";
+$Display_Non_Printable_Char[156] = "M-^{backslash}";
+$Display_Non_Printable_Char[157] = "M-^]";
+$Display_Non_Printable_Char[158] = "M-^^";
+$Display_Non_Printable_Char[159] = "M-^_";
+$Display_Non_Printable_Char[160] = "M- ";
+$Display_Non_Printable_Char[161] = "M-!";
+$Display_Non_Printable_Char[162] = "M-{double quote}";
+$Display_Non_Printable_Char[163] = "M-#";
+$Display_Non_Printable_Char[164] = "M-\$";
+$Display_Non_Printable_Char[165] = "M-%";
+$Display_Non_Printable_Char[166] = "M-&";
+$Display_Non_Printable_Char[167] = "M-{single quote}";
+$Display_Non_Printable_Char[168] = "M-(";
+$Display_Non_Printable_Char[169] = "M-)";
+$Display_Non_Printable_Char[170] = "M-*";
+$Display_Non_Printable_Char[171] = "M-+";
+$Display_Non_Printable_Char[172] = "M-,";
+$Display_Non_Printable_Char[173] = "M--";
+$Display_Non_Printable_Char[174] = "M-.";
+$Display_Non_Printable_Char[175] = "M-/";
+$Display_Non_Printable_Char[176] = "M-0";
+$Display_Non_Printable_Char[177] = "M-1";
+$Display_Non_Printable_Char[178] = "M-2";
+$Display_Non_Printable_Char[179] = "M-3";
+$Display_Non_Printable_Char[180] = "M-4";
+$Display_Non_Printable_Char[181] = "M-5";
+$Display_Non_Printable_Char[182] = "M-6";
+$Display_Non_Printable_Char[183] = "M-7";
+$Display_Non_Printable_Char[184] = "M-8";
+$Display_Non_Printable_Char[185] = "M-9";
+$Display_Non_Printable_Char[186] = "M-:";
+$Display_Non_Printable_Char[187] = "M-;";
+$Display_Non_Printable_Char[188] = "M-<";
+$Display_Non_Printable_Char[189] = "M-=";
+$Display_Non_Printable_Char[190] = "M->";
+$Display_Non_Printable_Char[191] = "M-?";
+$Display_Non_Printable_Char[192] = "M-@";
+$Display_Non_Printable_Char[193] = "M-A";
+$Display_Non_Printable_Char[194] = "M-B";
+$Display_Non_Printable_Char[195] = "M-C";
+$Display_Non_Printable_Char[196] = "M-D";
+$Display_Non_Printable_Char[197] = "M-E";
+$Display_Non_Printable_Char[198] = "M-F";
+$Display_Non_Printable_Char[199] = "M-G";
+$Display_Non_Printable_Char[200] = "M-H";
+$Display_Non_Printable_Char[201] = "M-I";
+$Display_Non_Printable_Char[202] = "M-J";
+$Display_Non_Printable_Char[203] = "M-K";
+$Display_Non_Printable_Char[204] = "M-L";
+$Display_Non_Printable_Char[205] = "M-M";
+$Display_Non_Printable_Char[206] = "M-N";
+$Display_Non_Printable_Char[207] = "M-O";
+$Display_Non_Printable_Char[208] = "M-P";
+$Display_Non_Printable_Char[209] = "M-Q";
+$Display_Non_Printable_Char[210] = "M-R";
+$Display_Non_Printable_Char[211] = "M-S";
+$Display_Non_Printable_Char[212] = "M-T";
+$Display_Non_Printable_Char[213] = "M-U";
+$Display_Non_Printable_Char[214] = "M-V";
+$Display_Non_Printable_Char[215] = "M-W";
+$Display_Non_Printable_Char[216] = "M-X";
+$Display_Non_Printable_Char[217] = "M-Y";
+$Display_Non_Printable_Char[218] = "M-Z";
+$Display_Non_Printable_Char[219] = "M-[";
+$Display_Non_Printable_Char[220] = "M-{backslash}";
+$Display_Non_Printable_Char[221] = "M-]";
+$Display_Non_Printable_Char[222] = "M-^";
+$Display_Non_Printable_Char[223] = "M-_";
+$Display_Non_Printable_Char[224] = "M-{aposterphe}";
+$Display_Non_Printable_Char[225] = "M-a";
+$Display_Non_Printable_Char[226] = "M-b";
+$Display_Non_Printable_Char[227] = "M-c";
+$Display_Non_Printable_Char[228] = "M-d";
+$Display_Non_Printable_Char[229] = "M-e";
+$Display_Non_Printable_Char[230] = "M-f";
+$Display_Non_Printable_Char[231] = "M-g";
+$Display_Non_Printable_Char[232] = "M-h";
+$Display_Non_Printable_Char[233] = "M-i";
+$Display_Non_Printable_Char[234] = "M-j";
+$Display_Non_Printable_Char[235] = "M-k";
+$Display_Non_Printable_Char[236] = "M-l";
+$Display_Non_Printable_Char[237] = "M-m";
+$Display_Non_Printable_Char[238] = "M-n";
+$Display_Non_Printable_Char[239] = "M-o";
+$Display_Non_Printable_Char[240] = "M-p";
+$Display_Non_Printable_Char[241] = "M-q";
+$Display_Non_Printable_Char[242] = "M-r";
+$Display_Non_Printable_Char[243] = "M-s";
+$Display_Non_Printable_Char[244] = "M-t";
+$Display_Non_Printable_Char[245] = "M-u";
+$Display_Non_Printable_Char[246] = "M-v";
+$Display_Non_Printable_Char[247] = "M-w";
+$Display_Non_Printable_Char[248] = "M-x";
+$Display_Non_Printable_Char[249] = "M-y";
+$Display_Non_Printable_Char[250] = "M-z";
+$Display_Non_Printable_Char[251] = "M-{";
+$Display_Non_Printable_Char[252] = "M-|";
+$Display_Non_Printable_Char[253] = "M-}";
+$Display_Non_Printable_Char[254] = "M-~";
+$Display_Non_Printable_Char[255] = "M-^?";
+
+
+
+sub Print_Debug
+{
+local($Line) = @_;
+
+	if ($Debug)
+	{
+		print "DEBUG: " . $Line . "\n";
+	}
+}
+
+sub Create_Read_Cmd
+{
+local($Platform, @Files) = @_;
+local(%File_Class);
+local($Type);
+local($Cmd);
+local($File);
+local($Types);
+local($First_Iteration);
+
+	$Cmd = "";
+
+	if ($Platform eq "DOS")
+	{
+		$Cmd = "<" . $Files[0];
+		return $Cmd;
+	}
+
+	foreach $File (@Files)
+	{
+
+		$Type = "cat";
+
+		if ($File =~ /[.]Z$/)
+		{
+			$Type = "zcat";
+		}
+
+		if ($File =~ /[.]z$/)
+		{
+			$Type = "pcat";
+		}
+
+		if ($File =~ /[.]gz$/)
+		{
+			$Type = "gunzip -c";
+		}
+
+		if ($File =~ /[.]zip$/)
+		{
+			$Type = "gunzip -c";
+		}
+
+		push(@{$File_Class{$Type}}, $File);
+	}
+
+
+	$Types = scalar(keys %File_Class);
+
+	if (	$Types == 1 &&
+		scalar(@{$File_Class{"cat"}}) == 1 )
+	{
+		$Cmd = "<" . $Files[0];
+		return $Cmd;
+	}
+
+	if ($Types > 1)
+	{	
+		$Cmd = "( ";
+	}
+
+	$First_Iteration = "Y";
+
+	foreach $Type (keys %File_Class)
+	{
+		if ($First_Iteration eq "N")
+		{
+			$Cmd = $Cmd . " ; ";
+		}
+
+		$Cmd = $Cmd . $Type . " " . join(" ", @{$File_Class{$Type}});
+
+		$First_Iteration = "N";
+	}
+
+	if ($Types > 1)
+	{	
+		$Cmd = $Cmd . " )";
+	}
+
+
+	$Cmd = $Cmd . " |";
+
+	return $Cmd;
+}
+
+
+
+
+sub Get_File_Name
+{
+local($File) = @_;
+local(@Names);
+local($Last_Element);
+
+	$File =~ s![\\]!/!g;
+
+	@Names = split("[/\]", $File);
+
+	$Last_Element = scalar(@Names) - 1;
+
+	if ($Last_Element >= 0)
+	{
+		return $Names[$Last_Element];
+	}
+	else
+	{
+		return "";
+	}
+
+}
+
+
+
+sub parse_data_line
+{
+
+local($ID, $Line, $Total_Column_Count, $Dynamic_Compression) = @_;
+local(@DATA);
+local($Value);
+local(@POS);
+local(@OFFSET);
+local($C);
+local(@HOLD_DATA);
+
+#print "O:$Line\n";
+
+	if ($Delimiter{$ID} ne "NONE")
+	{
+#		@DATA = split("$Delimiter{$ID}", $Line, $Total_Column_Count);
+
+		if ($dequote eq "N")
+		{
+			@DATA = split("$Delimiter{$ID}", $Line);
+		}
+		else
+		{
+      @DATA = &parse_line("$Delimiter{$ID}", 0, $Line);
+		}
+
+	}
+	else
+	{
+		@DATA = ();
+
+		foreach $C (@{$Column_Indexes{$ID}})
+		{
+			$Value = substr($Line, $Column_Position{$ID}[$C] - 1, $Column_Offset{$ID}[$C]);
+
+			push (@DATA, $Value);
+		}
+
+	}
+
+
+
+	if ($Dynamic_Compression eq "Y")
+	{
+		@CLEAN_DATA = ();
+		foreach $Value (@DATA)
+		{
+			$Value =~ s/[ ][ ]*$//g;
+			$Value =~ s/^[ ][ ]*//g;
+
+			if ($Value[0] = "\"")
+			{
+				$Value =~ s/^["]//g;
+				$Value =~ s/["]$//g;
+				$Value =~ s/[ ][ ]*$//g;
+				$Value =~ s/^[ ][ ]*//g;
+			}
+
+			push (@CLEAN_DATA, $Value);
+		}
+	}
+	else
+	{
+		@CLEAN_DATA = @DATA;
+	}
+
+#print "N:" . join(",", @CLEAN_DATA) . "\n";
+
+	return @CLEAN_DATA;
+
+}
+
+
+sub Page_Break
+{
+	print "
+";
+}
+
+sub Banner
+{
+local($Word, $Platform) = @_;
+
+	if ($Platform eq "UNIX")
+	{
+		open(BANNER, "banner $Word |");
+
+		while(<BANNER>)
+		{
+			print;
+		}
+
+		close(BANNER);
+	}
+
+	if ($Platform eq "DOS")
+	{
+		print "\n";
+		print "\n";
+	}
+
+
+}
+
+
+
+sub By_Value
+{
+	$Sort_Associative_Array{$a} <=> $Sort_Associative_Array{$b};
+}
+
+
+
+sub Std_Skewness
+{
+local($X, $X2, $X3, $N, $Stddev) = @_;
+local($A, $M, $Std_Skewness);
+
+if (	$N == 0 ||
+	$Stddev == 0 ||
+	$N == 1)
+{
+	return -1;
+}
+
+
+$A = $X / $N;
+
+$M = ($X3 - (3 * $A * $X2) + (3 * $X * $A * $A) - ($A * $A * $A)) / ($N - 1);
+
+$Std_Skewness = $M / ($Stddev * $Stddev * $Stddev);
+
+return $Std_Skewness;
+
+
+
+}
+
+sub Variance
+{
+local($X, $X2, $N) = @_;
+local($Variance);
+
+if (	$N != 0 && 
+	$N != 1)
+{
+	$Variance = ($X2 - (($X * $X) / $N)) / ($N - 1);
+}
+else
+{
+	$Variance = -1;
+}
+
+return $Variance;
+
+}
+
+
+sub Minimum 
+{
+local ($Curr_Min, $Value) = @_;
+
+
+	$Curr_Min =~ s/[ ]+//g;
+	$Value =~ s/[ ]+//g;
+
+	if ($Value !~ /^[+-]{0,1}[0-9.]*$/)
+	{
+		return $Curr_Min;
+	}
+
+	if ($Curr_Min eq "")
+	{
+		return $Value;
+	}
+		
+	if ($Curr_Min > $Value)
+	{
+		return $Value;
+	}
+	else
+	{
+		return $Curr_Min;
+	}
+
+
+}
+
+
+
+sub Maximum 
+{
+local ($Curr_Max, $Value) = @_;
+
+
+	$Curr_Max =~ s/[ ]+//g;
+	$Value =~ s/[ ]+//g;
+
+	if ($Value !~ /^[+-]{0,1}[0-9.]*$/)
+	{
+		return $Curr_Max;
+	}
+
+	if ($Curr_Max eq "")
+	{
+		return $Value;
+	}
+		
+	if ($Curr_Max < $Value)
+	{
+		return $Value;
+	}
+	else
+	{
+		return $Curr_Max;
+	}
+
+
+}
+
+
+
+
+
+sub Analysis_File
+{
+local($Extract, $Cmd) = @_;
+local($File);
+local($Column);
+local($Data_Records);
+local($Total_Column_Count) = 0;
+local($Total_Header_Count) = 0;
+local($Total_Trailer_Count) = 0;
+local($Line);
+local($Invalid_Records) = 0;
+local(@Column_Min);
+local(@Column_Max);
+local(@Column_Sum);
+local(@Column_Sum_Sqr);
+local(@Column_Sum_Cube);
+local(@Column_Null);
+local(@Column_Numeric);
+local(@Column_Non_Numeric);
+local(@Column_Freq);
+local(@Column_Variance);
+local(@Column_Stddev);
+local(@Column_Avg);
+local(@Column_Std_Skewness);
+local($Value);
+local($Occuences);
+local($Pct_Of_Total);
+local(%Primary_Key);
+
+
+
+#print join(", ", @Do_Freq) . "==\n";
+#print join(", ", @Do_Numeric) . "==\n";
+#print "Columns: " . join(", ", @Columns) . "==\n";
+
+$Total_Column_Count = scalar(@{$Column_Indexes{$Extract}});
+
+
+foreach $Column (@{$Column_Indexes{$Extract}})
+{
+	undef (%{$Column_Freq[$Column]});
+}
+
+undef (%Primary_Key);
+@Key_Columns = ();
+
+foreach $Column (@{$Column_Indexes{$Extract}})
+{
+	if ($Analysis{$Extract}[$Column] =~ /[Kk]/)
+	{
+		push(@Key_Columns, $Column);
+	}
+}
+
+
+open (FILE, "$Cmd");
+
+while (<FILE>)
+{
+
+	$Total_Record_Count++;
+
+	if ($Sample_Type ne "A")
+	{
+		if ($Sample_Type eq "R" && $Data_Records >= $Sample_Size)
+                {
+#			Stop Processing
+			last;
+                }
+
+		if ($Sample_Type eq "P" && (rand(1) > ($Sample_Size / 100)))
+		{
+#			Dont use the current line, get next line
+			next;
+		}
+	}
+
+	chop;
+	$Line = $_;
+
+	if ($Report_On_Non_Printable eq "Y")
+	{
+		$l = length($Line) - 1;
+
+		foreach $c (0 .. $l)
+		{
+			$o = ord(substr($Line, $c, 1));
+
+			if ($o < 32 || $o > 126 )
+			{
+				$Non_Printable_Char{$o}++;
+			}
+		}
+	}
+
+
+
+
+
+
+
+
+
+	@Physical_Data = &parse_data_line(	$Extract, 
+					$Line, 
+					$Total_Column_Count, 
+					$Dynamic_Compression);
+
+	@Data = ();
+	foreach $Column (@{$Column_Indexes{$Extract}})
+	{
+
+                if ($Physical_Num_Columns{$Extract}[$Column] > 1)
+                {
+		  @Result_Array = ();
+		  foreach $PC (@{$Physical_Columns{$Extract}[$Column]})
+		  {
+		  	push(@Result_Array, $Physical_Data[$PC])
+		  }
+		  push(@Data, join("~", @Result_Array));
+                }
+                else
+                {
+                  push(@Data, $Physical_Data[$Column]);
+                }
+	}
+
+#print "P:" . join(",", @Data) . "\n";
+
+#next;
+
+	if ($Physical_Data[0] eq "H" && $File_Has_Headers eq "Y")
+	{
+		$Total_Header_Count++;
+		next;
+	}
+
+	if ($Physical_Data[0] eq "T" && $File_Has_Headers eq "Y")
+	{
+		$Total_Trailer_Count++;
+		next;
+	}
+
+	if (scalar(@Physical_Data) > $Total_Column_Count)
+	{
+		$Invalid_Records++;
+		next;
+	}
+
+	$Data_Records++;
+
+
+
+        if ($Check_Primary_Key = "Y")
+        {
+                @Key_Value = ();
+                foreach $Column (@Key_Columns)
+                {
+                        push(@Key_Value, $Data[$Column]);
+                }
+
+                if (scalar(@Key_Value) != 0)
+                {
+                        $_key_val = join("|", @Key_Value);
+
+                        $Primary_Key{$_key_val}++;
+	
+                        if ($Primary_Key{$_key_val} > 1)
+                        {
+                                $Invalid_Records++;
+                                $Primary_Key_Violations++;
+                        }
+                }
+        }
+
+	foreach $Column (@{$Column_Indexes{$Extract}})
+	{
+                $Data_Value = $Data[$Column];
+
+                $Column_Width = length($Data_Value);
+
+		$Column_Min_Width[$Column] = 
+			&Minimum(	$Column_Min_Width[$Column], 
+					$Column_Width);
+
+		$Column_Max_Width[$Column] = 
+			&Maximum(	$Column_Max_Width[$Column], 
+					$Column_Width);
+
+                if (! ($Data_Value =~ /^[ ]*$/))
+		{
+
+			if ($Data_Value =~ /^[+-]{0,1}[0-9.]*$/) 
+			{
+				$Column_Numeric[$Column]++;
+
+			}
+			else
+			{
+				$Column_Non_Numeric[$Column]++;
+			}
+		}
+		else
+		{
+			$Column_Null[$Column]++;
+		}
+
+		$Column_Sum_Width[$Column] += $Column_Width;
+
+		if (	$Analysis{$Extract}[$Column] =~ /[Nn]/ ||
+			$Analysis{$Extract}[$Column] =~ /[Dd]/)
+		{
+
+                        $Column_Min[$Column] = &Minimum($Column_Min[$Column], $Data_Value);
+                        $Column_Max[$Column] = &Maximum($Column_Max[$Column], $Data_Value);
+
+                        if (! ($Data_Value =~ /^[ ]*$/))
+			{
+
+				if ($Data_Value =~ /^[+-]{0,1}[0-9.]*$/) 
+				{
+					$Column_Sum[$Column] += $Data_Value;
+					$Column_Sum_Sqr[$Column] += ($Data_Value * $Data_Value);
+					$Column_Sum_Cube[$Column] += ($Data_Value * $Data_Value * $Data_Value);
+				#	$Column_Numeric[$Column]++;
+
+				}
+				else
+				{
+					1 == 1;
+					# $Column_Non_Numeric[$Column]++;
+				}
+			}
+		}
+
+		if ($Analysis{$Extract}[$Column] =~ /[Ff]/)
+		{
+                        $Column_Freq[$Column]{$Data_Value}++;
+		}
+	}
+
+}
+
+print "Layout Data\n";
+print "-----------\n";
+print "\n";
+print "\n";
+print "\tTotal Records: 		        $Data_Records\n";
+print "\n";
+print "\tTotal Primary Key Violations:	$Primary_Key_Violations\n";
+print "\tTotal Invalid Records:		$Invalid_Records\n";
+print "\n";
+print "\tTotal Columns:			$Total_Column_Count\n";
+print "\tHeader Records:			$Total_Header_Count\n";
+print "\tTrailer Records:		$Total_Trailer_Count\n";
+print "\tDelimiter:			\"$Delimiter{$Extract}\"\n";
+print "\n";
+if ($Sample_Type eq "A")
+{
+	print "\tSample Type:			All Data\n";
+}
+
+if ($Sample_Type eq "R")
+{
+	print "\tSample Type:			First $Sample_Size Rows\n";
+}
+
+if ($Sample_Type eq "P")
+{
+	print "\tSample Type:			Approx ${Sample_Size}% of the Rows\n";
+
+	if ($Total_Record_Count != 0)
+	{
+	$Resultant_Sample_Size = int(($Data_Records / $Total_Record_Count) * 100);
+	}
+	else
+	{
+		$Resultant_Sample_Size = 0;
+	}
+
+	print "\t				Exactly ${Resultant_Sample_Size}% of the Rows\n";
+}
+
+print "\n";
+print "\tKey Columns:\n";
+print "\n";
+
+$Key_Found = "N";
+foreach $Column (@{$Column_Indexes{$Extract}})
+{
+	if ($Analysis{$Extract}[$Column] =~ /[Kk]/)
+	{
+		print "\t\t$Column_Names{$Extract}[$Column]\n";
+		$Key_Found = "Y";
+	}
+}
+
+if ($Key_Found eq "N")
+{
+	print "\t\tFile either has no keys or none were reported.\n";
+}
+
+print "\n";
+print "\tPrimary Key Validation\n";
+print "\n";
+
+$Duplicate_Keys = "N";
+
+foreach $Key_Value (keys %Primary_Key)
+{
+	if ($Primary_Key{$Key_Value} > 1)
+	{
+		print "\t$Key_Value occurs $Primary_Key{$Key_Value} times\n";
+		$Duplicate_Keys = "Y";
+	}
+}
+
+if ($Duplicate_Keys eq "N")
+{
+	print "\t\tNo duplicate keys detected\n";
+}
+
+
+if ($Report_On_Non_Printable eq "Y")
+{
+
+	print "\n";
+	print "\tReport on Non-Printable Characters\n";
+	print "\t----------------------------------\n";
+	print "\n";
+	print "\tNon-Printable characters are defined as any not\n";
+	print "\thaving a ASCII value between 32 and 126.  Note that\n";
+	print "\tother languages may be valid and outside of this range\n";
+	print "\n";
+	print "\n";
+
+	$Non_Printable_Format = "\t%-15s%-12s%-12s%-12s%-12s\n";
+	printf ($Non_Printable_Format, "Char", "Decimal", "Octal", "Hex", "Occurences");
+
+	foreach $c (sort keys %Non_Printable_Char)
+	{
+		$Decimal = sprintf("%d", $c);
+		$Octal = sprintf("%o", $c);
+		$Hexidecimal = sprintf("%x", $c);
+		$Occurences = sprintf("%d", $Non_Printable_Char{$c});
+
+		printf ($Non_Printable_Format, 	$Display_Non_Printable_Char[$c], 
+						$Decimal,
+						$Octal, 
+						$Hexidecimal, 
+						$Occurences);
+
+
+	}
+
+
+
+}
+
+print "\n";
+print "\n";
+
+foreach $Column (@{$Column_Indexes{$Extract}})
+{
+
+	if ($Data_Records != 0)
+	{
+		$Column_Avg_Width[$Column] = $Column_Sum_Width[$Column] / $Data_Records;
+	}
+	else
+	{
+		$Column_Avg_Width[$Column] = -1;
+	}
+
+	if (	$Analysis{$Extract}[$Column] =~ /[Nn]/ ||
+		$Analysis{$Extract}[$Column] =~ /[Dd]/)
+	{
+
+		$Column_Variance[$Column] = 
+			&Variance(	$Column_Sum[$Column],
+					$Column_Sum_Sqr[$Column],
+					$Column_Numeric[$Column]);
+
+		if ($Column_Variance[$Column] >= 0)
+		{
+			$Column_Stddev[$Column] = 
+				sqrt($Column_Variance[$Column]);
+		}
+		else
+		{
+			$Column_Stddev[$Column] = -1;
+		}
+
+		if ($Column_Numeric[$Column] != 0)
+		{
+			$Column_Avg[$Column] =	$Column_Sum[$Column] / 
+						$Column_Numeric[$Column];
+		}
+		else
+		{
+			$Column_Avg[$Column] = -1;
+		}
+
+		if ($Column_Numeric[$Column] != 0)
+		{
+			$Column_Std_Skewness[$Column] =
+				&Std_Skewness(	$Column_Sum[$Column],
+						$Column_Sum_Sqr[$Column],
+						$Column_Sum_Cube[$Column],
+						$Column_Numeric[$Column],
+						$Column_Stddev[$Column]);
+		}
+		else
+		{
+			$Column_Std_Skewness[$Column] = -1;
+		}
+
+
+
+
+
+
+	}
+
+}
+
+print "
+\n";
+print "Report Layout\n";
+print "=============\n";
+print "\n";
+print "\n";
+foreach $Column (@{$Column_Indexes{$Extract}})
+{
+	$Line = substr("     $Column_Names{$Extract}[$Column]" . "                    ", 1, 35);
+	print $Line;
+
+	@List_Of_Analysis = ();
+	if ($Analysis{$Extract}[$Column] =~ /[Ff]/)
+	{
+		push (@List_Of_Analysis, "Frequency Distribution");
+	}
+
+	if ($Analysis{$Extract}[$Column] =~ /[Nn]/)
+	{
+		push (@List_Of_Analysis, "Numerical");
+	}
+
+	if ($Analysis{$Extract}[$Column] =~ /[Dd]/)
+	{
+		push (@List_Of_Analysis, "Date");
+	}
+
+	print "(" . join(", ", @List_Of_Analysis) . ")\n";
+}
+
+
+print "
+";
+print "Data Statistics\n";
+print "===============\n";
+print "\n";
+print "\n";
+
+
+$Iteration = 0;
+
+foreach $Column (@{$Column_Indexes{$Extract}})
+{
+	$Iteration++;
+
+	if ($Iteration != 1)
+	{
+		print "
+";
+	}
+
+	$Header = "Column: $Column_Names{$Extract}[$Column]";
+
+	if ($Analysis{$Extract}[$Column] =~ /[Kk]/)
+	{
+		$Header = $Header . " (Primary Key)";
+	}
+
+	print "$Header\n";
+	$Header =~ s/./-/g;
+	print "$Header\n";
+	print "\n";
+
+	print   "Standard Analysis:\n";
+	print   "\n";
+
+	printf ("\tMin Width    : %d\n", $Column_Min_Width[$Column]);
+	printf ("\tAvg Width    : %.1f\n", $Column_Avg_Width[$Column]);
+	printf ("\tMax Width    : %d\n", $Column_Max_Width[$Column]);
+	printf ("\tNon Numeric  : %d\n", $Column_Non_Numeric[$Column]);
+	printf ("\tNumeric      : %d\n", $Column_Numeric[$Column]);
+	printf ("\tNull         : %d\n", $Column_Null[$Column]);
+	print "\n";
+
+	if ($Analysis{$Extract}[$Column] =~ /[Nn]/)
+	{
+		print   "Numerical Analysis:\n";
+		print   "\n";
+
+		printf ("\tStddev       : %.2f\n", $Column_Stddev[$Column]);
+#		printf ("\tStd Skewness : %.2f\n", $Column_Std_Skewness[$Column]);
+		printf ("\tVariance     : %.2f\n", $Column_Variance[$Column]);
+		printf ("\tMinimum      : %.2f\n", $Column_Min[$Column]);
+		printf ("\tAverage      : %.2f\n", $Column_Avg[$Column]);
+		printf ("\tMaximum      : %.2f\n", $Column_Max[$Column]);
+#                printf ("\tSum of X     : %f\n", $Column_Sum[$Column]);
+#                printf ("\tSum of X2    : %f\n", $Column_Sum_Sqr[$Column]);
+#                printf ("\tSum of X3    : %f\n", $Column_Sum_Cube[$Column]);
+#		printf ("\tNon Numeric  : %d\n", $Column_Non_Numeric[$Column]);
+#		printf ("\tNumeric      : %d\n", $Column_Numeric[$Column]);
+#		printf ("\tNull         : %d\n", $Column_Null[$Column]);
+		print "\n";
+	}
+
+	if ($Analysis{$Extract}[$Column] =~ /[Dd]/)
+	{
+		print   "Date Analysis:\n";
+		print   "\n";
+
+		printf ("\tMinimum      : %d\n", $Column_Min[$Column]);
+		printf ("\tAverage      : %d\n", $Column_Avg[$Column]);
+		printf ("\tMaximum      : %d\n", $Column_Max[$Column]);
+		printf ("\tNon Numeric  : %d\n", $Column_Non_Numeric[$Column]);
+		printf ("\tNumeric      : %d\n", $Column_Numeric[$Column]);
+		print "\n";
+	}
+
+	if ($Analysis{$Extract}[$Column] =~ /[Ff]/)
+	{
+		print "Frequency Distribution:\n";
+		print "\n";
+
+		%Sort_Associative_Array = %{$Column_Freq[$Column]};
+
+		$Count = 0;
+		$Num_In_List = scalar(keys %Sort_Associative_Array);
+
+		$Print_Blank = "N";
+
+
+		print "      Total Unique Values: $Num_In_List\n";
+		print "\n";
+
+		foreach $Value (reverse sort By_Value keys %Sort_Associative_Array)
+		{
+			$Count++;
+
+			if (	$Num_In_List > $Cutoff * 2 && 
+				$Count > $Cutoff && 
+				$Count < ($Num_In_List - $Cutoff))
+			{
+				if ($Print_Blank eq "N")
+				{
+					print "\n";
+					print "\t\t.\n";
+					print "\t\t.\n";
+					print "\t\t.\n";
+					print "\t\t.\n";
+					print "\n";
+					$Print_Blank = "Y";
+				}
+
+				if ($Value =~ /^\s*$/i)
+				{
+					$Format_Value = "\"$Value\"";
+
+					$Format_Occurences = $Column_Freq[$Column]{$Value};
+
+					$Format_Pct = $Format_Occurences / $Data_Records * 100;
+
+					write;
+
+					print "\n";
+					print "\t\t.\n";
+					print "\t\t.\n";
+					print "\t\t.\n";
+					print "\t\t.\n";
+					print "\n";
+				}
+
+				next;
+			}
+			
+			$Format_Value = "\"$Value\"";
+
+			$Format_Occurences = $Column_Freq[$Column]{$Value};
+
+			$Format_Pct = $Format_Occurences / $Data_Records * 100;
+
+			write;
+		}
+		print "\n";
+	}
+}
+
+
+
+print "
+";
+print "Data Summary\n";
+print "===============\n";
+print "\n";
+print "\n";
+
+
+$Iteration = 0;
+
+foreach $Column (@{$Column_Indexes{$Extract}})
+{
+	$Iteration++;
+
+	if ($Column_Null[$Column] == $Data_Records)
+	{
+		$Datatype_Guess = "VARCHAR2";
+	}
+	else
+	{
+		if ($Column_Numeric[$Column] / $Data_Records > .20 && $Column_Non_Numeric[$Column] == 0)
+		{
+			$Datatype_Guess = "NUMBER";
+		}
+		else
+		{
+			$Datatype_Guess = "VARCHAR2";
+		}
+	}
+
+	if ($Datatype_Guess == "VARCHAR2")
+	{
+		if ($Column_Null[$Column] == $Data_Records)
+		{
+			$Datatype_Length_Guess = 200;
+		}
+		else
+		{
+			$Datatype_Length_Guess = $Column_Max_Width[$Column];
+		}
+
+		if ($Datatype_Length_Guess == 0)
+		{
+			$Datatype_Length_Guess = 300;
+		}
+
+		$Physical_Datatype_Text = $Datatype_Guess . "(" . $Datatype_Length_Guess . ")";
+
+	}
+	else
+	{
+		$Physical_Datatype_Text = $Datatype_Guess;
+	}
+
+	printf ("%s,%d,%.1f,%d,%d,%d,%d,%s\n", 	$Column_Names{$Extract}[$Column], 
+						$Column_Min_Width[$Column], 
+						$Column_Avg_Width[$Column], 
+						$Column_Max_Width[$Column],
+						$Column_Non_Numeric[$Column],
+						$Column_Numeric[$Column],
+						$Column_Null[$Column],
+						$Physical_Datatype_Text );
+}
+
+}
+
+
+sub Print_Usage
+{
+print "
+Extract Validation and Analyizer Tool (EVA)
+
+EVA is a straight forward program used to quickly assess the quality
+and validity of an extract.
+
+* verify the size of the columns is as expected
+* verify the distinct values in a column is as expected
+* verify the range of numerical columns is as expected
+* verify the distribution of values in the columns is as expect
+* and more
+
+Usage: eva [ -c filename ] [ -s samplesize[%] ] [-dpgq]
+           datafile [ datafile ... ]
+
+-p	Report on non-printable characters
+-d	Dynamic compression (strip leading/trailing spaces and surrounding quotes)
+-q	Strip surrounding quotes
+-g	Debug mode
+";
+
+}
+
+#MAIN 
+
+# Collect Command Line Arguments
+
+#getopts('-c', \%Option);
+
+if (scalar(@ARGV) == 0) {
+  Print_Usage();
+  exit;
+}
+
+getopts('c:dhqpe:s:f:?r:g', \%Option);
+
+# Allow for a different configuration file
+
+if ($Option{g}) {
+	$Debug = 1;
+}
+
+if ($Option{r})
+{
+	$successful_return_status = $Option{r};
+}
+else
+{
+	$successful_return_status = 0;
+}
+
+
+if (defined($Option{c}))
+{
+	$Configuration_File = $Option{c};
+#	TASK: Check that file exists
+
+}
+else
+{
+#	Default Configuration Filename
+#	TASK: Set config file to "Default_Configuration File"
+	$Configuration_File = "config.dat";
+}
+
+if (defined($Option{p}))
+{
+	$Report_On_Non_Printable = "Y";
+}
+else
+{
+	$Report_On_Non_Printable = "N";
+}
+
+
+# Specify the use of dynamic Compression
+
+if (defined($Option{d}))
+{
+	$Dynamic_Compression = "Y";
+}
+else
+{
+#	Default Compression
+
+	$Dynamic_Compression = "N";
+}
+
+
+# File has headers
+
+
+if (defined($Option{h}))
+{
+	$File_Has_Headers = "Y";
+}
+else
+{
+	$File_Has_Headers = "N";
+}
+
+if (defined($Option{q}))
+{
+	$dequote = "Y";
+}
+else
+{
+	$dequote = "N";
+}
+
+if (defined($Option{s}))
+{
+        if ($Option{s} =~ /^[0-9][0-9]*[%]*$/)
+        {
+             if ($Option{s} =~ /[%]$/)
+             {
+                 $Sample_Size = $Option{s};
+                 $Sample_Size =~ s/[%]//g;
+                 $Sample_Type = 'P';
+		 if ($Sample_Size <= 0 or
+			$Sample_Size > 100)
+                 {
+			print ("Sample Size outside of 1 to 100 range\n");
+			exit;
+		 }
+
+		 if ($Sample_Size == 100)
+		 {
+			$Sample_Type = 'A';
+		 }
+
+             }
+             else
+             {
+                 $Sample_Size = $Option{s};
+                 $Sample_Type = 'R';
+             }
+        }
+        else
+        {
+             print "Sample Size is not valid.";
+             Print_Usage();
+             exit;
+        }
+}
+else
+{
+        $Sample_Size = 100;
+        $Sample_Type = 'A';
+}
+
+
+
+@Files = @ARGV;
+
+open (CONFIG, "$Configuration_File");
+while(<CONFIG>)
+{
+	chop;
+	s/^[ 	]*//;
+	s/[ 	][#].*$//;
+
+	@Parameter = split(/[:]/);
+
+	$Type = $Parameter[0];
+
+	if ($Type eq "EXTRACT")
+	{
+
+		$Current_Extract = $Parameter[1];
+		$Current_Extract_Name = $Parameter[2];
+		$Current_File_Spec = $Parameter[3];
+		$Delimiter = $Parameter[4];
+
+
+		if (	$Delimiter eq "")
+		{
+			$Delimiter = $Default_Delimiter;
+		}
+
+		if (	$Delimiter =~ /not delimit/i ||
+			$Delimiter =~ /undelimit/i ||
+			$Delimiter =~ /none/i)
+		{
+			$Delimiter{$Current_Extract} = "NONE";
+		}
+		elsif ($Delimiter =~ /tab/i 	)
+		{
+			$Delimiter{$Current_Extract} = "\011";
+		}
+		else
+		{
+			$Delimiter{$Current_Extract} = "\\" . $Delimiter;
+		}
+
+
+		$Extract_Name{$Current_Extract} = $Current_Extract_Name;
+		$Extract_File_Spec{$Current_Extract} = $Current_File_Spec;
+		$Column_Number = -1;
+		$Next_Start_Position = 1;
+
+
+	}
+
+	if ($Type eq "COLUMN")
+	{
+
+		$Column = ++$Column_Number;
+		$Column_Mapping = $Parameter[1];
+		$Name = $Parameter[2];
+
+		if ($Name eq "")
+		{
+			$Name = "Column $Column";
+		}
+
+		$Analysis = $Parameter[3];
+		$Position = $Parameter[4];
+		$Handling = $Parameter[5];
+
+
+		if ($Column_Mapping =~ /^[ ]*$/)
+		{
+			@Column_List = ($Column);
+			$Virtual_Column = "N";
+		}	
+		else
+		{
+			$Column_Mapping =~ s/[() ]//g;
+
+			@Column_List_Hold = split(",", $Column_Mapping);
+
+			@Column_List = ();
+			foreach $Num (@Column_List_Hold)
+			{
+				push(@Column_List, $Num - 1);
+			}
+
+			$Virtual_Column = "Y";
+
+
+		}
+
+		if ($Position =~ /^[0-9]+$/)
+		{
+			$Offset = $Position;
+			$Start_Position = $Next_Start_Position;
+			$Next_Start_Position = $Start_Position + $Offset;
+		}
+		else
+		{
+			($Start_Position, $Second_Value) = split(",", $Position);
+
+			if ($Second_Value =~ /^[+]/)
+			{
+				$Offset = $Second_Value;
+				$Offset =~ s/^[+]//g;
+			}
+			else
+			{
+				$Offset = ($Second_Value - $Start_Position) + 1;
+			}
+		}
+
+ #print "Column ($Name) is physically column(s): " . join(", ", ($Start_Position, $Offset)) . "\n";
+
+
+		$Analysis{$Current_Extract}[$Column] = $Analysis;
+		@{$Physical_Columns{$Current_Extract}[$Column]} = @Column_List;
+                $Physical_Num_Columns{$Current_Extract}[$Column] = scalar(@Column_List);
+
+		$Column_Names{$Current_Extract}[$Column] = $Name;
+		$Column_Indexes{$Current_Extract}[$Column] = $Column;
+
+		$Column_Position{$Current_Extract}[$Column] = $Start_Position;
+		$Column_Offset{$Current_Extract}[$Column] = $Offset;
+
+		$Column_Handling{$Current_Extract}[$Column] = $Handling;
+
+
+	}
+}
+close (CONFIG);
+
+
+$Only_This_Extract = "";
+
+if (defined($Option{e}))
+{
+	if (! defined($Extract_Name{$Option{e}}))
+	{
+		die "Unable to find Extract ID \"$Option{e}\" in the specificed config.dat\n";
+	}
+
+	$Only_This_Extract = $Option{e};
+}
+
+#print "Headers:		$File_Has_Headers\n";
+#print "Extract:		$Only_This_Extract\n";
+
+
+
+@Extracts = sort keys %Extract_Name;
+
+if ($Only_This_Extract ne "")
+{
+
+	@Extracts = ($Only_This_Extract);
+
+
+}
+
+&Print_Debug("Files:	" . join (", ", @Files));
+&Print_Debug("Dynamic Compression: $Dynamic_Compression");
+
+
+foreach $Extract (@Extracts)
+{
+
+	@Words = split("[ ]+", $Extract_Name{$Extract});
+
+	foreach $Word (@Words)
+	{
+		&Banner($Word, $Platform);
+	}
+
+	print "Extract ID   : $Extract\n";
+	print "Extract Name : $Extract_Name{$Extract}\n";
+
+	print "\n";
+	print "\n";
+
+	#&Page_Break;
+
+	$Cmd = &Create_Read_Cmd($Platform, @Files);
+	&Print_Debug("Cmd:	\"" . $Cmd);
+
+	if (scalar(@Files) == 0)
+	{
+#		&Banner("Stdin", $Platform);
+		print "\n";
+		&Analysis_File($Extract, $Cmd);
+	}
+
+	if (scalar(@Files) == 1)
+	{
+#		&Banner(&Get_File_Name($Files[0]), $Platform);
+		print "\n";
+		&Analysis_File($Extract, $Cmd);
+	}
+
+	if (scalar(@Files) > 1)
+	{
+#		foreach $File (@Files)
+#		{
+#			&Banner(&Get_File_Name($File), $Platform);
+#			print "\n";
+#		}
+
+		&Analysis_File($Extract, $Cmd);
+	}
+}
+
+
+
+
+
+
+exit ($successful_return_status);
+

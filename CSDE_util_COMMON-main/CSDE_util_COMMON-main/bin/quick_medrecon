@@ -1,0 +1,3 @@
+#!/bin/bash
+
+/ds/common/bin/medrecon -v $1 20080801 20081231 OTC PRODUCTS 19010101 M 30519

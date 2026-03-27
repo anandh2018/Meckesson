@@ -1,0 +1,226 @@
+#!/usr/bin/perl
+
+
+
+use Spreadsheet::WriteExcel::Big;
+use Getopt::Long;
+use IO;
+use File::Spec;
+use Text::ParseWords;
+
+
+sub write_custom() {
+  my($worksheet) = shift;
+
+	return $worksheet->write_string(@_);
+}
+
+sub new_worksheet($$;$)
+{
+my ($workbook) = shift;
+my ($worksheet_name) = shift;
+my ($style) = shift;
+
+
+				$worksheet_name =~ s/[.](dat|csv|txt)([.]gz)?$//;
+
+				if (length($worksheet_name) > 31)
+				{
+					$worksheet_name =~ s/[_0-9]+$//;
+					$worksheet_name = substr($worksheet_name, 0, 31);
+				}
+
+				$worksheet = $workbook->add_worksheet($worksheet_name);
+
+				$worksheet->keep_leading_zeros();
+				$worksheet->freeze_panes(1, 0);
+				$worksheet->set_landscape();
+#				$worksheet->set_margins(0.1) ;
+				$worksheet->repeat_rows(0);
+				$worksheet->fit_to_pages(1, 0); # 1 page wide and as long as necessary
+
+				if (! $LOOKS_LIKE) {
+					$worksheet->add_write_handler(qr/^.*$/, \&write_custom);
+				}
+
+				return $worksheet;
+
+}
+
+$heading = 0;
+$delimiter = ",";
+$data_quoted = 0;
+
+$style = "PRESENTATION";
+$LOOKS_LIKE = 0;
+
+$ret = GetOptions(  "heading|h!" => \$heading,
+										"delimiter|d=s" => \$delimiter,
+										"data_quoted" => \$data_quoted,
+										"data", sub { $style = "DATA"},
+										"looks_like", sub { $LOOKS_LIKE = 1 }
+ );
+
+  if (! $ret)
+  {
+    exit(1);
+  }
+
+if ($delimiter =~ /tab/i)
+{
+	$delimiter = chr(9);
+}
+
+$delimiter = '\\' . $delimiter;
+
+sub usage()
+{
+	print STDERR "\n";
+	print STDERR "  csv2excel [--looks_like] [ --[no]heading ] [-- data_quoted] [--delimiter=c] excelfile.xls delimited_file [ ... delimited_file ]\n";
+	print STDERR "\n";
+	print STDERR "\n";
+	print STDERR "\n";
+
+
+}
+if (scalar(@ARGV) > 0)
+{
+
+	$excel_file = shift (@ARGV);
+
+	if ($excel_file !~ /[.]xls$/)
+	{
+		print STDERR "The excel file does not have .xls extension\n";
+		exit(1);
+	}
+}
+else
+{
+	usage();
+	exit(1);
+}
+
+if (scalar(@ARGV) == 0)
+{
+	print STDERR "No delimited files specified\n";
+	exit(1);
+
+}
+
+
+my $workbook = Spreadsheet::WriteExcel::Big->new($excel_file);
+
+if (! $workbook)
+{
+	print STDERR "Failed to open Excel file\n";
+	exit(1);
+}
+
+%heading_format_hash = ( bold => 1, color => 'navy', bg_color => 'yellow', align => 'general', valign => 'bottom', text_wrap => 1 );
+
+if ($style eq "DATA")
+{
+	%data_format_hash = ( bold => 0, color => 'black', align => 'text', valign => 'top', text_wrap => 1, shrink => 1, font  => 'Courier New');
+}
+else
+{
+	%data_format_hash = ( bold => 0, color => 'black', align => 'text', valign => 'top', text_wrap => 1, shrink => 1);
+}
+
+if (! $LOOKS_LIKE) {
+	$data_format_hash{num_format} = '@';
+}
+
+$heading_format = $workbook->add_format(%heading_format_hash);
+
+$heading_format->set_top(1);
+$heading_format->set_bottom(1);
+$heading_format->set_left(1);
+$heading_format->set_right(1);
+
+$data_format    = $workbook->add_format(%data_format_hash);
+$data_format->set_top(1);
+$data_format->set_bottom(1);
+$data_format->set_left(1);
+$data_format->set_right(1);
+
+
+foreach $delimited_file (@ARGV)
+{
+
+$worksheet_name = (File::Spec->splitpath($delimited_file))[2];
+$worksheet_name =~ s/[.](dat|csv|txt)([.]gz)?$//;
+
+
+
+# Add a worksheet
+$worksheet = new_worksheet($workbook, $worksheet_name, $style);
+
+print STDERR "Reading file " . (File::Spec->splitpath($delimited_file))[2] . " into the worksheet " . $worksheet->get_name() . "\n";
+
+$worksheet_part = 1;
+
+if ($delimited_file =~ /[.](gz|zip)$/)
+{
+	$open_cmd = "gunzip -c $delimited_file |";
+}
+else
+{
+	$open_cmd = "< $delimited_file";
+}
+
+if (! open(DATA, "$open_cmd"))
+{
+	print STDERR "Unable to open the file \"$delimited_file\"\n";
+	exit(1);
+}
+
+	$row = 0;
+	while (<DATA>)
+	{
+		s/\015?\012$//;
+
+		if ($row > 65500)
+		{
+			$worksheet_part++;
+			$worksheet = new_worksheet($workbook, $worksheet_name . $worksheet_part, $style);
+
+			print STDERR "  Continued to the next tab with the same file due to size (tab is " . $worksheet_name . $worksheet_part . ")\n";
+			$row = 0;
+		}
+
+		$excel_row = [];
+
+		s/'/\\'/g;
+
+		if ($data_quoted)
+		{
+			@{$excel_row} = &parse_line($delimiter, 0, $_);
+		}
+		else
+		{
+			@{$excel_row} = split('[' . $delimiter . ']', $_);
+		}
+
+		if ($row == 0)
+		{
+			$worksheet->write_row($row, 0, $excel_row, $heading_format);
+		}
+		else
+		{
+			$worksheet->write_row($row, 0, $excel_row, $data_format);
+		}
+
+	$row++;
+	}
+
+	$worksheet->set_column(0, scalar(@{$excel_row}) - 1,  25);
+
+
+close (DATA);
+
+
+}
+
+$workbook->close();
+

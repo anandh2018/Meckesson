@@ -1,0 +1,69 @@
+#!/usr/bin/perl
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#
+# build_encrypt
+#
+# command line utility to create an encrypted database connection string
+# for use by versions of Build.pm that support it.
+#
+# 20150605 - Michael Carey <michael.carey@mckesson.com>
+# taking code from filed_encrypt
+#
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+package DS::Build;
+
+use strict;
+use warnings;
+use Crypt::Simple;
+use IO::File;
+
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
+# turn off local echo
+system('stty -echo');
+
+my $pw1 = '';
+my $pw2 = '';
+while ( !$pw1 ) {
+
+	# prompt for password
+	print "Enter the password .............. : ";
+	chomp( $pw1 = <STDIN> );
+	print "\n";
+
+	if ( !$pw1 ) {
+		print "The password cannot be blank.\n";
+		next;
+	}
+
+	# verify passwd
+	while ( !$pw2 ) {
+
+		# prompt for password a second time
+		print "Enter the password again ........ : ";
+		chomp( $pw2 = <STDIN> );
+		print "\n";
+
+	}
+
+	if ( $pw1 ne $pw2 ) {
+		print "Passwords don't match - please try again\n";
+		$pw1 = '';
+		$pw2 = '';
+	}
+
+} ## end while ( !$pw1 )
+
+# enable local echo
+system('stty echo');
+
+my $encrypted = encrypt($pw1);
+
+print "Encrypted password is ........... :\n\n", $encrypted, "\n\n";
+print "Build config connect string is .. :\n\n";
+print "<username>/{$encrypted}\@dbi:Oracle:<DSDEV|DSQA|DSPROD>\n\n";
+
+exit(0);

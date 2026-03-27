@@ -1,0 +1,22 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use File::Basename;
+
+use BLUELITE::Mail qw(email);
+use BLUELITE::Dimension::AWP_NDC_Price;
+
+my $PROGNAME = basename($0);
+my $FAILURE_EMAIL = q{DataServicesNotification@relayhealth.com};
+
+eval { BLUELITE::Dimension::AWP_NDC_Price->load };
+
+email(
+	to => $FAILURE_EMAIL,
+	subject => qq{$PROGNAME Failed},
+	msg => qq{Failed to load DIM_AWP_NDC_PRICE: $@},
+) if $@;
+
+exit 0;

@@ -1,0 +1,2577 @@
+#!/usr/bin/perl
+
+# Program: prun2
+#
+# Run a command in parallel
+#
+# Author: jmh
+#
+# general syntax: prun2 [options] [--] cmd [options] [%p] [--] [arg1] [%p] [arg2] [...] 
+# example syntax: prun2 [options] cmd [%p] [arg1] [%p] [arg2] [...] 
+# example syntax: prun2 [options] -- cmd <cmd_options> [-cmd_opt %p] [%p] -- [arg1] [arg2] [...] 
+# example syntax: prun2 [options] -- cmd <cmd_options> [%p] [arg1] [arg2] [...] 
+#
+# Example 1: run gzip 5 at a time, getting work units from command line arguments (*.dat)
+# prun2 -p 5 gzip *.dat
+#
+# Example 2: same as #1, but get work units from workunit file
+# prun2 -f workunit -p 5 gzip
+#
+# Example 3: same as #1, but get work units from standard input
+# find . -name '*.dat' -print |  prun2 -p 5 gzip
+#
+# Example 4: same as #1, but passing -c option to gunzip
+# prun2 -p 5 -- gunzip -c *.dat.gz
+# (must use -- before gunzip to avoid confusion between prun2 options and gunzip options)
+#
+# Example 5: run "gzip" 6 at a time, with "-S .GZ option" passed to gzip, getting work units from command line arguments (*.dat)
+# (must use -- before *.dat so prun2 won't mistakenly think that ".GZ" is one of the work units)
+# prun2 -p 6 -- gzip -S .GZ -- *.dat
+#
+# Example 6: same as #4, with alternate syntax
+# prun2 -p 6 -- gzip -S .GZ %p *.dat
+# (any occurrance of %p is replaced by a work unit with each execution of gzip)
+#
+# Example 7: run "cmd" 6 at a time, passing "-s %p" work unit arguments as first argument to cmd, work units
+# obtained from command line arguments (*.dat)
+# prun2 -p 6 -- cmd -s %p -k -c *.dat
+
+# options:
+# -a failures: maximum # child process failures before main
+# parent process will terminate
+# -e exit_code : exit value representing "normal" exit from child processes
+# (defaults to 0)
+# -f todo_file : file containing list of parameters to pass to children
+# -p threads : maximum # of threads (children) to run. Default = 1.
+# (modifiable dynamically via todo_file.control file
+# -h : Display program usage
+# -l : Lower scheduling priority to 14 (Default unchanged)\n";
+#
+# 10/3/2002 : Removed false warning about inability to remove
+# control file when work units aquired from STDIN
+#
+# 10/15/2002 : Added detection of unexpected lack of child processes to wait for
+# 10/15/2002 : Fixed max_child_failures bug
+#
+# 10/17/2002 : Added usage display.
+# 10/17/2002 : Added sanity checking to command line arguments and options.
+# 10/17/2002 : Added ability to get work units from command line arguments
+#
+# 10/22/2002 : Added example executions to comments and usage
+# 10/22/2002 : Added support for -h (help) option
+# 10/22/2002 : Added support for changing scheduling priority (-l mimicks nice, -n # sets to specific nice value)
+#
+# 10/28/2002 : Changed reporting of max threads to current threads when writing to done file
+#
+# 02/11/2003 : Changed signal handler for abnormal termination so that it kill all running child processes
+# instead of waiting for them to complete.
+#
+# 05/06/2003 : Added remaining time info to log info. Removed elapsed info from log.
+#
+# 6/9/2003 : Ignored SIGTTOU signal
+# 6/9/2003 : Improved remaining time calc to account for elapsed time of currently executing child processes
+#
+# 11/18/2003 : Added ability to add servers via control file *after* launching prun
+#
+# 12/02/2003 : Added Remaining Items info to log output when work unit completes successfully
+#
+# 12/17/2003 : Added -m option for max # of work unit attempts (default 1). Only downside to this is
+# that a failed work unit will not be retried until *after* all other work units have had a chance
+# to be attempted (to completion or failure) the same number of times as itself. For example, if a work
+# unit has failed once but there is still one work unit running its 1st attempt, the failed work unit
+# will not be attempted a second time until the other work unit completes its first attempt.
+#
+#            : Enhanced initial and trailing log info
+#
+# 12/18/2003 : Server info data is now periodically refreshed from server.info file.
+# This includes servers being added to and taken out of server groups. Server info file
+# can be updated manually or automatically (by another process) on some periodic schedule.
+#
+# 1/16/2004 : Removed -s control_check_interval option. Modification time of control file is used to
+# detect change to control file
+# 1/16/2004 : Modification time of server info file is used to detect change to server info setup data
+# 1/16/2004 : Added ability to append additional work units to work unit file
+# 1/16/2004 : Fixed bug. Previous addition of that supported moving servers in and out of groups in server
+# info file caused program to erroneously remove servers not in a group listed in server info file. Fixed.
+#
+# 2/23/2004 : Added -q option for quiet mode. This will prevent all but the most critical messages from being
+# output to STDERR.
+#
+# 5/14/2004 : If work units are files, they will now be launched in descending file size order. This
+# can decrease overall processing time by starting longer-running work units before shorter ones.
+#
+# 5/17/2004 : Added -t option, which prevents control file, work units, and done files from being removed
+# when at least one work unit failed and -f option was NOT used.
+#
+# 6/2/2004 : Added sourcing of /etc/profile on remote server prior to execution of work unit. Only sourced
+# if it exists. Previously, only $HOME/.profile was sourced.
+#
+# 7/2/2004 : Removed -p option, since it had become obsolete and could become problematic under certain
+# circumstances.
+# 7/2/2004 : Added requirement that work units be unique.
+#
+# 9/14/2004 : In remote shell command, fixed missing end quote issue that only caused problem when
+# running from Linux.
+#
+# 9/16/2004 : Added support for naming server groups in control file
+#
+# 9/29/2004 : Added -j job_name option, for display in execution report
+# 9/29/2004 : Added "work unit source" and "work unit range" display to execution report
+#
+# 10/08/2004 : Work unit specified by -f option no longer supports file names ending with '.done'
+#
+# 11/16/2004 : Added close(SI) after finished reading server info file. Suspected of causing problems
+# on subsequent reads of server info file.
+#
+# 12/8/2004 : Fixed buggy behavior associated with control file and server info updates. Also
+# simplified some of this logic.
+#
+# 12/9/2004 : Removed warning about mismatched work unit order when work units are files that were
+# resorted in filesize order. Limitation: new work units added while running will be ignored if work units are files.
+#
+# 12/14/2004 : Fixed long-standing issue of remote work units (i.e. those not executing on same server as prun)
+# not being killed when main prun process is killed.
+#
+# 12/22/2004 : Added current and elapsed time to log when work unit fails.
+# - Moved current time to same line as work unit line in log file upon work unit success.
+#
+# 1/10/2006 : Added -b option to inhibit attempt to launch work units in descending file size order.
+#
+# 2/2/2006 : Removed -n option.
+# - Changed -l option to cause command to be prefixed with "nice" command instead of calling setpriority
+#
+# 9/7/2006 : Changed -l option to launch workunits via "nice -n 14" instead of just "nice"
+# - Added -p priority option to allow a specific priority (nice) value to be used to launch work units
+# - Added ability to set or modify workunit nice values via "priority = #" setting in control file
+# - Added common logging, which is turned on when LOG_DIR environment variable is present
+#
+# 9/19/2006 : Fixed bug where work units on command line would get appened to end of each command line executed
+# (introduced in previous version)
+#
+# 9/20/2006 : Added support for alternate "server info" file locations
+# Precedence is: command line option -v overrides environment variable PRUN2_SERVER_INFO,
+#		environment variable overrides hard-coded default (currently /ds/common/etc/server.info)
+#
+# 10/4/2006 : prun2 exit code now based on number of remaining work units instead of
+# checking for failed work units. This is because failed work units can be retried and
+# subsequently succeed.
+#
+# 10/10/2006 : Enhanced child pid kill procedure so that a "kill"ed local child will only terminate
+# AFTER it's associated remote child pid has actually died (i.e. now we do a kill every 10 seconds
+# until the kill command gives an error, which means the pid no longer exists). Clever, indeed
+# (albeit a bit tardy).
+#
+# - Also enhanced auto-removal of work units and done files so that it's only attempted if
+# they were actually created.
+#
+# - Also removed file_exists() function, since it's no longer used.
+#
+# 10/17/2006 : Added 5 second delay between 1st and 2nd kill attempt when killing work units. This gives
+# the work unit a decent amount of time to gracefully cleanup and exit instead of being hit/interrupted with
+# 2 near-simultaneous kill signals. Also, as a result we should now see fewer
+# "trying again to kill pid ..." messages from prun2.  This is a refinement of the kill enhancements
+# added on 10/10/2006.
+#
+# 1/10/2007 : Changed $DEFAULT_SERVER_INFO_FILE to use $DS_BASE_DIR environment variable instead of
+# hard-coded '/ds' value.
+#
+# 2/4/2007 : Changed chop() calls to chomp() calls.
+#
+# 5/18/2007 : Fixed bug where work units would not get launched on servers added to server.info file while
+# prun2 is running.  This was in set_run_server_info().
+#
+# 8/8/2007 : Added -d temp_dir option, which allows specification of directory where prun2 will create
+# temp work unit and done files when the -f option is not used.
+#
+# 3/31/2008 : Added date/time-stamp prefix to log message "Running on ....". Also removed "via ssh"
+# from same log message.
+#
+# 8/1/2008 : Skip commented lines when reading control file in read_control_info() function
+# (previously was only skipped in init)
+#
+# 8/4/2008 : work unit kills will now use "kill -9" after 4 failed attempts to kill the nice way
+# Changed wait interval between kills from 10 to 15 seconds.
+#
+# 10/21/2008 : Added -x max_host_failures option, defaulting to 3. Host will be auto-removed
+# after this number of successive failures on a server.
+#
+# 11/6/2008 : Enhanced parallel degree component of -r option. Can now optionally add percent
+# character (e.g. -r rx:50%) to specify a percent of processors instead of a number of processors.
+# More helpful for group specs than individual servers.
+#
+# 12/20/2008 : Added error detection and handling for when DONE file cannot be appended to upon
+# successful work unit completion. No new work units will be launched after this happens.
+#
+# 1/14/2009 : Modified ssh/rsh child launcher code to stop reading from ssh file handle as soon
+# as PRUN2_CHILD_RETURN_STATUS tag is found, instead of reading until handle is closed.
+# This was done because *sometimes* sshd on the remote host will keep waiting (and therefore
+# leave the handle open) indefinitely, even though the child command has completed.
+# When that happens, the result may be an orphaned sshd process hanging around indefinitely,
+# but that's better than also having a prun2 process that hangs around indefinitely despite child
+# work units that actually did exit.
+#
+# 1/14/2009 : Added quiet switch (-q) to "ssh kill" command in remote_kill() function, to supress login banner
+#
+# 1/14/2009 : Fixed newline problem with "Killing all currently executing work units.." logging message in sig_handler() function.
+#
+# v 2.6 7/1/2010
+#
+# - Changed the way current directory is determined. Previously used cwd(), but that would
+# return /dsmounts/{curr_dir} when AUTOFS is used on NFS clients instead of just {curr_dir}. Now it uses
+# $ENV{PWD} if it exists, otherwise it uses cwd().
+#
+# v2.7 8/19/2011 : When -r option is not used, will look for host_spec in PRUN_PARALLEL_HOST_SPEC
+# environment variable, but will revert to previous default of local host if it is not set.
+#
+# 6/x/2010 : MAJOR ENHANCEMENT - Added true load balancing capability
+# Using server load monitoring daemons and "best server" chooser daemon via the Schedule::Load
+# family of modules, get_available_server() was rewritten to provide real load-balancing
+# capability. This necessitated other related changes, such as:
+#
+# 1) Changing blocking waits to non-blocking waits. This allows work units to be launched
+# within a few seconds of available CPU cycles becoming available on a server, instead of
+# waiting until a work unit completes (which can take a very long time).
+#
+# 2) Adding optional load-balance control settings to the server.info file (MAX_SERVER_LAUNCH_DELAY_SECS,
+# SERVER_NOMINAL_LOAD_FACTOR, SERVER_MAX_LOAD_FACTOR). These allow dynamic adjustment to grid-level
+# (global) parameters that tweak how the load is monitored and balanced across servers.
+#
+# 3) Added optional DEFAULT_HOST_SUFFIX parameter to server.info file. This defaults to the domain
+# suffix of the local host on which prun2 is running. The Schedule::Load modules use fully qualified
+# host names, so this makes the internal prun2 host names compatible and thus avoids constant
+# translating back and forth between "ds15.ndchealth.com" and "ds15", for example.
+# It's also just more correct. :-)
+#
+# 4) Added a GRID_MIN_PROCESSES setting, which is the minimum total number of processes this specific
+# prun2 job will attempt to keep running at any given time. This concept was necessary to help put
+# a (small) limit on starvation. This is especially important when the grid is already completely
+# consumed with nothing but very long-running processes. When less than GRID_MIN_PROCESSES is
+# running for this prun2 job, prun2 will launch a new work unit on the "best" (i.e. least utilized)
+# server, even if the load on that server is already at or beyond the SERVER_NOMINAL_LOAD_FACTOR
+# (e.g. 100% utilized), but NOT if it's load is at or beyond the SERVER_MAX_LOAD_FACTOR
+# (e.g. 130% utilized). Thus, this setting can help minimize starvation (at the risk of overloading
+# servers), but it cannot completely avoid it in all circumstances. If prun2 is allowing too
+# much starvation for someone's needs, someone can kill other long-running processes and/or
+# (less destructively) reduce the load imposed by other prun2 jobs via prun2 control files.
+# The default setting for GRID_MIN_PROCESSES is 5% of the maximum possible number of simultaneous
+# threads (derived from -r command-line setting). It can be configured via the new GRID_MIN_PROCESSES
+# parameter in a control file or via the new -g command line option (below).
+#
+# The -g command-line option was added to override the default for GRID_MIN_PROCESSES. Setting it
+# too high increases the risk of server overload. Even if servers do not get overloaded, your
+# co-workers will frown at you for not playing nice. Use of this option is discouraged, as it
+# generally goes against the whole purpose load balancing. To minimize the need for *others* to
+# use this option, if your work units are known to run for long periods of time (e.g. hours), use
+# a host specification (-r option) that uses less than 100% of the servers it runs on. Keep in
+# mind that even though starvation may be occuring with your job, it should be temporary.
+# When CPU cycles finally become available, a starving prun2 job is more likely to launch a new
+# work unit than one that's *not* starving. This behavior was intentionally designed this way in
+# order to minimize starvation. However, "temporary" could be a very long time depending on
+# how long it takes for a significant number of long-running work units from other prun2
+# jobs to complete. You can override this setting via the GRID_MIN_PROCESSES setting in a control
+# file.
+#
+# An alternate way to work around not-so-temporary starvation is to temporarily increase the
+# SERVER_MAX_LOAD_FACTOR setting in the server.info file. Setting this too high imposes increased
+# risk of server overload. Use with discretion and at your own risk.
+#
+# 5) Added group write permission to common log file
+#
+
+our $DS_BASE_DIR = $ENV{DS_BASE_DIR};
+our $DEFAULT_HOST_SUFFIX;
+
+$DEFAULT_SERVER_INFO_FILE = "$DS_BASE_DIR/common/etc/server.info";
+
+our $USER_PROFILE = '$HOME/.bash_profile';
+our $DEFAULT_CPU_PRIORITY = 14;
+our $MAX_SERVER_FAILURES = 3;
+
+our $DEFAULT_SERVER_NOMINAL_LOAD_FACTOR = 1.0;
+our $DEFAULT_SERVER_MAX_LOAD_FACTOR = 1.25;
+our $DEFAULT_MIN_SERVER_LAUNCH_DELAY_SECS = 0.5;
+our $DEFAULT_MAX_SERVER_LAUNCH_DELAY_SECS = 3;
+
+use Getopt::Std;	# for parsing command line arguments
+use Time::Local;
+use IO::Handle;
+use File::Spec::Functions qw[splitpath canonpath splitdir rel2abs];
+use Cwd;
+use POSIX ":sys_wait_h";
+use Sys::Hostname;
+use Schedule::Load::Schedule;
+use Data::Dumper;
+use Time::HiRes qw( usleep );
+use Fcntl qw(:mode);
+use List::Util qw(max);
+
+use Schedule::Load::Hosts;
+use Schedule::Load;
+our $Debug = 0;
+$Schedule::Load::Debug = $Debug;
+$Schedule::Load::Schedule::Debug = $Debug;
+$Schedule::Load::Hosts::Debug = $Debug;
+
+autoflush STDOUT 1;
+autoflush STDERR 1;
+
+$PGM = $0;
+
+
+
+if (defined($ENV{LOG_DIR})) {
+	$LOG_DIR = $ENV{LOG_DIR};
+
+	$YYYYMM = substr(&get_time, 0, 6);
+
+	$LOG_FILE = "$LOG_DIR/${YYYYMM}.prun2.log";
+	$COMMON_LOGGING = 0;
+
+	if (! open(COMMON_LOG, ">> $LOG_FILE")) {
+		print STDERR "Warning: prun2 will be unable to log to the file $LOG_FILE : $!\n";
+	} else {
+		$COMMON_LOGGING = 1;
+
+		# add group write permission to log file
+		my $perm = (stat $LOG_FILE)[2];
+		chmod $perm | S_IWGRP, $LOG_FILE;
+	}
+
+	autoflush COMMON_LOG 1;
+}
+
+@TERMINATION_SIGNALS = ('HUP', 'INT', 'TERM', 'ABRT', 'BUS', 'FPE', 'ILL', 'QUIT', 'SEGV', 'SYS', 'TRAP');
+
+
+sub server_name($) {
+  my $sname = $_[0];
+  my $ret;
+
+	if (defined($DEFAULT_HOST_SUFFIX) && ($sname !~ /[.]/)) {
+		$ret = "${sname}${DEFAULT_HOST_SUFFIX}";
+	} else {
+		$ret = $sname;
+	}
+
+	return $ret;
+}
+
+
+sub check_master_list_sanity() {
+  my(%temp_master_list);
+
+	# make sure work units are unique
+
+	foreach $work_unit (@master_list) {
+		if (exists($temp_master_list{$work_unit})) {
+			&print_mesg("ERROR: Work units must be unique, but work unit '$work_unit' occurs more than once\n");
+			my_exit(1);
+		} else {
+			$temp_master_list{$work_unit} = 1;
+		}
+	}
+
+}
+
+
+sub sort_master_list() {
+
+	my($num_known_file_sizes) = 0;
+	my($fname, $source_file_size, $dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$source_file_size,$atime,$mtime,$ctime,$blksize,$blocks, $num_known_file_sizes, $max_known_file_size, %master_list_sizes);
+
+	if ($SORT_WU_OK) {
+		foreach $fname (@master_list) {
+			if (-f $fname) {
+				($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$source_file_size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($fname);
+				if ($source_file_size =~ /^[1-9][0-9]*$/) {
+					$master_list_sizes{$fname} = $source_file_size;
+					$num_known_file_sizes++;
+
+					if ($source_file_size > $max_known_file_size) {
+						$max_known_file_size = $source_file_size;
+					}
+				} else {
+					$master_list_sizes{$fname} = 'unknown';
+				}
+			} else {
+				$master_list_sizes{$fname} = 'unknown';
+			}
+		}
+
+		if ($num_known_file_sizes > 0) {
+			foreach $fname (keys %master_list_sizes) {
+				if ($master_list_sizes{$fname} eq 'unknown') {
+					$master_list_sizes{$fname} = $max_known_file_size + 1;
+				}
+			}
+
+			@master_list = sort { $master_list_sizes{$b} <=> $master_list_sizes {$a} } keys %master_list_sizes;
+			$MASTER_LIST_RESORTED = 1;
+		}
+	}
+}
+
+
+sub print_mesg($;$) {
+	my($mesg, $level) = @_;
+
+	if ( (! $QUIET_MODE) or ($mesg =~ /error/i) ) {
+			print STDERR $mesg;
+
+			if ($COMMON_LOGGING) {
+				if (($level ne 'WU') && ($level ne 'HELP')) {
+					$CURR_TIME = &get_time;
+					print COMMON_LOG join(' ', ${WU_LOG_TAG}, $USERNAME, $CURR_TIME, $mesg);
+				}
+			}
+	}
+}
+
+
+our $MAX_THREADS;
+
+sub set_max_threads($) {
+
+	$MAX_THREADS = $_[0];
+
+	if (defined($GRID_MIN_PROCESSES) && ($GRID_MIN_PROCESSES > $MAX_THREADS)) {
+		&print_mesg("Warning: GRID_MIN_PROCESSES is $GRID_MIN_PROCESSES, which exceeds the current MAX_THREADS ($MAX_THREADS). GRID_MIN_PROCESSES is being reduced to $MAX_THREADS.\n");
+		$GRID_MIN_PROCESSES = $MAX_THREADS;
+	}
+}
+
+
+sub get_max_threads() {
+	return $MAX_THREADS;
+}
+
+
+sub get_time() {
+        my (@num_text, @nums, $ni, $mesg_to_print);
+        my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+        my @nums = ($mon + 1, $mday, $hour, $min, $sec);
+
+        for ($ni = 0; $ni <= $#nums; $ni++) {
+                if ($nums[$ni] < 10 and $nums[$ni] >= 0) {
+                        $num_text[$ni] = "0" . $nums[$ni];
+                } else {
+                        $num_text[$ni] = $nums[$ni];
+                }
+        }
+
+        ($mon, $mday, $hour, $min, $sec) = @num_text;
+        $year += 1900;
+
+        return "${year}${mon}${mday} ${hour}:${min}:${sec}";
+}
+
+sub sig_handler_ignore {
+       my($sig) = $_[0];
+ 
+       &print_mesg("Warning: $PGM received signal $sig. Ignoring...\n");
+}
+
+
+sub remove_temp_files() {
+
+	if ($TODO_FILE_INDICATOR == 0) {
+		if (-f $CONTROL_FILE) {
+			$num_deleted = unlink $CONTROL_FILE;
+			if ($num_deleted != 1) {
+				&print_mesg("Warning: Unable to remove all of the following temp files: $MASTER_TODO_FILE, $CONTROL_FILE\n");
+			}
+		}
+
+		if ( ($num_fail == 0) or ($remove_temp_wu_on_failures) ) {
+
+			if ((-f $master_done_file) && (! unlink($master_done_file))) {
+				&print_mesg("Warning: Unable to remove done file $master_done_file\n");
+			}
+
+			if ((-f $MASTER_TODO_FILE) && (! unlink($MASTER_TODO_FILE))) {
+				&print_mesg("Warning: Unable to remove master todo file $MASTER_TODO_FILE\n");
+			}
+
+		} else {
+			print STDERR ("\nNote: Use -f $MASTER_TODO_FILE to retry failed work units.\n");
+		}
+	}
+}
+
+
+sub close_log() {
+
+	if ($COMMON_LOGGING) {
+		$COMMON_LOGGING = 0;
+		close(COMMON_LOG);
+	}
+
+}
+
+sub my_exit($) {
+  my $exit_status = shift;
+
+	&close_log;
+	exit($exit_status);
+}
+
+sub remote_kill {
+  my($sig) = $_[0];
+
+	# Make sure this handler doesn't get called more than once before it can finish the 1st time
+
+	foreach $sig (@TERMINATION_SIGNALS) {
+		if ($SIG{$sig} ne 'IGNORE') {
+			# assign signal handler for signal unless it is being ignored
+			$SIG{$sig} = 'DEFAULT';
+		}
+	}
+
+	&print_mesg("Note: Work unit $CURRENT_WORKUNIT received signal $sig . Killing remote child process $REMOTE_CHILD_PID on $CURRENT_REMOTE_SERVER .\n", 'WU');
+
+	# Keep running kill command (every 15 seconds) on appropriate pid on appropriate server
+	# until kill command returns an error (indicating process has finally died).
+	# Start using "kill -9" after 4 failed attempts.
+
+	my $quiet;
+
+	if ($server_info{$CURRENT_REMOTE_SERVER}{'rsh_method'} eq 'ssh') {
+		$quiet = '-q -o BatchMode=yes';
+	} else {
+		$quiet = '';
+	}
+
+	my $curr_hostname_adj = $CURRENT_REMOTE_SERVER;
+
+	if (hostname_suffix($CURRENT_REMOTE_SERVER) eq $LOCAL_SUFFIX) {
+		$curr_hostname_adj = hostname_prefix($CURRENT_REMOTE_SERVER);
+	} else {
+		$curr_hostname_adj = $CURRENT_REMOTE_SERVER;
+	}
+
+  my $cmd = $server_info{$CURRENT_REMOTE_SERVER}{'rsh_method'} . " $quiet -n $curr_hostname_adj 'kill $REMOTE_CHILD_PID ; sleep 5; tries=1; while kill \$SIG9 $REMOTE_CHILD_PID 2> /dev/null; do sleep 15; tries=\`expr \$tries + 1\` ; if [ \$tries -gt 4 ] ; then SIG9=-9; fi; echo prun2: trying again \\(attempt \$tries\\) to kill \$SIG9 pid $REMOTE_CHILD_PID on $curr_hostname_adj ; done'";
+
+	exec($cmd);
+
+	&print_mesg("Warning: Unable to run kill child process $REMOTE_CHILD_PID on $curr_hostname_adj for work unit $CURRENT_WORKUNIT ! Work unit may still be running!\n");
+
+	my_exit(99);
+}
+
+# signal handler routine for abnormal termination of process
+sub sig_handler {
+  my($sig) = $_[0];
+	my($pid, $num_signaled);
+
+  &print_mesg("Warning: $PGM received signal $sig. Killing all currently executing work units..\n", 'WU');
+	&remove_temp_files();
+
+	foreach $pid (keys %child) {
+
+			$num_signaled = kill('TERM', $pid);
+
+			if ($num_signaled == 1) {
+				&print_mesg("Note: $PGM Sent TERM signal to $child{$pid} work unit (pid = $pid).\n", 'WU');
+			} else {
+				&print_mesg("Warning: $PGM was unable to send $sig signal to $child{$pid} work unit. Work unit may still be running!\n");
+			}
+	}
+
+	until (($waited_pid = wait) == -1) {
+		&print_mesg("Note: Work unit $child{$waited_pid} appears to have been killed.\n", 'WU');
+		delete($child{$waited_pid});
+		$KILLED_WU++;
+	}
+
+	foreach $pid (keys %child) {
+		&print_mesg("Warning: Work unit $child{$pid} (local pid=$pid) was NOT killed!\n");
+	}
+
+	&execution_report;
+
+	my_exit(9);
+}
+
+# setup signal handler for this (parent) process
+
+foreach $sig (@TERMINATION_SIGNALS) {
+        # assign signal handler for signal unless it is being ignored
+        if ($SIG{$sig} ne 'IGNORE') {
+                $SIG{$sig} = \&sig_handler;
+        }
+}
+
+# signals to ignore
+$SIG{'TTOU'} = \&sig_handler_ignore;
+
+sub execution_report {
+  my(@execution_report, $subject_job_name, $subject, $send_to_mail);
+
+	push(@execution_report, "=== prun execution report ===\n");
+
+	if (length($JOB_NAME) > 0) {
+		push(@execution_report, "JOB:	$JOB_NAME\n");
+		$subject_job_name = $JOB_NAME;
+	} else {
+		$subject_job_name = $WU_RANGE;
+	}
+
+	push(@execution_report, "Work unit source:	$WU_SOURCE\n");
+	push(@execution_report, "Work unit range:	$WU_RANGE\n");
+
+	if ($num_fail > 0) {
+		push(@execution_report, "Failed work unit executions = $num_fail\n");
+		$subject = "$subject_job_name completed with failures";
+	} else {
+		$subject = "$subject_job_name successfully completed";
+	}
+
+	if (($success_retry_exec > 0) or ($failed_retry_exec > 0)) {
+		push(@execution_report, "Successful retry executions = $success_retry_exec\n");
+		push(@execution_report, "Failed retry executions = $failed_retry_exec\n");
+	}
+
+	if ($items_previously_completed > 0) {
+		push(@execution_report, "Previously completed work units = $items_previously_completed\n");
+	}
+
+	push(@execution_report, "Successful work units = $num_success\n");
+
+	if ($FAILED_DONE_WORK_UNITS > 0) {
+		push(@execution_report, "Successful work units not recorded in done file = $FAILED_DONE_WORK_UNITS\n");
+	}
+
+	if ($KILLED_WU > 0) {
+		push(@execution_report, "Killed work units = $KILLED_WU\n");
+	}
+
+	push(@execution_report, "Remaining work units = $NUM_ITEMS_REMAINING\n");
+
+	$elapsed_seconds = time() - $START_TIME;
+	push(@execution_report, "Total elapsed time = $elapsed_seconds seconds.\n");
+
+	if ($elapsed_seconds != 0) {
+
+		if (($num_success / ($elapsed_seconds / 3600)) > 0) {
+			$time = 'hour';
+			$wu_per_time = $num_success / ($elapsed_seconds / 3600);
+		} elsif (($num_success / ($elapsed_seconds / 60)) > 0) {
+			$time = 'min';
+			$wu_per_time = $num_success / ($elapsed_seconds / 60);
+		} elsif (($num_success / $elapsed_seconds) > 0) {
+			$time = 'sec';
+			$wu_per_time = $num_success / $elapsed_seconds;
+		}
+
+		if (defined($wu_per_time)) {
+			push(@execution_report, sprintf("Throughput = %.1f work units / %s\n", $wu_per_time, $time));
+		}
+	}
+
+	if (($MAIL_ON_SUCCESS) and (! $num_fail > 0)) {
+		foreach $email_address (@success_email_addresses) {
+			$email_address_list{$email_address} = 1;
+		}
+	}
+
+	if (($MAIL_ON_FAILURE) and ($num_fail > 0)) {
+		foreach $email_address (@failure_email_addresses) {
+			$email_address_list{$email_address} = 1;
+		}
+	}
+
+	if ((($MAIL_ON_SUCCESS) and (! $num_fail > 0)) or (($MAIL_ON_FAILURE) and ($num_fail > 0))) {
+		$email_addresses = join(',', keys %email_address_list);
+
+		if (open(MAIL, "| mail -s '$subject' $email_addresses")) {
+			$send_to_mail = 1;
+		} else {
+			push(@execution_report, "Warning: Could not start mail process to send to $address_list\n");
+		}
+	}
+
+	foreach $report_line (@execution_report) {
+		&print_mesg($report_line);
+
+		if ($send_to_mail) {
+			print(MAIL $report_line);
+		}
+	}
+
+	if ($send_to_mail) {
+		close(MAIL);
+	}
+}
+
+sub file_updated() {
+  my($fname) = shift;
+
+	if (-r $fname) {
+		($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$source_file_size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($fname);
+
+		if (! exists($LAST_FILE_MTIME{$fname})) {
+			$LAST_FILE_MTIME{$fname} = $mtime;
+			return 1;
+		}
+
+		if ($mtime == $LAST_FILE_MTIME{$fname}) {
+			return 0;
+		}
+
+		$LAST_FILE_MTIME{$fname} = $mtime;
+		return 1;
+
+	} else {
+		if (exists($LAST_FILE_MTIME{$fname})) {		# file previously existed
+			delete $LAST_FILE_MTIME{$fname};
+			return 1;	# force update, since file was removed
+		} else {
+			return undef;
+		}
+	}
+}
+
+sub read_control_info() {
+	my($val, $server_name, $max_threads, $found_group, $parm, $read_priority);
+
+		%CONTROL_INFO = ();
+
+		if (-r $CONTROL_FILE) {
+			open(CTL, "< $CONTROL_FILE") || return $max_threads;
+
+			while (<CTL>) {
+
+				$val = $_;
+				chomp($val);
+
+				next if ($val =~ /^\s*$/);	# skip blank lines
+				next if ($val =~ /^\s*#/);	# skip commented lines
+
+				$val =~ s/^\s+//;
+				$val =~ s/\s+$//;
+
+				# check for "parm = value"
+
+				if ($val =~ /^\s*([a-z0-9_]+)\s*=\s*['"]?([a-z0-9_.]+)['"]?\s*$/i) {
+					($parm, $val) = (uc($1), $2);
+
+					if ($parm eq 'PRIORITY') {
+
+						if ($val =~ /^normal$/i) {
+							$val = 0;
+						} elsif ($val !~ /^\s*(\d+)\s*$/) {
+							&print_mesg("Warning: PRIORITY value of '$val' in control file $CONTROL_FILE is not a positive integer. Ignoring.\n");
+							next;
+						}
+
+						if ($val > 19) {
+							&print_mesg("Warning: Max PRIORITY value is 19 (lowest priority), so read priority of '$val' will have the same effect as specifying 19\n");
+						}
+
+						$read_priority = $val;
+
+					} elsif ($parm eq 'GRID_MIN_PROCESSES') {
+						if (($val =~ /^\d+$/) && ($val >= 0)) {
+							if ($val != $GRID_MIN_PROCESSES) {
+								&print_mesg("Note: Changing GRID_MIN_PROCESSES from $GRID_MIN_PROCESSES to $val via control file.\n");
+								$GRID_MIN_PROCESSES = $val;
+							}
+						} else {
+							&print_mesg("Warning: GRID_MIN_PROCESSES value of '$val' in control file $CONTROL_FILE is not >= 0. Ignoring.\n");
+							next;
+						}
+					}
+				} else {
+
+					# check for "servername:processes" or "groupname:processes"
+
+					if (! ($_ =~ /[:,]/)) {
+						&print_mesg("Warning: cannot understand control file instruction '$_' . Ignoring. Accepted syntax is 'x:#', where x is servername or group name, and # is number of work units to keep running on each server.\n");
+						next;
+					}
+
+					($server_name, $max_threads) = split('[:,]', $val);
+
+					if ($server_name eq '') {
+						next;
+					}
+
+					if (! ($max_threads =~ /^[0-9]+/)) {
+						&print_mesg("Warning: max threads value of $max_threads for server $server_name in control file $CONTROL_FILE is not valid. Ignoring.\n");
+						next;
+					}
+
+					$CONTROL_INFO{$server_name} = $max_threads;
+				}
+			}
+
+			close(CTL);
+
+			if (defined($read_priority)) {
+
+				if (defined($workunit_priority)) {
+
+					if ($read_priority != $workunit_priority) {
+
+						if ($argv[0] eq 'nice') {
+
+							if ($argv[1] ne '-n') {
+								&print_mesg("ERROR: cannot find '-n' parameter to 'nice' command. prun2 bug exists!\n");
+								my_exit(1);
+							}
+
+							if ($argv[2] !~ /^\d+$/) {
+								&print_mesg("ERROR: cannot find numeric argument to 'nice -n' parameter. prun2 bug exists!\n");
+								my_exit(1);
+							}
+
+							if ($workunit_priority != $argv[2]) {
+								&print_mesg("ERROR: current priority of '$workunit_priority' does not match expected priority of '" . $argv[2] . "' . prun2 bug exists!\n");
+								my_exit(1);
+							}
+
+							&print_mesg("Note: CPU scheduling priority for remaining work units has changed from $workunit_priority to $read_priority\n");
+							$argv[2] = $read_priority;
+							$workunit_priority = $read_priority;
+					}
+				}
+			} else {
+
+				if ($argv[0] eq 'nice') {
+					&print_mesg("ERROR: Attempting to establish priority of '$read_priority'. Found existing 'nice' command prefix, but did not expect it to be there\n");
+					my_exit(1);
+				}
+
+				&print_mesg("Note: CPU scheduling priority for remaining work units will be $read_priority\n");
+
+				@argv = ('nice', '-n', $read_priority, @argv);
+				$workunit_priority = $read_priority;
+			}
+		}
+	}
+}
+
+sub curr_load($) {
+  my $ho = $_[0];
+
+#	my $adj_load = $ho->adj_load;
+#	my $load = $ho->total_load;
+#	my $cpus = $ho->cpus;
+#	my $total_pctcpu = $ho->total_pctcpu;
+
+#	my $pct_based_load = int($total_pctcpu / 100 + 0.6) / $cpus;
+#	my $adj_based_load = $adj_load / $cpus;
+#	my $load_factor = $load / $cpus;
+
+	return $ho->total_load / $ho->cpus;
+}
+
+our $SCHEDULER;
+
+our $SERVER_MAX_LOAD_FACTOR;
+our $SERVER_NOMINAL_LOAD_FACTOR;
+our $MIN_SERVER_LAUNCH_DELAY_SECS = $DEFAULT_MIN_SERVER_LAUNCH_DELAY_SECS;
+our $MAX_SERVER_LAUNCH_DELAY_SECS;
+
+our $GRID_MIN_PROCESSES;
+
+our $MAX_RND_THRESH_ADJ = 0.3;
+
+sub grid_min_processes() {
+
+	if (defined($GRID_MIN_PROCESSES)) {
+		return $GRID_MIN_PROCESSES;
+	} else {
+		my $gmp = int(0.05 * get_max_threads + 0.5);
+		$gmp = 1 if ($gmp < 1);
+
+		return $gmp;
+	}
+}
+
+sub can_launch($$) {
+  my ($threads_running, $curr_load_factor) = @_;
+
+	if (
+			($curr_load_factor < $SERVER_NOMINAL_LOAD_FACTOR) ||
+			(($threads_running < grid_min_processes()) && ($curr_load_factor < $SERVER_MAX_LOAD_FACTOR))
+		) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+
+our $MAX_VIRTUAL_MEMORY_LOAD_FACTOR = 1.5;
+our $MAX_RSS_MEMORY_LOAD_FACTOR = 0.9;
+
+sub high_memory($$$) {
+  my ($virtual_mem, $rss_mem, $physical_mem) = @_;
+
+	if ((! defined($virtual_mem)) || (! defined($physical_mem)) || (! defined($rss_mem))) {
+#print "debug undef: virtual_mem = $virtual_mem, physical mem = $physical_mem, rss_mem = $rss_mem\n";
+		return undef;
+	}
+
+	if (($virtual_mem > 0) && ($physical_mem > 0) && ($rss_mem > 0)) {
+#print "debug: virtual_mem = $virtual_mem, physical mem = $physical_mem, rss mem = $rss_mem\n";
+		if (
+				($virtual_mem / $physical_mem > $MAX_VIRTUAL_MEMORY_LOAD_FACTOR) ||
+				($rss_mem / $physical_mem > $MAX_RSS_MEMORY_LOAD_FACTOR)
+			) {
+			return 1
+		} else {
+			return 0;
+		}
+	}
+
+	return undef;
+}
+
+
+our $MIN_SECONDS_TIL_RSS_FULL = 200;
+our $MIN_SECONDS_TIL_VIRT_FULL = 300;
+
+sub accelerating_mem($$$$$$) {
+  my ($curr_mem, $prev_mem, $phys_mem, $curr_time, $prev_time, $min_seconds) = @_;
+
+	return 0; # this function disabled here.
+
+	if ((! defined($curr_mem)) || (! defined($prev_mem)) || (! defined($phys_mem)) || (! defined($curr_time)) || (! defined($prev_time)) || (! defined($min_seconds))) {
+#print "curr_mem = $curr_mem, prev_mem = $prev_mem, phys_mem = $phys_mem, curr_time = $curr_time, prev_time = $prev_time\n";
+		return undef;
+	}
+
+	if (($curr_mem > 0) && ($prev_mem > 0) && ($phys_mem > 0) && ($curr_time > 0) && ($prev_time > 0)) {
+		my $num_seconds_elapsed = $curr_time - $prev_time;
+		#my $rss_diff_per_sec = ($curr_mem - $prev_mem) / $phys_mem / $num_seconds;
+
+		my $free_bytes = $phys_mem - $curr_mem;
+
+#		if ($free_bytes <= 0) {
+#			return undef;
+#		}
+
+		if ($num_seconds_elapsed < 0) {
+			return undef;
+		}
+
+		if ($num_seconds_elapsed == 0) {
+			$num_seconds_elapsed = 0.5;	# we're faking it for an approximation, since granularity is 1 second
+		}
+
+		my $bytes_per_sec = ($curr_mem - $prev_mem) / $num_seconds_elapsed;
+
+		if ($bytes_per_sec == 0) {
+			return 0;
+		}
+
+		my $secs_til_full = int($free_bytes / $bytes_per_sec);
+
+
+		if (abs($secs_til_full) < $min_seconds) {
+			$Debug && print "debug: seconds until full = $secs_til_full (min = $min_seconds). elapsed = $num_seconds_elapsed .\n";
+			return 1;
+		} else {
+			return 0;
+		}
+	}
+
+	return undef;
+}
+
+sub get_avail_server_alt($$) {
+  my $avail_servers = shift;
+	my $threads_running = shift;
+
+	# try picking server with the lowest load
+	my ($curr_min_load_factor, $curr_host);
+
+	foreach my $server (keys %{$avail_servers}) {
+		next if (! can_launch($threads_running, $avail_servers->{$server}->{curr_load_factor}));
+
+		if (($avail_servers->{$server}->{curr_load_factor} < $curr_min_load_factor) || (! defined($curr_min_load_factor))) {
+			$curr_min_load_factor = $avail_servers->{$server}->{curr_load_factor};
+			$curr_host = $server;
+		}
+	}
+
+	&print_mesg("Had to use alternate method to select $curr_host as best server\n") if (defined($curr_host));
+
+	return $curr_host;
+}
+
+
+sub get_available_server($) {
+  my $threads_running = shift;
+
+	my $curr_time = time;
+	my $hinfo = {};
+
+	$SCHEDULER = Schedule::Load::Schedule->fetch;
+
+	my ($hname, $ho, $curr_load_factor);
+	my $avail_server = {};
+
+	foreach my $server (keys %server_info) {
+		next if ($server_info{$server}{'threads_max'} == 0);
+
+		$Debug && print "debug: considering server $server, tr = " . $server_info{$server}{'threads_running'} . ", prc = " . $server_info{$server}{'processors'} . "\n";
+
+		if (defined($server_info{$server}{'threads_running'}) && ($server_info{$server}{'threads_running'} >= $server_info{$server}{'processors'})) {
+			$Debug && print "debug: already running " . $server_info{$server}{'threads_running'} . " work units on $server (max " . $server_info{$server}{'processors'} . ")\n";
+			next;
+		}
+
+		if (exists($server_info{$server}->{last_launch_time}) &&
+			(($curr_time - $server_info{$server}->{last_launch_time}) < $MIN_SERVER_LAUNCH_DELAY_SECS)) {
+			$Debug && print "debug: has not yet been $MIN_SERVER_LAUNCH_DELAY_SECS seconds since last work unit launched on $server\n";
+			next;
+		}
+
+		$ho = $SCHEDULER->get_host($server);
+
+		if (! defined($ho)) {
+			$Debug && &print_mesg("debug: WARNING: could not get host object for $server\n");
+			next;
+		}
+
+		$prev_stat_time = $server_info{$server}->{last_stat_time};
+
+		$curr_rss = $ho->total_rss;
+		$prev_rss = $server_info{$server}->{last_rss};
+
+		$curr_vir = $ho->total_size;
+		$prev_vir = $server_info{$server}->{last_vir};
+
+		if (
+			($curr_rss != $prev_rss) ||
+			($curr_vir != $prev_vir) ||
+			(($threads_running == 0) && (($curr_time - $prev_stat_time) >= $MAX_SERVER_LAUNCH_DELAY_SECS)) ||
+			(($curr_time - $prev_stat_time) >= (3 * $MAX_SERVER_LAUNCH_DELAY_SECS))
+		) {
+
+			$server_info{$server}->{last_stat_time} = $curr_time;
+			$server_info{$server}->{last_rss} = $curr_rss;
+			$server_info{$server}->{last_vir} = $curr_vir;
+
+			$Debug && print "debug: On $server . curr_rss = $curr_rss, prev_rss = $prev_rss, curr_time = $curr_time, prev time = $prev_stat_time\n";
+
+			if (accelerating_mem($curr_rss, $prev_rss, $server_info{$server}->{phys_mem}, $curr_time, $prev_stat_time, $MIN_SECONDS_TIL_RSS_FULL)) {
+				$Debug &&	print "debug: RSS accelerating too fast on $server\n";
+				$server_info{$server}->{rss_accel} = 1;
+			} else {
+				$server_info{$server}->{rss_accel} = 0;
+			}
+
+			$Debug && print "debug: On $server . curr_vir = $curr_vir, prev_vir = $prev_vir, curr_time = $curr_time, prev time = $prev_stat_time\n";
+
+			if (accelerating_mem($curr_vir, $prev_vir, $server_info{$server}->{phys_mem}, $curr_time, $prev_stat_time, $MIN_SECONDS_TIL_VIRT_FULL)) {
+				$Debug &&	print "debug: VIRTUAL accelerating too fast on $server\n";
+				$server_info{$server}->{vir_accel} = 1;
+			} else {
+				$server_info{$server}->{vir_accel} = 0;
+			}
+
+			next if ($server_info{$server}->{rss_accel} || $server_info{$server}->{vir_accel});
+		} elsif ($server_info{$server}->{rss_accel}) {
+			$Debug &&	print "debug: RSS was accelerating too fast on $server the last time it's memory stats were gathered\n";
+			next;
+		} elsif ($server_info{$server}->{vir_accel}) {
+			$Debug &&	print "debug: VIR was accelerating too fast on $server the last time it's memory stats were gathered\n";
+			next;
+		}
+
+		$curr_load_factor = curr_load($ho);
+
+		$Debug &&	print "debug: $server : total_size = " . $ho->total_size . ", " . $server_info{$server}->{phys_mem} . ", total_rss = " . $ho->total_rss . ", lf = $curr_load_factor, total pctcpu = " . $ho->total_pctcpu . "\n";
+
+		if (high_memory($ho->total_size, $ho->total_rss, $server_info{$server}->{phys_mem})) {
+			$Debug &&	print "debug: MEMORY TOO HIGH ON $server (total = " . $ho->total_size . ' , rss = ' . $ho->total_rss . ' , phys = ' . $server_info{$server}->{phys_mem} . ") \n";
+			next;
+		}
+
+		$server_info{$server}->{ho} = $ho;
+
+		$Debug && &print_mesg("debug: $server : curr_load_factor = $curr_load_factor, total_load = " . $ho->total_load . "\n");
+
+		if (! can_launch($threads_running, $curr_load_factor)) {
+			$Debug && print "debug: cannot launch on $server due to: total work units running = $threads_running. min work units = " . grid_min_processes() . ". nominal server load = $SERVER_NOMINAL_LOAD_FACTOR . max server load = $SERVER_MAX_LOAD_FACTOR . $server curr_load_factor = $curr_load_factor\n";
+			next;
+		}
+
+		$Debug && print "debug: can_launch($threads_running, $curr_load_factor) for $server is true\n";
+		$avail_server->{$server} = { curr_load_factor => $curr_load_factor };
+	}
+
+	my @available_servers = (keys %{$avail_server});
+
+	if (scalar(@available_servers) == 0) {
+		$Debug && print "debug: No potential servers to choose from\n";
+		return undef;
+	}
+
+	my $avail_txt = join(', ', map { "\'$_\' => 1" } @available_servers);
+  my @best_opts = ();
+
+	if ($threads_running >= grid_min_processes()) {
+		push(@best_opts, allow_none => 1);
+	} else {
+		push(@best_opts, allow_none => 0);
+	}
+
+	$Debug && &print_mesg("debug: choosing among these servers (@best_opts): @available_servers \n");
+
+	my $hname = $SCHEDULER->best(@best_opts, favor_host => undef, match_cb => 'sub { my %available_servers = (' . $avail_txt . '); my $hname = $_[0]->hostname; return exists($available_servers{$hname});}');
+
+	# if "best" method won't come up with a server, try picking the one with the lowest load
+	$hname = get_avail_server_alt($avail_server, $threads_running) if (! defined($hname));
+
+	if (! defined($hname)) {
+		$Debug && &print_mesg("debug: could not use alternate method to pick a server!\n");
+		return;
+	}
+
+	$ho = $SCHEDULER->get_host($hname);
+
+	if (! defined($ho)) {
+		$Debug && &print_mesg("debug: could not get host info for $hname !\n");
+		return;
+	}
+
+	# this block helps minimize chances of multiple prun2's picking the same heavily loaded server at the same time.
+	# The more loaded the chosen server, the more likely we'll skip choosing it (this time).
+
+	my $curr_load_factor = curr_load($ho);
+
+	#my $rand_threshold = (1 - $curr_load_factor / 2) / (($curr_load_factor + 0.4) ** 2);
+	my $rand_threshold = ($SERVER_MAX_LOAD_FACTOR - $curr_load_factor / 2) / (($curr_load_factor + 1.1) ** 2);
+
+	#my $rand_threshold = (1 - $curr_load_factor / 2) / (($curr_load_factor + 1) ** 3);
+	$rand_threshold = 0 if ($rand_threshold < 0);	# don't let threshold go negative
+	$rand_threshold += .01;	# always guarantee some minimum chance (1%) of hitting threshold
+
+#			my $elapsed_secs = $curr_time - $server_info->{$hname_short}->{last_launch_time};
+#			if ($elapsed_secs > ($MAX_SERVER_LAUNCH_DELAY_SECS * 3)) {
+#				$elapsed_secs = $MAX_SERVER_LAUNCH_DELAY_SECS * 3;
+#			}
+#
+#			$rand_threshold += $elapsed_secs * $MAX_RND_THRESH_ADJ / ($MAX_SERVER_LAUNCH_DELAY_SECS * 3);
+
+	my $rnd = rand();
+
+	if ($rnd >= $rand_threshold) {
+		$Debug && &print_mesg("debug: not choosing $hname this time (lf = $curr_load_factor, rnd = $rnd, thresh = $rand_threshold)\n");
+		return undef;
+	}
+
+	$Debug && &print_mesg("debug: choosing $hname (lf = $curr_load_factor, rnd = $rnd, thresh = $rand_threshold)\n");
+
+	return $hname;
+}
+
+
+sub init_server_info() {
+	my($server_name, $processors, $rsh_cmd, $mem, $group, $line_num, $original_line, %server_info_temp);
+	my($SERVER_INFO_FILE) = shift;
+
+	if (! open(SI, "$SERVER_INFO_FILE")) {
+		&print_mesg("Warning: Unable to open server info file $SERVER_INFO_FILE : $!\n");
+		return 1;
+	}
+
+	%SERVER_GROUPS = ();
+
+	$line_num = 0;
+
+	while (<SI>) {
+		chomp;
+		$line_num++;
+		$original_line = $_;
+
+		$_ =~ s/^ +//;
+		$_ =~ s/ +$//;
+
+		if ($_ =~ /^#/) {
+			next;
+		}
+
+		if ($_ =~ /^\s*([a-z0-9_]+)\s*=\s*['"]?([a-z0-9_.]+)['"]?\s*/i) {
+			($parm, $val) = (uc($1), $2);
+
+			if ($parm =~ /DEFAULT_HOST_SUFFIX/i) {
+				if ($val ne '') {
+					$DEFAULT_HOST_SUFFIX = $val;
+
+					if ($DEFAULT_HOST_SUFFIX !~ /^[.]/) {
+						$DEFAULT_HOST_SUFFIX = ".${DEFAULT_HOST_SUFFIX}";
+					}
+				} else {
+					&print_mesg("Warning: DEFAULT_HOST_SUFFIX in $SERVER_INFO_FILE is empty!\n");
+				}
+			} elsif ($parm =~ /SERVER_MAX_LOAD_FACTOR/i) {
+				if ($val ne '') {
+					if ($val =~ /^\s*\d+([.]\d+)?\s*$/) {
+						if (($val <= 2) && ($val > 0)) {
+							my $old_server_max_load_factor = $SERVER_MAX_LOAD_FACTOR;
+							$SERVER_MAX_LOAD_FACTOR = $val;
+
+							if (defined($old_server_max_load_factor)) {
+								if ($old_server_max_load_factor != $SERVER_MAX_LOAD_FACTOR) {
+									&print_mesg("Note: SERVER_MAX_LOAD_FACTOR changed from $old_server_max_load_factor to $SERVER_MAX_LOAD_FACTOR in server info file $SERVER_INFO_FILE\n");
+								}
+							} else {
+								&print_mesg("SERVER_MAX_LOAD_FACTOR = $SERVER_MAX_LOAD_FACTOR from server info file $SERVER_INFO_FILE\n");
+							}
+
+						} else {
+							&print_mesg("Warning: SERVER_MAX_LOAD_FACTOR setting of '$val' is outside accepted range. Must be > 0 and <= 2. Setting of $SERVER_MAX_LOAD_FACTOR will remain unchanged.\n");
+						}
+					} else {
+						&print_mesg("Warning: SERVER_MAX_LOAD_FACTOR setting of '$val' is invalid. Must be > 0 and <= 2. Setting of $SERVER_MAX_LOAD_FACTOR will remain unchanged.\n");
+					}
+				}
+			} elsif ($parm =~ /SERVER_NOMINAL_LOAD_FACTOR/i) {
+				if ($val ne '') {
+					if ($val =~ /^\s*\d+([.]\d+)?\s*$/) {
+						if (($val <= 2) && ($val > 0)) {
+							if ($val <= $SERVER_MAX_LOAD_FACTOR) {
+								my $old_server_nominal_load_factor = $SERVER_NOMINAL_LOAD_FACTOR;
+								$SERVER_NOMINAL_LOAD_FACTOR = $val;
+
+								if (defined($old_server_nominal_load_factor)) {
+									if ($old_server_nominal_load_factor != $SERVER_NOMINAL_LOAD_FACTOR) {
+										&print_mesg("Note: SERVER_NOMINAL_LOAD_FACTOR changed from $old_server_nominal_load_factor to $SERVER_NOMINAL_LOAD_FACTOR in server info file $SERVER_INFO_FILE\n");
+									}
+								} else {
+									&print_mesg("SERVER_NOMINAL_LOAD_FACTOR = $SERVER_NOMINAL_LOAD_FACTOR from server info file $SERVER_INFO_FILE\n");
+								}
+							} else {
+								&print_mesg("Warning: In server info file $SERVER_INFO_FILE, SERVER_NOMINAL_LOAD_FACTOR of $val exceeds current SERVER_MAX_LOAD_FACTOR of $SERVER_MAX_LOAD_FACTOR, which is not allowed. Ignoring setting.\n");
+							}
+						} else {
+							&print_mesg("Warning: SERVER_NOMINAL_LOAD_FACTOR setting of '$val' is outside accepted range. Must be > 0 and <= 2. Setting of $SERVER_NOMINAL_LOAD_FACTOR will remain unchanged.\n");
+						}
+					} else {
+						&print_mesg("Warning: SERVER_MAX_LOAD_FACTOR setting of '$val' is invalid. Must be > 0 and <= 2. Setting of $SERVER_MAX_LOAD_FACTOR will remain unchanged.\n");
+					}
+				}
+			} elsif ($parm =~ /MAX_SERVER_LAUNCH_DELAY_SECS/i) {
+				if ($val ne '') {
+					if ($val =~ /^\s*\d+(.\d+)?\s*$/) {
+						if ($val > 0) {
+							my $old_server_launch_delay_secs = $MAX_SERVER_LAUNCH_DELAY_SECS;
+							$MAX_SERVER_LAUNCH_DELAY_SECS = $val;
+
+							if (defined($old_server_launch_delay_secs)) {
+								if ($old_server_launch_delay_secs != $MAX_SERVER_LAUNCH_DELAY_SECS) {
+									&print_mesg("Note: MAX_SERVER_LAUNCH_DELAY_SECS changed from $old_server_launch_delay_secs seconds to $MAX_SERVER_LAUNCH_DELAY_SECS seconds in server info file $SERVER_INFO_FILE\n");
+								}
+							} else {
+								&print_mesg("MAX_SERVER_LAUNCH_DELAY_SECS = $MAX_SERVER_LAUNCH_DELAY_SECS from server info file $SERVER_INFO_FILE\n");
+							}
+						} else {
+							&print_mesg("Warning: MAX_SERVER_LAUNCH_DELAY_SECS setting of '$val' in server info file $SERVER_INFO_FILE is invalid! Setting must be > 0 seconds. Existing setting of $MAX_SERVER_LAUNCH_DELAY_SECS will remain unchanged.\n");
+						}
+					} else {
+						&print_mesg("Warning: MAX_SERVER_LAUNCH_DELAY_SECS setting of '$val' in server info file $SERVER_INFO_FILE is invalid!  Existing setting of $MAX_SERVER_LAUNCH_DELAY_SECS seconds will remain unchanged.\n");
+					}
+				}
+			} elsif ($parm =~ /MIN_SERVER_LAUNCH_DELAY_SECS/i) {
+				if ($val ne '') {
+					if ($val =~ /^\s*\d+(.\d+)?\s*$/) {
+						if ($val > 0) {
+							my $old_server_launch_delay_secs = $MIN_SERVER_LAUNCH_DELAY_SECS;
+							$MIN_SERVER_LAUNCH_DELAY_SECS = $val;
+
+							if (defined($old_server_launch_delay_secs)) {
+								if ($old_server_launch_delay_secs != $MIN_SERVER_LAUNCH_DELAY_SECS) {
+									&print_mesg("Note: MIN_SERVER_LAUNCH_DELAY_SECS changed from $old_server_launch_delay_secs seconds to $MIN_SERVER_LAUNCH_DELAY_SECS seconds in server info file $SERVER_INFO_FILE\n");
+								}
+							} else {
+								&print_mesg("MIN_SERVER_LAUNCH_DELAY_SECS = $MIN_SERVER_LAUNCH_DELAY_SECS from server info file $SERVER_INFO_FILE\n");
+							}
+						} else {
+							&print_mesg("Warning: MIN_SERVER_LAUNCH_DELAY_SECS setting of '$val' in server info file $SERVER_INFO_FILE is invalid! Setting must be > 0 seconds. Existing setting of $MIN_SERVER_LAUNCH_DELAY_SECS will remain unchanged.\n");
+						}
+					} else {
+						&print_mesg("Warning: MIN_SERVER_LAUNCH_DELAY_SECS setting of '$val' in server info file $SERVER_INFO_FILE is invalid!  Existing setting of $MIN_SERVER_LAUNCH_DELAY_SECS seconds will remain unchanged.\n");
+					}
+				}
+			} else {
+				&print_mesg("Warning: the following line in $SERVER_INFO_FILE is not a recognized setting!: '$_'\n");
+			}
+
+			next;
+		}
+
+		next if (! ($_ =~ /[:,]/));
+
+		($server_name, $processors, $mem, $rsh_cmd, $group) = split('[:,]', $_);
+
+		if ($server_name eq '') {
+			&print_mesg("Warning: Server name missing from line $line_num of server info file $SERVER_INFO_FILE : line = '$original_line'\n");
+			next;
+		}
+
+		$server_name .= $DEFAULT_HOST_SUFFIX if (defined($DEFAULT_HOST_SUFFIX) && ($server_name !~ /[.]/));
+
+		if (! ($processors =~ /^[0-9]+$/)) {
+			&print_mesg("Warning: Number of physical processors for server $server_name is not valid ($processors). Forcing to 1.\n");
+			$processors = 1;
+		}
+
+		if (($rsh_cmd ne 'rsh') and ($rsh_cmd ne 'ssh')) {
+			&print_mesg("Warning: rsh_cmd for $server_name is not rsh or ssh ($rsh_cmd). Assuming rsh\n");
+			$rsh_cmd = 'rsh';
+		}
+
+		$server_info_temp{$server_name}{'processors'} = $processors;
+		$server_info_temp{$server_name}{'rsh_method'} = $rsh_cmd;
+
+		if (length($group) > 0) {
+			$server_info_temp{$server_name}{'server_group'} = $group;
+			$SERVER_GROUPS{$group}{'servers'}{$server_name} = 1;
+		} else {
+			$server_info_temp{$server_name}{'server_group'} = '';
+		}
+
+		if ($mem =~ /^\s*(\d+[.]?\d*)\s*g\s*$/i) {
+			if (($1 >= 0.1) && ($1 <= 1000)) {
+				$server_info_temp{$server_name}{'phys_mem'} = sprintf('%.1f', $1 * 1073741824);	# convert memory GB to bytes
+#print "debug: physical mem for $server_name set to " . $server_info_temp{$server_name}{'phys_mem'} . "\n";
+			} else {
+				&print_mesg("Warning: physical memory setting for $server_name is '$1', which is outside the accepted range of 0.1 to 1000 GB. Ignoring\n");
+			}
+		} elsif ($mem !~ /^\s*$/) {
+			&print_mesg("Warning: physical memory setting for $server_name is '$mem', which is invalid. Ignoring\n");
+		}
+	}
+
+	close(SI);
+
+	if (! defined($DEFAULT_HOST_SUFFIX)) {
+		$DEFAULT_HOST_SUFFIX = $LOCAL_HOSTNAME;
+		$DEFAULT_HOST_SUFFIX =~ s/^[^.]+[.]/./;
+	}
+
+	foreach my $sname (keys %server_info_temp) {
+		if ($sname !~ /[.]/) {
+			$full_sname = "${sname}${DEFAULT_HOST_SUFFIX}";
+		} else {
+			$full_sname = $sname;
+		}
+
+		foreach my $key (keys %{$server_info_temp{$sname}}) {
+			$server_info{$full_sname}{$key} = $server_info_temp{$sname}{$key};
+		}
+	}
+
+
+	if (! defined($SERVER_NOMINAL_LOAD_FACTOR)) {
+		$SERVER_NOMINAL_LOAD_FACTOR = $DEFAULT_SERVER_NOMINAL_LOAD_FACTOR;
+		&print_mesg("Defaulting SERVER_NOMINAL_LOAD_FACTOR to $SERVER_NOMINAL_LOAD_FACTOR\n");
+	}
+
+	if (! defined($MAX_SERVER_LAUNCH_DELAY_SECS)) {
+		$MAX_SERVER_LAUNCH_DELAY_SECS = $DEFAULT_MAX_SERVER_LAUNCH_DELAY_SECS;
+		&print_mesg("Defaulting SERVER_LAUNCH_DELAY_SECS to $MAX_SERVER_LAUNCH_DELAY_SECS\n");
+	}
+
+	if (! defined($SERVER_MAX_LOAD_FACTOR)) {
+		$SERVER_MAX_LOAD_FACTOR = $DEFAULT_SERVER_MAX_LOAD_FACTOR;
+		&print_mesg("Defaulting SERVER_MAX_LOAD_FACTOR to $SERVER_MAX_LOAD_FACTOR\n");
+	}
+}
+
+
+$return_code = 0;
+$num_success = 0;
+$num_fail = 0;
+$threads = 0;
+
+
+sub usage {
+
+	no warnings;
+
+	&print_mesg("Usage:\n", 'HELP');
+	&print_mesg("$PGM [-f workunit_file] [-e normal_exit_status] [-r host[:threads[%][:rsh|ssh]][,...]] [-p priority] [--] command [-options] [%p]\n", 'HELP');
+	&print_mesg("Note: If any options are specified for command, -- must be specified just prior to command.\n", 'HELP');
+	&print_mesg("Note: If no arguments or options for command are specified, %p is assumed.\n", 'HELP');
+	&print_mesg("Options and defaults:\n", 'HELP');
+	&print_mesg("	-f: Source of %p argument values for command (default standard input)\n", 'HELP');
+	&print_mesg("	-r: comma-seperated list of hosts to run on. Each host may be followed by :threads, :threads:#, or :threads:#% . Default " . (exists($ENV{PRUN_PARALLEL_HOST_SPEC}) ? $ENV{PRUN_PARALLEL_HOST_SPEC} : '{localhost}') . "\n", 'HELP');
+	&print_mesg("	-p: Set scheduling priority (nice value) to priority. Valid values are integers between 0 and 19. (Default 0)\n", 'HELP');
+	&print_mesg("	-l: Set scheduling priority to $DEFAULT_CPU_PRIORITY\n", 'HELP');
+	&print_mesg("	-e: Normal return/exit status from work unit (Default 0)\n", 'HELP');
+	&print_mesg("	-a: Max # of work unit failures allowed (Default unlimited)\n", 'HELP');
+	&print_mesg("	-x: Max # of successive work unit failures allowed per host (Default $MAX_SERVER_FAILURES). Use 0 to disable.\n", 'HELP');
+	&print_mesg("	-s: Min # of seconds between control file inspections (Default 10)\n", 'HELP');
+	&print_mesg("	-m: Max # of times a specific work unit can be attempted (Default 1)\n", 'HELP');
+	&print_mesg("	-t: Do NOT remove control file, temp work units and done files when at least one work unit fails (no effect when work units obtained via -f option)\n", 'HELP');
+	print STDERR "	-h:\n"; 
+	&print_mesg("	-j: job name. Displayed in execution report\n", 'HELP');
+	&print_mesg("	-d: temp directory used to create work unit and done files when -f option not used\n", 'HELP');
+	&print_mesg("	-w: comma-seperated list of email addresses to send execution report to.\n", 'HELP');
+	&print_mesg("	-k: comma-seperated list of email addresses to send successful execution report to.\n", 'HELP');
+	&print_mesg("	-u: comma-seperated list of email addresses to send UNsuccessful execution report to.\n", 'HELP');
+	&print_mesg("	-b: If work units are files, DO NOT attempt to launch them in descending file size order.\n", 'HELP');
+	&print_mesg("	-v: Explicit location of server info file (overrides PRUN2_SERVER_INFO environment variable)\n", 'HELP');
+	&print_mesg("\n", 'HELP');
+	&print_mesg("general syntax: prun2 [options] [--] cmd [options] [%p] [--] [arg1] [%p] [arg2] [...] \n", 'HELP');
+	&print_mesg("example syntax: prun2 [options] cmd [%p] [arg1] [%p] [arg2] [...] \n", 'HELP');
+	&print_mesg("example syntax: prun2 [options] -- cmd <cmd_options> [-cmd_opt %p] [%p] -- [arg1] [arg2] [...] \n", 'HELP');
+	&print_mesg("example syntax: prun2 [options] -- cmd <cmd_options> [%p] [arg1] [arg2] [...] \n", 'HELP');
+	&print_mesg("\n", 'HELP');
+	&print_mesg("Example 1: run gzip 5 at a time on local host, getting work units from command line arguments (*.dat)\n", 'HELP');
+	&print_mesg("prun2 -p 5 gzip *.dat\n", 'HELP');
+	&print_mesg("\n", 'HELP');
+	&print_mesg("Example 2: same as #1, but get work units from workunit file\n", 'HELP');
+	&print_mesg("prun2 -f workunit -p 5 gzip\n", 'HELP');
+	&print_mesg("\n", 'HELP');
+	&print_mesg("Example 3: same as #1, but get work units from standard input\n", 'HELP');
+	&print_mesg("find . -name '*.dat' -print |  prun2 -p 5 gzip\n", 'HELP');
+	&print_mesg("\n", 'HELP');
+	&print_mesg("Example 4: same as #1, but passing -c option to gunzip, and running max processors on host1 and host2\n", 'HELP');
+	&print_mesg("prun2 -r host1,host2 -- gunzip -c *.dat.gz\n", 'HELP');
+	&print_mesg("(must use -- before gunzip to avoid confusion between prun2 options and gunzip options)\n", 'HELP');
+	&print_mesg("\n", 'HELP');
+	&print_mesg("Example 5: run gzip 6 at a time, with '-S .GZ option' passed to gzip, getting work units from command line arguments (*.dat)\n", 'HELP');
+	&print_mesg("(must use -- before *.dat so prun2 won't mistakenly think that '.GZ' is one of the work units)\n", 'HELP');
+	&print_mesg("prun2 -p 6 -- gzip -S .GZ -- *.dat\n", 'HELP');
+	&print_mesg("\n", 'HELP');
+	&print_mesg("Example 6: same as #4, with alternate syntax\n", 'HELP');
+	&print_mesg("prun2 -p 6 -- gzip -S .GZ %p *.dat\n", 'HELP');
+	&print_mesg("(any occurrance of %p is replaced by a work unit with each execution of gzip)\n", 'HELP');
+	&print_mesg("\n", 'HELP');
+	&print_mesg("Example 7: run cmd 6 at a time on host1 and 4 at a time on host2, passing '-s %p' work unit arguments as first argument to cmd, work units\n", 'HELP');
+	&print_mesg("obtained from command line arguments (*.dat)\n", 'HELP');
+	&print_mesg("prun2 -p 6 -r host2:4,host1 -- cmd -s %p -k -c *.dat\n", 'HELP');
+	&print_mesg("\n", 'HELP');
+	&print_mesg("Note: Perform 'echo rx:0 > workunit.control' to prevent new work units from being executed on rx.\n", 'HELP');
+	&print_mesg("Note: Perform 'echo rx:2 > workunit.control' to change parallel_degree on rx to 2 while prun2 is still running.\n", 'HELP');
+	&print_mesg("Note: Parallel degree precedence: '-r host:threads', '-p threads', '-v server info default file'\n", 'HELP');
+	&print_mesg("Note: Perform 'echo priority = 15 >> workunit.control' to change/set CPU priority for unlaunched (remaining) work units\n", 'HELP');
+
+}
+
+getopts('f:e:a:s:lh-i:r:m:qtj:k:u:w:bp:v:d:x:g:z');
+
+if ($#ARGV < 0) {
+	&usage;
+	my_exit(0);
+}
+
+if (defined($opt_z)) {
+	$Debug = 1;
+}
+
+if (defined($opt_g)) {
+	if ($opt_g =~ /^\s*\d+\s*$/) {
+		if ($opt_g >= 1) {
+			$GRID_MIN_PROCESSES = $opt_g;
+			&print_mesg("Warning: The -g option (grid_minimum_processes) was specified on the command line as $GRID_MIN_PROCESSES\n");
+		} else {
+			&print_mesg("ERROR: When specified, the -g option (grid_minimum_processes) must be at least 1. Value requested = $opt_g\n");
+			my_exit(1);
+		}
+	} else {
+		&print_mesg("ERROR: When specified, the -g option (grid_minimum_processes) must be a positive integer of at least 1. Value requested = $opt_g\n");
+		my_exit(1);
+	}
+}
+
+
+if (defined($opt_x)) {
+	if ($opt_x =~ /^\s*\d+\s*$/) {
+		$MAX_SERVER_FAILURES = $opt_x;
+
+		if ($MAX_SERVER_FAILURES < 0) {
+			&print_mesg("ERROR: Negative value of '$opt_x' not supported for -x option\n");
+			my_exit(1);
+		}
+
+		if ($MAX_SERVER_FAILURES == 0) {
+			$MAX_SERVER_FAILURES = undef;
+		}
+
+	} else {
+		&print_mesg("ERROR: Must specify integer value for -x option. Value passed was '$opt_x'\n");
+		my_exit(1);
+	}
+}
+
+
+$TEMP_DIR = '.';
+
+if (defined($opt_d)) {
+	$TEMP_DIR = $opt_d;
+}
+
+if (! -w $TEMP_DIR) {
+	$TEMP_DIR = '/tmp';
+}
+
+# Determine which server info file to use.
+# Precedence is: command line overrides environment variable,
+#		environment variable overrides hard-coded default
+
+if (defined($opt_v)) {
+	$SERVER_INFO_FILE = $opt_v;
+} elsif (exists($ENV{PRUN2_SERVER_INFO})) {
+	$SERVER_INFO_FILE = $ENV{PRUN2_SERVER_INFO};
+} else {
+	$SERVER_INFO_FILE = $DEFAULT_SERVER_INFO_FILE;
+}
+
+
+sub hostname_prefix($) {
+  my $hname = $_[0];
+
+	$hname =~ s/[.].*$//g;
+	return $hname;
+}
+
+sub hostname_suffix($) {
+  my $hname = $_[0];
+
+	$hname =~ s/^[^.]+[.]//g;
+	return $hname;
+}
+
+
+our $LOCAL_HOSTNAME = hostname;
+
+if (! defined($LOCAL_HOSTNAME)) {
+	$LOCAL_HOSTNAME = `hostname`;
+	chomp($LOCAL_HOSTNAME);
+}
+
+our $LOCAL_SUFFIX = hostname_suffix($LOCAL_HOSTNAME);
+our $USERNAME = getlogin() || getpwuid($<);
+
+if (defined($opt_p)) {
+	if ($opt_p !~ /^\d+$/) {
+		&print_mesg("ERROR: Must specify integer priority value of at least 0 for -p option. Value passed was '$opt_p'\n");
+		my_exit(1);
+	}
+
+	$workunit_priority = $opt_p;
+	@PRUN_ARGV = ('nice', '-n', $workunit_priority, @ARGV);
+
+	if (defined($opt_l)) {
+		&print_mesg("Warning: '-p $opt_p' option overrides -l option. Ignoring -l option\n");
+	}
+
+} else {
+	if (defined($opt_l)) {
+
+		$workunit_priority = $DEFAULT_CPU_PRIORITY;
+		@PRUN_ARGV = ('nice', '-n', $workunit_priority, @ARGV);
+
+	} else {
+		@PRUN_ARGV = @ARGV;
+	}
+}
+
+if (defined($opt_q)) {
+	$QUIET_MODE = 1;
+}
+
+if (defined($opt_f)) {
+	@argv = @PRUN_ARGV;
+	$MASTER_TODO_FILE = $opt_f;
+
+	if ($MASTER_TODO_FILE =~ /[.]done$/) {
+		die "ERROR: work unit file name '$MASTER_TODO_FILE' specified by -f option cannot end with '.done'\n";
+	}
+
+	$master_done_file = $MASTER_TODO_FILE . ".done";
+	$CONTROL_FILE = $MASTER_TODO_FILE . ".control";
+	$WU_SOURCE = $MASTER_TODO_FILE;
+
+	$workunit_source_message = "Got work units from $MASTER_TODO_FILE\n";
+
+	open(MASTER, "< $MASTER_TODO_FILE") || die "can't open $MASTER_TODO_FILE: $!";
+	$master_index = -1;
+
+	while (<MASTER>) {
+		chomp;
+		next if (/^[    ]*[#]/);
+		next if (/^[    ]*$/);
+
+		@M = split(',', $_);
+
+		$master_index++;
+		$master_list[$master_index] = $M[0];
+	}
+
+	close (MASTER);
+	$TODO_FILE_INDICATOR = 1;
+
+} else {
+	# no -f specified, so try getting source from standard input
+	if (! -t STDIN) {
+		@master_list = <STDIN>;
+	}
+
+
+	$MASTER_TODO_FILE = "$TEMP_DIR/prun_temp.$$";
+	$master_done_file = "$TEMP_DIR/prun_temp.$$.done";
+	$CONTROL_FILE = "$TEMP_DIR/prun_temp.$$.control";
+	$TODO_FILE_INDICATOR = 0;
+	$WU_SOURCE = '{standard input}';
+
+	if ($#master_list >= 0) {
+		@argv = @PRUN_ARGV;
+		chomp(@master_list);
+
+		if (($#master_list >= 0) and (! (-f $MASTER_TODO_FILE))) {
+
+			$workunit_source_message = "Got work units from standard input\n";
+
+			if (open(MASTER, "> $MASTER_TODO_FILE")) {
+				for($i = 0; $i <= $#master_list; $i++) {
+					print MASTER $master_list[$i] . "\n";
+				}
+				close(MASTER);
+			} else {
+				&print_mesg("Warning: Unable to save recoverable copy of work units to $MASTER_TODO_FILE, continuing without recovery capability : $!\n");
+			}
+		} else {
+			die "Error: Recoverable copy of work units already exists in temp file $MASTER_TODO_FILE\n";
+		}
+
+	} else {
+		# no -f specified and no records in standard input, so try getting source from command line arguments
+
+		$found_source_arg = 0;
+		$last_command_arg_index = 0;
+
+		for($i = $#PRUN_ARGV; $i >= 1; $i--) {
+			if ($PRUN_ARGV[$i] =~ /%p/) {
+				$last_command_arg_index = $i - 1;
+				last;
+			} elsif ($PRUN_ARGV[$i] =~ /^--$/) {
+				$last_command_arg_index = $i - 1;
+				last;
+			} elsif ($PRUN_ARGV[$i] =~ /^-/) {
+				$last_command_arg_index = $i;
+				last;
+			} else {
+				$found_source_arg = 1;
+				$first_source_arg_index = $i;
+			}
+		}
+
+		if ($found_source_arg) {
+
+			# grab work units from commmand line arguments and save in @master_list
+			for($i = $first_source_arg_index; $i <= $#PRUN_ARGV; $i++) {
+				push(@master_list, $PRUN_ARGV[$i]);
+			}
+
+			@argv = ();
+			# create arg list WITHOUT work units arguments (since those will be replaced by %p)
+			for($i = 0; $i <= $last_command_arg_index; $i++) {
+				push(@argv, $PRUN_ARGV[$i]);
+			}
+
+			$WU_SOURCE = '{command line arguments}';
+		} else {
+			&print_mesg("Error: Cannot find parm list from -f, standard input, or command line arguments.\n");
+			&print_mesg("Command line = " . join(' ', @PRUN_ARGV) . "\n");
+			my_exit(1);
+		}
+
+		$workunit_source_message = "Got work units from command line arguments\n";
+
+		if (open(MASTER, "> $MASTER_TODO_FILE")) {
+			for($i = 0; $i <= $#master_list; $i++) {
+				print MASTER $master_list[$i] . "\n";
+			}
+			close(MASTER);
+		} else {
+			&print_mesg("Warning: Unable to save recoverable copy of work units to $MASTER_TODO_FILE, continuing without recovery capability : $!\n");
+		}
+	}
+
+}
+
+($vol, $dir, $base_fname) = splitpath($MASTER_TODO_FILE);
+@dirs = splitdir(rel2abs $dir);
+
+if ($#dirs >= 1) {
+	$WU_LOG_TAG = $dirs[$#dirs - 1] . '/' . $dirs[$#dirs] . '/' . $base_fname;
+} elsif ($#dirs == 0) {
+	$WU_LOG_TAG = $dirs[0] . '/' . $base_fname;
+} else {
+	$WU_LOG_TAG = $base_fname;
+}
+
+&print_mesg($workunit_source_message);
+
+if (defined($opt_b)) {
+	$SORT_WU_OK = 0;
+} else {
+	$SORT_WU_OK = 1;
+}
+
+if (defined($opt_w)) {
+	$MAIL_ON_SUCCESS = 1;
+	@success_email_addresses = split(',', $opt_w);
+	$MAIL_ON_FAILURE = 1;
+	@failure_email_addresses = @success_email_addresses;
+}
+
+if (defined($opt_k)) {
+	$MAIL_ON_SUCCESS = 1;
+	@success_email_addresses = split(',', $opt_k);
+}
+
+if (defined($opt_u)) {
+	$MAIL_ON_FAILURE = 1;
+	@failure_email_addresses = split(',', $opt_u);
+}
+
+if (defined($opt_j)) {
+	$JOB_NAME = $opt_j;
+}
+
+if (defined($opt_t)) {
+	$remove_temp_wu_on_failures = 0;
+} else {
+	$remove_temp_wu_on_failures = 1;
+}
+
+
+if (defined($opt_m)) {
+	if ($opt_m > 0) {
+		$MAX_ATTEMPTS = $opt_m;
+	} else {
+		&print_mesg("ERROR: -m option value of $opt_m is invalid. Must be an integer of at least 1\n");
+		my_exit(1);
+	}
+} else {
+	$MAX_ATTEMPTS = 1;
+}
+
+
+sub server_max_threads($;$) {
+  my ($server_name, $max_threads_spec) = @_;
+  my $max_threads;
+
+	if (defined($server_name)) {
+		if (defined($max_threads_spec)) {
+			if ($max_threads_spec =~ /^\s*(\d+)(%)?\s*$/) {
+
+				if (defined($2)) {
+					my $max_threads_pct = $1;
+
+					if (exists($server_info{$server_name})) {
+						if (exists($server_info{$server_name}{processors})) {
+							$max_threads = int($server_info{$server_name}{processors} * $max_threads_pct / 100);
+
+							if (($server_info{$server_name}{processors} >= 1) and ($max_threads <= 0)) {
+								$max_threads = 1;
+							}
+						} else {
+							$max_threads = 1;
+							&print_mesg("Warnning: server_max_threads(): max threads spec of '$max_threads_spec' requested for $server_name, but processors is not defined for this server. Defaulting to $max_threads.\n");
+						}
+					} else {
+						&print_mesg("Warnning: server_max_threads(): max threads spec of '$max_threads_spec' requested for $server_name, but this server is not recognized.\n");
+					}
+
+				} else {
+					$max_threads = $1;
+				}
+
+			} else {
+				$max_threads = 1;
+				&print_mesg("Warnning: server_max_threads(): max threads spec of '$max_threads_spec' for $server_name is invalid. Defaulting to $max_threads.\n");
+			}
+		} else {
+			if (exists($server_info{$server_name})) {
+				if (exists($server_info{$server_name}{processors})) {
+					$max_threads = $server_info{$server_name}{processors};
+				} else {
+					$max_threads = 1;
+					&print_mesg("Warnning: server_max_threads(): cannot determine max threads for server $server_name . Defaulting to $max_threads.\n");
+				}
+			} else {
+				&print_mesg("Warnning: server_max_threads(): max threads for server $server_name cannot be determined because this server is not recognized.\n");
+			}
+		}
+	} else {
+		&print_mesg("Warning: server_max_threads(): No server name provided\n");
+	}
+
+	return $max_threads;
+}
+
+
+sub set_run_server_info() {
+	my ($server_parm_list) = shift;
+# Hess changed 5/18/2007
+#	my ($initial_state) = shift;
+	my (%servers_requested);
+
+	# set run request info based on command line parameters
+
+	%MERGED_RUN_REQUEST_INFO = ();
+
+	foreach $server_parm (split('[ ,]+', $server_parm_list)) {
+		($l_server_name, $max_threads, $rsh_cmd) = split(':', $server_parm);
+
+		$l_server_name =~ s/^ +//;
+		$l_server_name =~ s/ +$//;
+		$rsh_cmd =~ s/^ +//;
+		$rsh_cmd =~ s/ +$//;
+		$max_threads =~ s/^ +//;
+		$max_threads =~ s/ +$//;
+
+		if (! (length($l_server_name) > 0)) {
+			&print_mesg("ERROR: Server name missing in server info file $SERVER_INFO_FILE\n");
+			my_exit(1);
+		}
+
+		if (exists($SERVER_GROUPS{$l_server_name})) {	# this is a group, not a server
+			foreach $server_name_temp (keys %server_info) {	# adjust request for each server in group
+				if ($server_info{$server_name_temp}{'server_group'} eq $l_server_name) {
+					$MERGED_RUN_REQUEST_INFO{$server_name_temp}{'rsh_cmd'} = $rsh_cmd;
+
+					if (! exists($MERGED_RUN_REQUEST_INFO{$server_name_temp}{'max_threads'})) {	# don't overwrite server-specific request w/group request
+						$MERGED_RUN_REQUEST_INFO{$server_name_temp}{'max_threads'} = server_max_threads($server_name_temp, $max_threads);
+						$MERGED_RUN_REQUEST_INFO{$server_name_temp}{'info_source'} = 'command line';
+					}
+				}
+			}
+		} else {	# adjust request for the server
+
+      $l_server_name = server_name($l_server_name);
+
+			$MERGED_RUN_REQUEST_INFO{$l_server_name}{'rsh_cmd'} = $rsh_cmd;
+			$MERGED_RUN_REQUEST_INFO{$l_server_name}{'max_threads'} = server_max_threads($l_server_name, $max_threads);
+			$MERGED_RUN_REQUEST_INFO{$l_server_name}{'info_source'} = 'command line';
+		}
+	}
+
+	# override the command line parameter server request info with the control file request info where appropriate
+
+	&read_control_info();
+
+	foreach $server_name (keys %CONTROL_INFO) {
+		if (exists($SERVER_GROUPS{$server_name})) {	# this is a group, not a server
+			foreach $server_name_temp (keys %server_info) {	# adjust request for each server in group
+				if ($server_info{$server_name_temp}{'server_group'} eq $server_name) {
+					$MERGED_RUN_REQUEST_INFO{$server_name_temp}{'rsh_cmd'} = $server_info{$server_name_temp}{'rsh_cmd'};
+
+					if ($MERGED_RUN_REQUEST_INFO{$server_name_temp}{'info_source'} ne 'control file') {	# don't overwrite server-specific request w/group request
+						$MERGED_RUN_REQUEST_INFO{$server_name_temp}{'max_threads'} = $CONTROL_INFO{$server_name};
+						$MERGED_RUN_REQUEST_INFO{$server_name_temp}{'info_source'} = 'control file';
+					}
+				}
+			}
+		} else {	# adjust request for the server
+			my $l_server_name = server_name($server_name);
+			$MERGED_RUN_REQUEST_INFO{$server_name}{'max_threads'} = $CONTROL_INFO{$server_name};
+			$MERGED_RUN_REQUEST_INFO{$server_name}{'info_source'} = 'control file';
+		}
+	}
+
+	foreach $l_server_name (keys %MERGED_RUN_REQUEST_INFO) {
+
+		if (defined($MERGED_RUN_REQUEST_INFO{$l_server_name}{'rsh_cmd'})) {
+			$rsh_cmd = $MERGED_RUN_REQUEST_INFO{$l_server_name}{'rsh_cmd'};
+		} else {
+			$rsh_cmd = '';
+		}
+
+		if (defined($MERGED_RUN_REQUEST_INFO{$l_server_name}{'max_threads'})) {
+			$max_threads = $MERGED_RUN_REQUEST_INFO{$l_server_name}{'max_threads'};
+		} else {
+			$max_threads = '';
+		}
+
+		if (defined($MERGED_RUN_REQUEST_INFO{$l_server_name}{'info_source'})) {
+			$info_source = $MERGED_RUN_REQUEST_INFO{$l_server_name}{'info_source'};
+		} else {
+			$info_source= 'unknown source';	# should not happen
+		}
+
+		if (! (length($l_server_name) > 0)) {
+			&print_mesg("ERROR: Server name missing in $SERVER_INFO_FILE. Syntax is server[:threads][:rsh_cmd][,...]\n");
+			my_exit(1);
+		}
+
+
+	  foreach $server_name (keys %server_info) {
+
+	    if (($l_server_name eq $server_name) or ($l_server_name eq $server_info{$server_name}{'server_group'})) {
+				if ($max_threads eq '') {
+
+					if (defined($server_info{$server_name}{'processors'})) { # get threads_max from server info file
+						if ($server_info{$server_name}{'processors'} != $server_info{$server_name}{'threads_max'}) {
+							if ($server_info{$server_name}{'threads_max'} == 0) {
+								&print_mesg("Note: Adding server " . hostname_display($server_name) . " to current server list, utilizing " . $server_info{$server_name}{'processors'} . " processors, based on server info file.\n");
+							} elsif ($server_info{$server_name}{'processors'} == 0) {
+								&print_mesg("Note: " . hostname_display($server_name) . " has been removed from the server pool, based on server info file.\n");
+							} else {
+								&print_mesg("Note: Max threads for " . hostname_display($server_name) . " changed from " . $server_info{$server_name}{'threads_max'} . " to " . $server_info{$server_name}{'processors'} . " , based on server info file.\n");
+							}
+
+							$server_info{$server_name}{'threads_max'} = $server_info{$server_name}{'processors'};
+						}
+					} else {
+						&print_mesg("WARNING: Unable to determine number of threads to run for server " . hostname_display($server_name) . " . Prematurely abandoning set_run_server_info() fuction. Server Info file may be corrupt or invalid\n");
+						return 0;
+					}
+				} else {
+					if ($max_threads =~ /^[0-9]+$/) {
+						if ($max_threads != $server_info{$server_name}{'threads_max'}) {
+							if ($server_info{$server_name}{'threads_max'} == 0) {
+								&print_mesg("Note: Adding server " . hostname_display($server_name) . " to the current server list, utilizing $max_threads processors, based on ${info_source}.\n");
+							} elsif ($max_threads == 0) {
+								&print_mesg("Note: " . hostname_display($server_name) . " has been removed from the server pool, based on ${info_source}.\n");
+							} else {
+								&print_mesg("Note: Max threads for " . hostname_display($server_name) . " changed from $server_info{$server_name}{'threads_max'} to $max_threads , based on ${info_source}.\n");
+							}
+
+							if ($max_threads > $server_info{$server_name}{'processors'}) {
+								&print_mesg("Warning: Max threads of $max_threads for server " . hostname_display($server_name) . " exceeds pre-defined number of processors of $server_info{$server_name}{'processors'}\n");
+							}
+
+							$server_info{$server_name}{'threads_max'} = $max_threads;
+						}
+					} else {
+						&print_mesg("ERROR: Max threads specified for server " . hostname_display($server_name) . " ($max_threads) is invalid, ignoring.\n");
+					}
+				}
+
+			$servers_requested{$server_name} = 1;
+ 	   }
+
+#	if ($initial_state eq 'Y') {
+		# Hess changed 5/18/2007
+
+		$server_info{$server_name}{'threads_running'} = 0 if ((! exists($server_info{$server_name}{'threads_running'})) || (! defined($server_info{$server_name}{'threads_running'})));
+		$server_info{$server_name}{'threads_completed'} = 0 if ((! exists($server_info{$server_name}{'threads_completed'})) || (! defined($server_info{$server_name}{'threads_completed'})));
+		$server_info{$server_name}{'threads_failed'} = 0 if ((! exists($server_info{$server_name}{'threads_failed'})) || (! defined($server_info{$server_name}{'threads_failed'})));
+#	}
+
+	if (! (length($rsh_cmd) > 0)) {
+  		if (! defined($server_info{$server_name}{'rsh_method'})) {
+  			&print_mesg("Warning: Unable to determine rsh method for server $server_name. Assuming rsh\n");
+  			$server_info{$server_name}{'rsh_method'} = 'rsh';
+  		}
+	} else {
+	  	if (($rsh_cmd ne 'rsh') and ($rsh_cmd ne 'ssh')) {
+  			&print_mesg("ERROR: rsh method for server $server_name is not rsh or ssh ($rsh_cmd)\n");
+  			my_exit(1);
+	  	}
+	}
+
+	  }
+	}
+
+	my $old_max_threads = get_max_threads;;
+
+	my $max_threads = 0;
+
+	foreach $server_name (keys %server_info) {
+		if (! defined($servers_requested{$server_name})) {
+			if (defined($server_info{$server_name}{'threads_max'})) {
+				if ($server_info{$server_name}{'threads_max'} > 0) {
+					&print_mesg("Note: $server_name has been removed from the server pool, based on group membership in server info file.\n");
+					$server_info{$server_name}{'threads_max'} = 0;
+				}
+			}
+		}
+
+		$max_threads += $server_info{$server_name}{'threads_max'};
+	}
+
+	set_max_threads($max_threads);
+
+	if (defined($old_max_threads) && (get_max_threads != $old_max_threads)) {
+		&print_mesg("Note: Max threads changed from $old_max_threads to " . get_max_threads . ".\n");
+	}
+
+}
+
+
+if (defined($opt_i)) {
+	$SERVER_INFO_FILE = $opt_i;
+}
+
+&print_mesg("=== initialize prun setup info ===\n");
+
+# initialize generic server info
+
+&init_server_info($SERVER_INFO_FILE);
+
+# initialize run-specific server info
+
+if (! defined($opt_r)) {
+	if (exists($ENV{PRUN_PARALLEL_HOST_SPEC}) && defined($ENV{PRUN_PARALLEL_HOST_SPEC}) && ($ENV{PRUN_PARALLEL_HOST_SPEC} !~ /^\s*$/)) {
+		$server_parm_list = $ENV{PRUN_PARALLEL_HOST_SPEC};
+	} else {
+		$server_parm_list = `hostname`;
+		chomp($server_parm_list);
+	}
+
+	if (length($server_parm_list) == 0) {
+		&print_mesg("ERROR: Unable to determine hostname\n");
+		my_exit(1);
+	}
+} else {
+	$server_parm_list = $opt_r;
+}
+
+# Hess changed 5/18/2007
+#&set_run_server_info($server_parm_list, 'Y');
+
+&set_run_server_info($server_parm_list);
+
+if (defined($opt_h)) {
+	&usage;
+	my_exit(0);
+}
+
+if (defined($opt_a)) {
+	if ($opt_a ne 'unlimited') {
+		$max_child_failures = $opt_a;
+	}
+}
+
+if (! defined($max_child_failures)) {
+	$max_child_failures = 999999999999;
+}
+
+if (defined($opt_e)) {
+	$normal_child_exit = $opt_e;
+} else {
+	$normal_child_exit = 0;
+}
+
+
+if (($ARGV[0] =~ /^-/) or ($ARGV[0] =~ /^%p/) or (length($ARGV[0]) == 0)) {
+	&print_mesg("Error: specified command of " . $ARGV[0] . " is not valid.\n");
+	my_exit(1);
+}
+
+if ($ARGV[0] eq 'nice') {
+	&print_mesg("ERROR: To launch work units at reduced CPU scheduling priority, you must use the '-l' or '-p priority' command line options INSTEAD OF prefixing your command with 'nice'\n");
+	my_exit(1);
+}
+
+# @argv = @PRUN_ARGV;
+
+$found_parm = 0;
+for($i = $#PRUN_ARGV; $i >= 1; $i--) {
+	if ($PRUN_ARGV[$i] =~ /%p/) {
+# print "found %p in arg $i : $PRUN_ARGV[$i]\n";
+		$found_parm = 1;
+		last;
+	}
+}
+
+sub get_wu_from_file() {
+	my($wu_file) = shift;
+	my($wu_index, $line, $original_max_wu_index, @M, $num_new_wu);
+
+	if (! $MASTER_LIST_RESORTED) {
+		if (-r $wu_file) {
+			open(WU, "< $wu_file") || &print_mesg("Warning: Unable to look for work units in file $wu_file : $!\n");
+
+			$wu_index = -1;
+			$line_num = 0;
+			$original_max_wu_index = $#master_list;
+
+			while (<WU>) {
+
+				$line_num++;
+
+				chomp;
+				next if (/^[    ]*[#]/);
+				next if (/^[    ]*$/);
+
+				@M = split(',', $_);
+
+				$wu_index++;
+
+				if ($wu_index <= $original_max_wu_index) {
+					if ($master_list[$wu_index] ne $M[0]) {
+						&print_mesg("Warning: Mismatch between previous work units and current work units in $wu_file file on line $line_num . Work unit file may only be appended to. First mismatched line is: $_\n");
+						last;
+					}
+				} else {
+					$master_list[$wu_index] = $M[0];
+				}
+			}
+
+			close (MASTER);
+			$TOTAL_MASTER_ITEMS = scalar(@master_list);
+
+			if ($#master_list > $original_max_wu_index) {
+				$num_new_wu = $#master_list - $original_max_wu_index;
+				$NUM_ITEMS_REMAINING += $num_new_wu;
+				&print_mesg("Note: $num_new_wu work units were appended to the $wu_file file\n");
+			}
+		}
+
+		&sort_master_list();
+	}
+}
+
+
+sub hostname_display($) {
+  my $hname = shift;
+	my $hostname_display;
+
+		if (hostname_suffix($hname) eq $LOCAL_SUFFIX) {
+			$hostname_display = hostname_prefix($hname);
+		} else {
+			$hostname_display = $hname;
+		}
+
+	return $hostname_display;
+}
+
+
+sub get_work_unit_cmd_line($@) {
+  my $work_unit = shift;
+	my @input_command_line_args = @_;
+
+	return map { $_ =~ s/\%p/${work_unit}/g; $_ } @input_command_line_args;
+}
+
+
+sub get_remote_work_unit_cmd_line($@) {
+  my $server = shift;
+	my @cmd_line_args = @_;
+	my $quiet = '';
+
+	$quiet = '-q -o BatchMode=yes' if ($server_info{$server}{'rsh_method'} eq 'ssh');
+
+	return "$server_info{$avail_server}{'rsh_method'} $quiet -n " . hostname_display($server) . " '[ -f /etc/profile ] && . /etc/profile > /dev/null ; [ -f $USER_PROFILE ] && . $USER_PROFILE > /dev/null; cd $CURR_DIR 2> /dev/null; " . join(' ', @cmd_line_args) . " &\n echo PRUN2_CHILD_PID=\$!; wait \$!; echo PRUN2_RSH_RETURN_STATUS=\$?' |";
+}
+
+
+sub setup_termination_sig_handler($) {
+  my $code_ref = shift;
+
+	foreach $sig (@TERMINATION_SIGNALS) {
+		if ($SIG{$sig} ne 'IGNORE') {
+			$SIG{$sig} = $code_ref;
+			print "setup signal $sig for pid $$\n";
+		}
+	}
+}
+
+
+sub run_child_work_unit($$@) {
+  my ($server, $work_unit) = (shift, shift);
+	my @command_line_args = @_;
+
+	$CURRENT_WORKUNIT = $work_unit;
+
+	if ($server ne $LOCAL_HOSTNAME) {
+		close(STDIN);
+
+		# assign signal handler for killing child process
+		setup_termination_sig_handler(\&remote_kill);
+
+		$cmd = get_remote_work_unit_cmd_line($server, @command_line_args);
+
+		if (! open(RSH, $cmd)) {
+			&print_mesg("Error: Unable to start 'ssh' for $work_unit : $!\n");
+			my_exit(1);
+		}
+
+		$CURRENT_REMOTE_SERVER = $server;
+		$wu_return_status = 1;
+
+		while (<RSH>) {
+			chomp;
+
+			# look for return status or child pid tags *anywhere* in a line, since the child process might
+			# be careless and output incomplete STDOUT lines, which can cause them to randomly become
+			# mixed in on the same line as our prun2 tags.
+
+			if (/PRUN2_RSH_RETURN_STATUS=([0-9]+)/) {
+				$wu_return_status = $1;
+
+				# stop reading input *now* instead of waiting for RSH handle to close, because *sometimes* sshd on the remote host
+				# will keep waiting (and therefore leave the handle open) indefinitely, even though the child command  has completed.
+				# When that happens, the result may be an orphaned sshd process hanging around indefinitely, but that's better than
+				# also having a prun2 process that hangs around indefinitely despite child work units that actually did exit.
+
+				last;
+			} elsif (/PRUN2_CHILD_PID=([0-9]+)/) {
+				$REMOTE_CHILD_PID = $1;
+			} else {
+				print $_ . "\n";
+			}
+		}
+
+		close(RSH);
+
+		$CURRENT_REMOTE_SERVER = '';
+
+	} else {
+		# run command via exec() instead of rsh/ssh since we are on local host
+		exec(@command_line_args);
+		$wu_return_status = 1;  # just in case
+	}
+
+	return $wu_return_status; 
+}
+
+
+sub get_remaining_time($$) {
+  my $wu_start_times = shift;
+	my $running_wu = shift;
+
+	my $num_completion_times = scalar(@{$wu_start_times});
+	my $num_to_analyze = max(3 * get_max_threads, $NUM_ITEMS_REMAINING / 10);
+
+	$num_to_analyze = 4 if ($num_to_analyze < 4);
+	$num_to_analyze = 200 if ($num_to_analyze > 200);
+	$num_to_analyze = $num_completion_times if ($num_completion_times < $num_to_analyze);
+
+#print Dumper $wu_start_times;
+
+	my $num_seconds = time() - $wu_start_times->[$num_completion_times - $num_to_analyze];
+	my $avg_secs_per_wu = $num_seconds / $num_to_analyze;
+
+	my $secs_for_newest_wu;
+	my $threads_running = 0;
+
+#print Dumper $running_wu;
+
+	my $curr_time = time();
+
+	foreach my $child_pid_running (keys %{$running_wu}) {
+		$threads_running++;
+		$secs_for_newest_wu = $curr_time - $running_wu->{$child_pid_running} if ((! defined($secs_for_newest_wu)) || ($secs_for_newest_wu > ($curr_time - $running_wu->{$child_pid_running})));
+	}
+
+print "remaining = $NUM_ITEMS_REMAINING, num_to_analyze = $num_to_analyze, num completion times = $num_completion_times, num secs = $num_seconds, avg = $avg_secs_per_wu, running = $threads_running, newest secs = $secs_for_newest_wu, time = $curr_time\n";
+
+	my $remaining_secs;
+
+	$remaining_secs = $avg_secs_per_wu * ($NUM_ITEMS_REMAINING - $threads_running);
+	$remaining_secs += max(0, $avg_secs_per_wu * get_max_threads - $secs_for_newest_wu) if ($threads_running);
+# foo
+	$remaining_secs = 0 if ($remaining_secs < 0);
+
+	my $remaining_days = int($remaining_secs / 86400);
+	my $remaining_hours = int(($remaining_secs - ($remaining_days * 86400)) / 3600);
+	my $remaining_minutes = int(($remaining_secs - ($remaining_days * 86400 + $remaining_hours * 3600)) / 60);
+	my $remaining_seconds = $remaining_secs - ($remaining_days * 86400 + $remaining_hours * 3600 + $remaining_minutes * 60);
+
+	return sprintf("%02u:%02u:%02u:%02u", $remaining_days, $remaining_hours, $remaining_minutes, $remaining_seconds);
+}
+
+
+if (! $found_parm) {
+	push(@argv, '%p');
+}
+
+&print_mesg("Command line: " . join(' ', @argv) . "\n");
+
+if (! ($#master_list >= 0)) {
+	die "Error: Nothing to do!\n";
+}
+
+$WU_RANGE = $master_list[0];
+
+if ($#master_list > 0) {
+	$WU_RANGE = "${WU_RANGE}.." . $master_list[$#master_list] . "\n";
+}
+
+&sort_master_list();	# sorts master work unit list by file size (descending) if work units are files
+&check_master_list_sanity();
+
+$TOTAL_MASTER_ITEMS = scalar(@master_list);
+&print_mesg("Total items in master list = $TOTAL_MASTER_ITEMS\n");
+
+$items_previously_completed = 0;
+
+if (($TODO_FILE_INDICATOR) and (-f $master_done_file)) {
+	if (-r $master_done_file) {
+		open(DONE, "< $master_done_file") || die "can't open $master_done_file";
+
+		while (<DONE>) {
+			chomp;
+			@data = split(',', $_);
+			$done{$data[0]} = 0;
+			$items_previously_completed++;
+		}
+
+		close (DONE);
+	} else {
+		die "unable to access $master_done_file";
+	}
+}
+
+for($i = 0; $i <= $#master_list; $i++) {
+	if (! defined($done{$master_list[$i]})) {
+		$NUM_ITEMS_REMAINING++;
+	}
+}
+
+if ($TODO_FILE_INDICATOR) {
+	&print_mesg("Work units previously completed = $items_previously_completed\n");
+	&print_mesg("Work units remaining = $NUM_ITEMS_REMAINING\n");
+}
+
+open(DONE, ">>$master_done_file") || die "can't create $master_done_file";
+
+select(DONE);
+$|++;	# turns on autoflush for DONE
+select(STDOUT); # change default filehandle back to stdout
+
+$item_index = 0;
+
+
+&print_mesg("Local host = $LOCAL_HOSTNAME\n");
+&print_mesg("Main (parent) prun process ID = $$\n");
+
+&print_mesg("Job owner: $USERNAME\n");
+
+&print_mesg("Max threads possible = " . get_max_threads . "\n");
+&print_mesg("Max attempts per work unit = $MAX_ATTEMPTS\n");
+&print_mesg("Work unit CPU scheduling priority (nice value) = $workunit_priority\n") if (defined($workunit_priority));
+&print_mesg("=== begin prun execution of work units ===\n\n");
+
+$Last_Time = time();
+$START_TIME = $Last_Time;
+
+$num_attempts = 1;
+$success_retry_exec = 0;
+$failed_retry_exec = 0;
+my $shutdown = 0;
+our $FAILED_DONE_WORK_UNITS = 0;
+
+if (exists($ENV{PWD})) {
+	$CURR_DIR = $ENV{PWD};
+} else {
+	$CURR_DIR = cwd();
+}
+
+my ($quiet, $done_record);
+
+$last_log_status_time = time;
+
+my $sleep_seconds = 1;
+my $last_threads_running = 0;
+
+
+until (	(
+	($threads == 0)
+	 and (
+		   ( ($item_index == $TOTAL_MASTER_ITEMS) and ($num_attempts == $MAX_ATTEMPTS) )
+		or ( $num_fail > $max_child_failures )
+		or (get_max_threads == 0)
+		or $shutdown
+	     )
+	 )
+	)
+	{
+
+	if ($threads != $last_threads_running) {
+		$Debug && &print_mesg("threads running = $threads\n");
+		$last_threads_running = $threads;
+	}
+
+	# if end of work unit list has been reached, the restart from beginning of work unit list and
+	# increment attempts counter
+
+	if (($item_index == $TOTAL_MASTER_ITEMS) and ($threads == 0) and ($num_attempts < $MAX_ATTEMPTS)) {
+		$item_index = 0;
+		$num_attempts++;
+	}
+
+	$avail_server = undef;
+
+	if ($threads < get_max_threads) {
+
+		# run next job if there are any left to run and # of threads running is less than max # threads allowed
+		if (($item_index < $TOTAL_MASTER_ITEMS) && ($num_fail <= $max_child_failures)) {
+
+			# skip if it already completed
+			if (defined($done{$master_list[$item_index]})) {
+				$item_index++;
+				next;
+			}
+
+			# attempt to find best available server to run work unit on
+			$avail_server = get_available_server($threads);
+
+			if (defined($avail_server)) {
+				@curr_args = get_work_unit_cmd_line($master_list[$item_index], @argv);
+
+				&print_mesg(&get_time() . ", Running on " . hostname_display($avail_server) . " : " . join(' ', @curr_args) . "\n", 'WU');
+
+				# split me into seperate parent/child process pair
+
+				$PID = fork;
+
+				if (! defined($PID)) {
+					&print_mesg("Error: Unable to fork process for $master_list[$item_index]\n");
+					$item_index++;
+					next;
+				}
+
+				if ($PID == 0) {
+					# child work unit process executes in here
+
+					close(DONE);  # no need for child to hold open since it doesn't write to DONE file
+
+					my_exit(run_child_work_unit($avail_server, $master_list[$item_index], @curr_args));
+
+				} else {
+					# parent process code
+
+					my $curr_time = time();
+
+					$child_server{$PID} = $avail_server;
+					$child{$PID} = $master_list[$item_index];
+					$child_start{$PID} = $curr_time;
+					$item_index++;
+					$threads++;
+					$server_info{$avail_server}{'threads_running'}++;
+					$server_info{$avail_server}{'last_launch_time'} = $curr_time;
+				}
+			}
+		}
+	}
+
+	# this is also parent process code
+  # wait for any child process to complete
+
+	do {
+	# Do a non-blocking wait, to see if any child process has
+	# completed.
+
+	$waited_pid = waitpid(-1, WNOHANG);
+
+	if ($waited_pid > 0) {
+
+			$threads--;
+			$waited_server = $child_server{$waited_pid};
+			$server_info{$waited_server}{'threads_running'}--;
+
+			$child_returncode = ($? >> 8); # return code must be decoded from $?
+			$child_start_time = $child_start{$waited_pid};
+			$child_elapsed = time() - $child_start_time;
+			delete $child_start{$waited_pid};
+			delete $child_server{$waited_pid};
+
+			if ($child_returncode != $normal_child_exit) {
+				&print_mesg("\n" . &get_time() . ", Work unit $child{$waited_pid} returned error status $child_returncode on $waited_server in $child_elapsed seconds.\n", 'WU');
+
+				$num_fail++;
+
+				if ($num_attempts > 1) {
+					$failed_retry_exec++;
+				}
+
+				$server_info{$waited_server}{failures}++;
+
+				if (defined($MAX_SERVER_FAILURES) && ($server_info{$waited_server}{failures} >= $MAX_SERVER_FAILURES) && ($server_info{$waited_server}{'threads_max'} >= 1)) {
+					&print_mesg("Note: Max threads for $waited_server changed from " . $server_info{$waited_server}{'threads_max'} . " to 0, due to $server_info{$waited_server}{failures} successive failed work units. Max threads changed from " . get_max_threads . " to " . (get_max_threads - $server_info{$waited_server}{'threads_max'}) . ".\n");
+					set_max_threads(get_max_threads - $server_info{$waited_server}{'threads_max'});
+					$server_info{$waited_server}{'threads_max'} = 0;
+					delete $server_info{$waited_server}{failures};	# reset in case user adds server back while still running
+				}
+
+			} else {
+				$NUM_ITEMS_REMAINING--;
+
+				if ($num_attempts > 1) {
+					$success_retry_exec++;
+				}
+
+				$done{$child{$waited_pid}} = 0;
+
+				push(@wu_start_times, $child_start_time);
+
+				$remaining_time = get_remaining_time(\@wu_start_times, \%child_start);
+
+				$done_record = join(",", $child{$waited_pid}, $child_elapsed, $threads + 1, $NUM_ITEMS_REMAINING) . "\n";
+
+				if (! print DONE $done_record) {
+					&print_mesg("prun2 ERROR: Unable to record completed work unit in done file '$master_done_file' due to '$!' . No new work units will be launched. The following record could not be appended to the done file: $done_record\n");
+					$shutdown = 1;
+					$FAILED_DONE_WORK_UNITS++;
+				}
+
+				&print_mesg("\n" . &get_time() . ", Work unit $child{$waited_pid} completed on " . hostname_display($waited_server) . " in $child_elapsed seconds. Remaining time = $remaining_time . Remaining work units = $NUM_ITEMS_REMAINING .\n", 'WU');
+
+				delete $server_info{$waited_server}->{last_launch_time};
+
+				if (($COMMON_LOGGING) && ((time - $last_log_status_time) >= 1800)) {
+					&print_mesg("Remaining time = $remaining_time . Remaining work units = $NUM_ITEMS_REMAINING\n");
+					$last_log_status_time = time;
+				}
+
+				$num_success++;
+				delete $server_info{$waited_server}{failures};	# reset failure count, since we are only tracking *successive* failures
+			}
+
+			delete $child{$waited_pid};
+
+		}
+
+	} until (! ($waited_pid > 0));
+
+	if (! defined($avail_server)) {
+		# Most of the time there will be no children that have completed so briefly go to sleep to prevent prun3 from spinning it's
+		# wheels on waitpid() calls, eating up precious CPU time.
+
+		if (get_max_threads > 0) {
+			# this reduces starvation by waiting less time if we are running less than max_threads.
+			# the fewer we are running, the less time we wait before checking again for an available server.
+
+			$sleep_seconds = $MIN_SERVER_LAUNCH_DELAY_SECS + rand() * ($MAX_SERVER_LAUNCH_DELAY_SECS - $MIN_SERVER_LAUNCH_DELAY_SECS) * $threads / get_max_threads;
+		} else {
+			$sleep_seconds = 1;
+		}
+
+		$Debug && &print_mesg("debug: sleeping for $sleep_seconds seconds. threads = $threads\n");
+		usleep($sleep_seconds * 1000000);
+	}
+
+	$curr_time = time();
+	$Elapsed = $curr_time - $Last_Time;
+
+	if ($TODO_FILE_INDICATOR) {
+		if (&file_updated($MASTER_TODO_FILE)) {
+			&get_wu_from_file($MASTER_TODO_FILE);
+		}
+	}
+
+	if ( (&file_updated($SERVER_INFO_FILE)) or (&file_updated($CONTROL_FILE)) ) {
+		&init_server_info($SERVER_INFO_FILE);
+		&set_run_server_info($server_parm_list);
+	}
+
+}
+
+close(DONE);
+
+if ( ($return_code == 0) && ($NUM_ITEMS_REMAINING >= 1) ) {
+		$return_code = 1;
+}
+
+&execution_report;
+&remove_temp_files();
+
+my_exit($return_code);
+

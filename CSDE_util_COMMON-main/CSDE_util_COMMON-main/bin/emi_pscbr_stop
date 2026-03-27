@@ -1,0 +1,32 @@
+#!/usr/bin/bash
+
+
+#Author: W Hampton
+#Stop GlassFish/Tomcat EMI
+
+export USER=`whoami`
+if [ "${USER}" = "pscbr" ];
+then
+    # Find current PIDs running Glassfish
+    export GLASS_PID_PSCBR=`ps ux | grep -w "domain" | grep -v "grep" | tr -s ' ' | cut -f 2 -d ' '`
+    export TOMCAT_PID_PSCBR=`ps ux | grep -w "Dcatalina" | grep -v "grep" | tr -s ' ' | cut -f 2 -d ' '`
+    #Checking if the PIDs are running
+    if [ "${GLASS_PID_PSCBR}" = "" ]
+  then
+     echo "domain1 Stopped..."
+  else
+     echo "Stopping domain1"
+	   /dsapp/prod/local/${HOSTNAME%%.*}/pscbr/glassfish-3.1.2.2/glassfish/bin/asadmin stop-domain domain1
+	   sleep 6; kill -9 ${GLASS_PID_PSCBR}
+   fi
+     if [ "${TOMCAT_PID_PSCBR}" = "" ]
+     then
+        echo "Tomcat is stopped..."
+    else
+        echo "Stopping Tomcat..."
+	     cd /dsapp/prod/local/${HOSTNAME%%.*}/pscbr/tomcat/current/bin/ && ./stop_tomcat
+    fi
+    else
+        echo "Need to be pscbr to execute."
+fi
+

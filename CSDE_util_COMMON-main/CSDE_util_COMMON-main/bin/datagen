@@ -1,0 +1,2 @@
+export JAVA_HOME=/ds/jdk1.7.0_25/
+/ds/jdk1.7.0_25/bin/java com.relayhealth.datagen.Datagen $*

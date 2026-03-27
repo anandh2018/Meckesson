@@ -1,0 +1,102 @@
+
+
+if [ ! -d "$DS_BASE_DIR" ]
+  then
+    echo "ERROR: DS_BASE_DIR environment variable is '$DS_BASE_DIR', which is not an existing directory"
+    exit 1
+fi
+
+
+server_file="$DS_BASE_DIR/common/etc/server.info"
+
+if [ ! -f $server_file ]
+  then
+	echo "Cannot find server file $server_file"
+	exit 1
+fi
+
+server_list=`cut -d: -f1 < $server_file | tr "\012" ' '`
+
+usage() {
+	echo "usage: $0 [-p] command [options] -- server1 [server2] ..."
+	echo "server list = $server_list"
+	exit 0
+}
+
+if [ "$1" = "" ]
+  then
+	usage
+	exit 0
+fi
+
+if [ "$1" = '-p' ]
+  then
+		background='&'
+		shift
+fi
+
+case $1 in
+	-*)	echo "$1 is not a supported option"
+			usage
+			break;;
+esac
+
+command=$1
+shift 1
+
+found_sep=0
+
+for parm in $*
+  do
+	shift
+
+	if [ "$parm" != '--' ]
+	  then
+		if [ "$parm_list" = "" ]
+		  then
+			parm_list="$parm"
+		  else
+			parm_list="$parm_list $parm"
+		fi
+	  else
+		found_sep=1
+		break
+	fi
+  done
+
+if [ "$found_sep" -eq 0 ]
+  then
+	echo "Did not find --"
+	usage
+	exit 1
+fi
+
+if [ $# -eq 0 ]
+  then
+	echo "No server list found after --"
+	usage
+	exit 1
+fi
+
+for server_info in `cat $server_file | cut -d: -f1,4,5`
+  do
+	s_name=`echo $server_info | cut -d: -f1`
+	s_rsh=`echo $server_info | cut -d: -f2`
+	s_grp=`echo $server_info | cut -d: -f3`
+
+	for server in $*
+	  do
+		s_prefix_name=`echo $server | cut -d. -f1`
+
+		if [ "$s_name" = "$server" -o "$s_grp" = "$server" -o "$s_name" = "$s_prefix_name" ]
+		  then
+			echo RUNNING $s_rsh $s_name $command $parm_list "#######################"
+			cmd="$s_rsh -q -X $s_name \"[ -f /etc/profile ] && . /etc/profile; [ -f \$HOME/.bash_profile ] && . \$HOME/.bash_profile; [ -d $PWD ] && cd $PWD ; eval $command $parm_list\""
+			eval "$cmd | sed 's/^/$server:/' $background"
+			break
+		fi
+	  done
+  done
+
+wait
+

@@ -1,0 +1,43 @@
+#	This is the default standard profile provided to a user.
+#	They are expected to edit it to meet their own needs.
+
+# .bashrc
+
+# User specific aliases and functions
+
+# Source global definitions
+if [ -f /etc/bashrc ]; then
+	. /etc/bashrc
+fi
+
+PROFILE=/ds/common/bin/profile_v3
+
+if [ ! -f $PROFILE ]
+then
+	echo "Cannot locate the profile file on \"$PROFILE\".  Mounting problems?"
+	# umask 116
+
+	#umask -S u=rwx,g=rwx,o=-
+	umask 07
+
+	if [ -t 0 ] 
+	  then
+		stty erase ^?
+	  else
+		:
+	fi
+
+else
+	# Invoke common profile for bluelite
+
+	. $PROFILE
+fi
+
+# Remote emacs access requires the shell to have a typical "$" in the prompt.
+# If you don't like it, let me know before you change it back.
+# - Craig McDaniel
+# PS1='\u@\h:\w\$ '
+
+
+
+

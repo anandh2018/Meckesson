@@ -1,0 +1,4 @@
+#!/bin/bash
+export DATE=`date +%Y%m%d`
+export YMONTH=`date +%Y%m`
+export YEAR=`date +%Y`

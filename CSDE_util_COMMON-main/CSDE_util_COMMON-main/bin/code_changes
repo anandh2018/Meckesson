@@ -1,0 +1,44 @@
+#!/usr/bin/bash
+
+########################################################################
+#  ____ ___  ____  _____    ____ _   _    _    _   _  ____ _____ ____  
+# / ___/ _ \|  _ \| ____|  / ___| | | |  / \  | \ | |/ ___| ____/ ___| 
+#| |  | | | | | | |  _|   | |   | |_| | / _ \ |  \| | |  _|  _| \___ \ 
+#| |__| |_| | |_| | |___  | |___|  _  |/ ___ \| |\  | |_| | |___ ___) |
+# \____\___/|____/|_____|  \____|_| |_/_/   \_\_| \_|\____|_____|____/ 
+#########################################################################
+
+# Program: code_changes - Report Data Services code changes
+# Author: William Hampton, CoverMyMeds
+
+# Version 1.0 - 05/17/2024
+
+
+display_usage() {
+echo "Usage: The focus of this script is to search for code/config changes."
+}
+
+# Check whether user had supplied -h or --help . If yes display usage
+if [[ ( $@ == "--help") ||  $@ == "-h" ]]
+ then
+     display_usage
+     exit 0
+fi
+
+
+days=$1
+
+# Find Changes
+ds_prod=$(find /ds/production/ -maxdepth 4 -path '*/bin/*' -mtime $days -type f  2>&1 | grep -v "Permission denied" | grep -v "no such file") 
+
+env_prod1=$(find /ds/env/prod/ -maxdepth 4 -path '*/common/bin/*' -mtime $days -type f  2>&1 -o -path '*/common/etc*' -name "*xml" -mtime $days 2>&1 | grep -v "Permission denied" | grep -v "no such file") 
+
+env_prod2=$(find /ds/env/prod/ -path '*/common/lib/*' -mtime $days -type f  2>&1 -o -path '*/util/bin*' -mtime $days -type f 2>&1 | grep -v "Permission denied" | grep -v "no such file")
+
+c="${ds_prod} ${env_prod1} ${env_prod2}"
+
+
+
+if [ -n "$c" ]; then
+	 mail -s "Data Services Changes" william.hampton@mckesson.com, christine.howard@relayhealth.com  <<< "$c"
+fi

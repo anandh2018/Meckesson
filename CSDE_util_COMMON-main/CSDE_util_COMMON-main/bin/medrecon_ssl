@@ -1,0 +1,141 @@
+#!/usr/bin/perl -w
+
+use SOAP::Lite;
+use Data::Dumper;
+use strict;
+use Time::HiRes;
+use Data::UUID qw(NameSpace_URL);
+
+my $verbose_flag = 0;
+if ($ARGV[0] eq "-v") {
+  $verbose_flag = 1;
+  shift @ARGV;
+}
+my $host = shift @ARGV;
+my $start_date = shift @ARGV;
+my $end_date = shift @ARGV;
+my $last_name = shift @ARGV;
+my $first_name = shift @ARGV;
+my $dob = shift @ARGV;
+my $gender = shift @ARGV;
+my $zip_code = shift @ARGV;
+my $cardholder = shift @ARGV;
+
+if (! defined $cardholder) {
+ $cardholder = q{};
+}
+ 
+my $ug = new Data::UUID;
+my $uuid = $ug->create_str();
+my $time = time();
+#generate xml string
+my $unencrypted_criteria = qq{<start_date>$start_date</start_date>
+<end_date>$end_date</end_date>
+<last_name>$last_name</last_name>
+<first_name>$first_name</first_name>
+<dob>$dob</dob>
+<gender>$gender</gender>
+<zip_code>$zip_code</zip_code>
+};
+if (defined $cardholder) {
+  $unencrypted_criteria .= "<member_id>$cardholder</member_id>\n";
+} 
+my $criteria = $unencrypted_criteria;
+ 
+my $command = q{curl -s -k -X POST https://} . $host . q{/soap -d '<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+               xmlns:soapenc="http://schemas.xmlsoap.org/soap/encoding/" 
+   xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+   soap:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" 
+   xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body>
+<GetMedHistory xmlns="MedHistory">
+<c-gensym3 xsi:type="xsd:string">&lt;data_services_request id="} . $uuid . q{" timestamp="} . $time . q{"&gt;
+  &lt;Header&gt;
+    &lt;authentication&gt;
+      &lt;auth_mode&gt;ppk&lt;/auth_mode&gt;
+      &lt;user_name&gt;Jessica.Landisman@per-se.com&lt;/user_name&gt;
+    &lt;/authentication&gt;
+  &lt;/Header&gt;
+  &lt;request_format&gt;
+    &lt;request_data&gt;med_history&lt;/request_data&gt;
+    &lt;request_version&gt;1&lt;/request_version&gt;
+  &lt;/request_format&gt;
+  &lt;response_format&gt;
+    &lt;predefined_response&gt;NCPDPScript&lt;/predefined_response&gt;
+    &lt;response_version&gt;1&lt;/response_version&gt;
+  &lt;/response_format&gt;
+  &lt;request_criteria&gt;&lt;start_date&gt;} . $start_date . q{&lt;/start_date&gt;
+&lt;end_date&gt;} . $end_date . q{&lt;/end_date&gt;
+&lt;last_name&gt;} . $last_name . q{&lt;/last_name&gt;
+&lt;first_name&gt;} . $first_name . q{&lt;/first_name&gt;
+&lt;dob&gt;} . $dob . q{&lt;/dob&gt;
+&lt;gender&gt;} . $gender . q{&lt;/gender&gt;
+&lt;zip_code&gt;} . $zip_code . q{&lt;/zip_code&gt;
+&lt;member_id&gt;} . $cardholder . q{&lt;/member_id&gt;
+&lt;/request_criteria&gt;
+&lt;/data_services_request&gt;</c-gensym3></GetMedHistory></soap:Body></soap:Envelope>'};
+
+my $start_time = Time::HiRes::gettimeofday();
+my $result = qx/$command/;
+my $end_time = Time::HiRes::gettimeofday();
+
+my $return = 1;
+my $exception = q{-};
+if ($result !~ m/GetMedHistoryResponse/) {
+  $return = 0;
+  $exception = $result;
+}
+elsif ($result =~ m/errorMsg(.*)errorMsg/) {
+  print "FOUND IT\n";
+  $return = 0;
+  $exception = $1;
+  $exception = substr($exception,4);
+  $exception = substr($exception,0,-5); 
+}
+my $elapsed_time = $end_time - $start_time;
+
+if ($verbose_flag) {
+  print Dumper $result;
+  if (1 == 0) {
+  }
+  else {
+    my $result_string = $result;
+    #print $result_string, "\n";
+    my @lines = split /\n/, $result_string;
+    my $encrypted_text;
+    my $cdata_flag = 0;
+    foreach my $line (@lines) {
+      if ($cdata_flag == 1) {
+        if ($line =~ m/]]/) {
+          $cdata_flag = 0;
+        } else {
+          $encrypted_text .= "$line\n";
+        }
+      } else {
+        if ($line =~ m/CDATA/) {
+          $cdata_flag = 1;
+          $line =~ s/^\s+\<!\[CDATA\[//;
+          $encrypted_text = "$line\n";
+        }
+      }
+    }
+
+    if (defined($encrypted_text) && (0 < length($encrypted_text))) {
+      my $pgp = new BLUELITE::GPG(homedir => '/ds/gnupg',
+      );
+
+      my $result = $pgp->decrypt_verify('Niwthh', $encrypted_text);
+      if ($pgp->error()) {
+        print "Failed decryption: " . $pgp->error() . "\n";
+      }
+      else {
+        print "Signature verified for " . $result->{'key_user'} . "\n";
+        my $decrypted_text = $result->{'text'};
+        print Dumper $result;
+        print $decrypted_text;
+      }
+    }
+  }
+} 
+
+print "\n$host|$start_date|$end_date|$last_name|$first_name|$dob|$gender|$zip_code|$cardholder|$return|$exception|$start_time|$end_time|$elapsed_time\n";

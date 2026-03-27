@@ -1,0 +1,512 @@
+#!/usr/bin/perl
+
+# process_incoming: Process incoming files from vendors and internal data sources
+#
+# initial release: 2004
+# 6/6/2005 - added support for running custom processes (e.g. mmub) and sending ftp files from any directory (e.g. mmub)
+#
+# 6/15/2005 - Changed -t option to be begin_YYYYMM, added -u option for end_YYYYMM.
+# - moved c1_to_c2 meta-data from C2 specific hash to general run hash
+#
+
+our $DS_BASE_DIR = $ENV{DS_BASE_DIR};
+die "ERROR: DS_BASE_DIR environment variable is '$DS_BASE_DIR', which is not an existing directory\n" if (! ((defined($DS_BASE_DIR)) && (-d $DS_BASE_DIR)));
+
+use Getopt::Std;
+
+$num_prog_args = $#ARGV + 1;
+$move_sources_failures = 0;
+$c2_gen_failures = 0;
+$prod_send_failures = 0;
+$move_sources_successes = 0;
+$run_failures = 0;
+
+$LOG_DIR = "$DS_BASE_DIR/common/log";
+chomp($NOW = `date +%Y%m%d.%H%M`);
+
+$current_process = $$;
+
+$LOG_FILE = "$LOG_DIR/${NOW}.process_incoming.${current_process}.log";
+
+if (! open(LOG, "> $LOG_FILE")) {
+	print STDERR "ERROR: Cannot create log file $LOG_FILE : $!\n";
+	&my_exit(1);
+} else {
+	print LOG "Log file: $LOG_FILE\n";
+}
+
+getopts('m:f:t:u:p:e:r:');
+
+if (defined($opt_r)) {
+	@run_id_list = split(',', $opt_r);
+}
+
+if (defined($opt_e)) {
+	$email_list = $opt_e;
+}
+
+
+$other_process_text = `ps -f -u ds | grep process_incoming | egrep -vi '$current_process|vi |grep |profile'`;
+
+if ($other_process_text ne '') {
+	&log_mesg("Existing process_incoming process appears to be already running. Refusing to run again.
+Process info on existing process follows:
+$other_process_text\n");
+	&my_exit(5);
+}
+
+
+$curr_time = time;
+
+if (defined($opt_t)) {
+	$RUN_BEGIN_MONTH = $opt_t;
+
+	if (defined($opt_u)) {
+		$RUN_END_MONTH = $opt_u;
+	} else {
+		$RUN_END_MONTH = $RUN_BEGIN_MONTH;
+	}
+} else {
+	$RUN_END_MONTH = &get_yyyymm($curr_time);
+	$RUN_BEGIN_MONTH = &get_yyyymm($curr_time - 60 * 60 * 24 * 31 * 1);
+}
+
+if (defined($opt_p)) {
+	$PROD_SEND_BEGIN_MONTH = $opt_p;
+	$PROD_SEND_END_MONTH = $opt_p;
+} else {
+	$PROD_SEND_END_MONTH = &get_yyyymm($curr_time);
+	$PROD_SEND_BEGIN_MONTH = $PROD_SEND_END_MONTH;
+}
+
+# meta data for c2 generation
+
+
+$PROD_SEND_CONFIG_FILE = "$DS_BASE_DIR/common/etc/prod_send.config";
+
+$PROCESS_HOST_LIST = 'ds30,rx';
+
+$MOVE_SOURCES{'tulsa'} = 'T';
+$MOVE_SOURCES{'proxymed'} = 'P';
+$MOVE_SOURCES{'include_exclude'} = 'INC';
+
+$PROD_SEND{'tulsa_c2_ub'}{TYPE} = 'UB';
+$PROD_SEND{'tulsa_c2_ub'}{SOURCES} = $MOVE_SOURCES{tulsa};
+$PROD_SEND{'tulsa_c2_ub'}{BEGIN_MONTH} =$PROD_SEND_BEGIN_MONTH;
+$PROD_SEND{'tulsa_c2_ub'}{END_MONTH} = $PROD_SEND_END_MONTH;
+$PROD_SEND{'tulsa_c2_ub'}{VERSION} = 'e2';
+
+$PROD_SEND{'tulsa_c2_hcfa'}{TYPE} = 'NSF';
+$PROD_SEND{'tulsa_c2_hcfa'}{SOURCES} = $MOVE_SOURCES{tulsa};
+$PROD_SEND{'tulsa_c2_hcfa'}{BEGIN_MONTH} =$PROD_SEND_BEGIN_MONTH;
+$PROD_SEND{'tulsa_c2_hcfa'}{END_MONTH} = $PROD_SEND_END_MONTH;
+$PROD_SEND{'tulsa_c2_hcfa'}{VERSION} = 'e2';
+
+$PROD_SEND{'tulsa_clear_hcfa'}{TYPE} = 'NSF';
+$PROD_SEND{'tulsa_clear_hcfa'}{SOURCES} = 'T';
+$PROD_SEND{'tulsa_clear_hcfa'}{BEGIN_MONTH} =$PROD_SEND_BEGIN_MONTH;
+$PROD_SEND{'tulsa_clear_hcfa'}{END_MONTH} = $PROD_SEND_END_MONTH;
+$PROD_SEND{'tulsa_clear_hcfa'}{VERSION} = 'c';
+
+$PROD_SEND{mmub}{TYPE} = 'CUSTOM';
+$PROD_SEND{mmub}{SOURCE_DIR} = "$DS_BASE_DIR/production/market_monitors/deliverables";
+$PROD_SEND{mmub}{FILE_GLOB} = 'mmi_UBC2_T????????.dat.gz';
+$PROD_SEND{mmub}{PASSIVE} = 1;
+
+
+$RUN = {
+	mmub => {
+		name => 'Market Monitors filtered UB data',
+		work_unit_source => 'gen_wu',
+		work_unit_info => {
+			TYPE => 'UB',
+			VERSION => 'e2',
+			SOURCES => 'T',
+			BEGIN_MONTH => $RUN_BEGIN_MONTH,
+			END_MONTH => $RUN_END_MONTH
+		},
+		command => "$DS_BASE_DIR/production/market_monitors/bin/run_mmub -s %p"
+	},
+
+	proxy_n_clean => {
+		name => 'Proxymed-Norcross HCFA raw-to-clean',
+		work_unit_source => 'gen_wu',
+		work_unit_info => {
+			TYPE => 'NSF',
+			VERSION => 'r',
+			SOURCES => 'N',
+			BEGIN_MONTH => $RUN_BEGIN_MONTH,
+			END_MONTH => $RUN_END_MONTH
+		},
+		command => "nsf_clean -f %p -d /ds/data_sources/pclaims/N/NSF_clean -k -e 200 %p",
+		command_success_exit => 200
+	},
+
+	proxy_c_clean => {
+		name => 'Proxymed-California HCFA raw-to-clean',
+		work_unit_source => 'gen_wu',
+		work_unit_info => {
+			TYPE => 'NSF',
+			VERSION => 'r',
+			SOURCES => 'C',
+			BEGIN_MONTH => $RUN_BEGIN_MONTH,
+			END_MONTH => $RUN_END_MONTH
+		},
+		command => "nsf_clean -f %p -d /ds/data_sources/pclaims/P/NSF_clean -k -e 200 %p",
+		command_success_exit => 200
+	},
+
+	proxy_n_c1_to_c2 => {
+		name => 'Proxymed-Norcross HCFA c1_to_c2',
+		work_unit_source => 'gen_wu',
+		work_unit_info => {
+			TYPE => 'NSF',
+			VERSION => 'e',
+			SOURCES => 'N',
+			BEGIN_MONTH => $RUN_BEGIN_MONTH,
+			END_MONTH => $RUN_END_MONTH
+		},
+		command => "c1_to_c2_wrap -t /ds/data_sources/pclaims/N/NSF_c2 -c -h ds01 %p"
+	},
+
+	proxy_c_c1_to_c2 => {
+		name => 'Proxymed-California HCFA c1_to_c2',
+		work_unit_source => 'gen_wu',
+		work_unit_info => {
+			TYPE => 'NSF',
+			VERSION => 'e',
+			SOURCES => 'C',
+			BEGIN_MONTH => $RUN_BEGIN_MONTH,
+			END_MONTH => $RUN_END_MONTH
+		},
+		command => "c1_to_c2_wrap -t /ds/data_sources/pclaims/P/NSF_c2 -c -h ds01 %p"
+	},
+
+	tulsa_nsf_c1_to_c2 => {
+		name => 'Tulsa HCFA c1_to_c2',
+		work_unit_source => 'gen_wu',
+		work_unit_info => {
+			TYPE => 'NSF',
+			VERSION => 'e',
+			SOURCES => 'T',
+			BEGIN_MONTH => $RUN_BEGIN_MONTH,
+			END_MONTH => $RUN_END_MONTH
+		},
+		command => "c1_to_c2_wrap -t /ds/data_sources/pclaims/T/NSF_c2 -c -h ds01 %p"
+	},
+
+	tulsa_ub_c1_to_c2 => {
+		name => 'Tulsa UB92 c1_to_c2',
+		work_unit_source => 'gen_wu',
+		work_unit_info => {
+			TYPE => 'UB',
+			VERSION => 'e',
+			SOURCES => 'T',
+			BEGIN_MONTH => $RUN_BEGIN_MONTH,
+			END_MONTH => $RUN_END_MONTH
+		},
+		command => "c1_to_c2_wrap -t /ds/data_sources/hospital_claims/tulsa/UB_c2 -c -h ds01 %p"
+	}
+};
+
+sub my_exit() {
+	my($exit_code) = shift;
+
+	if (-f $LOG_FILE) {
+		close(LOG);
+	}
+
+	&cleanup_log;
+
+	if ($exit_code != 0) {
+		if (-f $LOG_FILE) {
+			if (defined($email_list)) {
+				system("mailx -s 'process_incoming failure' $email_list < $LOG_FILE");
+			}
+		} else {
+			if (defined($email_list)) {
+				system("echo 'No logging details available' | mailx -s 'process_incoming failure' $email_list");
+			}
+		}
+	} else {
+		# remove log file if no errors and no meaningful activity happened
+
+		$ret = system("egrep -i 'Files moved: *[^0]|Files sent: *[^0]|c2 file generated:|mmi_ub file successfully generated:|nsf_clean file successfully generated:' $LOG_FILE > /dev/null");
+		$ret = $ret >> 8;
+
+		if ($ret != 0) {
+			unlink($LOG_FILE);
+		}
+	}
+
+	exit($exit_code);
+}
+
+sub log_mesg() {
+	print LOG $_[0];
+	print STDERR $_[0];
+}
+
+if ($num_prog_args <= 0) {
+	print "Usage: $0 [-m move_sources_list] [-f ftp_id_list] [-t c2_gen_YYYYMM] [-r run_id_list] [-p ftp_YYYYMM] [-e email_list] [-t YYYYMM [-u YYYYMM]]\n";
+	print "	ftp_id_list (comma-seperated list)	Valid values: " . join(' ', keys %PROD_SEND) . "\n";
+	print "	move_sources_list (comma-seperated list)	Valid values: " . join(' ', keys %MOVE_SOURCES) . "\n";
+	print "	run_id_list (comma-seperated list)	Valid values: " . join(' ', keys %{$RUN}) . "\n";
+	print "	-t	Beginning month for -r run_id_list (defaults to previous month if not specified)\n";
+	print "	-u	Ending month for -r run_id_list (defaults to -t value if not specified, or current month if -t not specified)\n";
+
+
+	&my_exit(1);
+}
+
+sub get_yyyymm() {
+
+	($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(shift);
+
+	return sprintf('%4d%02d', $year + 1900, $mon + 1);
+}
+
+@LOG_IGNORE_TEXT = split("\n",
+"Property of NDCHealth
+########################### NOTICE from ndcHEALTH #############################
+Red Hat Enterprise Linux ES release 3
+###############################################################################
+This system is for the use of authorized users only.  Individuals using this
+computer system without authority, or in excess of their authority, are subject
+to having all of their activities on this system monitored and recorded by
+system personnel.
+In the course of monitoring individuals improperly using this system, or in the
+course of system maintenance, the activities of authorized users may also be
+monitored.
+The use of this system constitues consent by the user to the monitoring
+described above.  If as a result of this monitoring improper or illegal
+activities are identified NDCHealth will take appropriate action up to and
+including the reporting of such to the appropriate government officials."
+);
+
+sub cleanup_log() {
+
+  my($TEMP_LOG, $log_line, $ret);
+
+	$TEMP_LOG = "${LOG_FILE}.temp";
+
+	close(LOG);
+	open(LOG_READ, $LOG_FILE) || return 0;
+	open(LOG_WRITE, "> ${TEMP_LOG}") || return 0;
+
+	LOG_LINE:
+	while (<LOG_READ>) {
+		$log_line = $_;
+		chop($log_line);
+
+		foreach $ignore_line (@LOG_IGNORE_TEXT) {
+			if ( ($log_line =~ /^${ignore_line}/) or ($log_line =~ /^\s*$/) ) {
+				next LOG_LINE;
+			}
+		}
+
+		if (! print LOG_WRITE $log_line . "\n") {
+			close(LOG_WRITE);
+			close(LOG_READ);
+			unlink($TEMP_LOG);
+			return 0;
+		}
+	}
+
+	close(LOG_WRITE);
+	close(LOG_READ);
+
+	$ret = system('mv', $TEMP_LOG, $LOG_FILE);
+	$ret = $ret >> 8;
+
+	if ($ret != 0) {
+		unlink($TEMP_LOG);
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+sub do_system() {
+  my($ret);
+
+	close(LOG);
+
+	$ret = system(join(' ', @_) . " >> $LOG_FILE 2>&1");
+	$ret = $? >> 8;
+
+	if (! open(LOG, ">> $LOG_FILE")) {
+		print STDERR "ERROR: Cannot create log file $LOG_FILE : $!\n";
+        	&my_exit(1);
+	}
+
+	return $ret;
+}
+
+
+if (defined($opt_m)) {
+	foreach $source (split(',', $opt_m)) {
+		$temp_source = $MOVE_SOURCES{$source};
+		$temp_source_list{$temp_source} = 1;
+	}
+
+	foreach $temp_source (keys %temp_source_list) {
+		push(@source_list, $temp_source);
+	}
+
+	foreach $source (@source_list) {
+#		print "debug: " . join(' ', 'move_sources', '-o', '-a', '-s', $source) . "\n";
+
+		if (&do_system('move_sources', '-o', '-a', '-s', $source) != 0) {
+			&log_mesg("ERROR: move_sources failed for source $source\n");
+			$move_sources_failures++;
+		} else {
+			$move_sources_successes++;
+		}
+	}
+
+	if ($move_sources_failures > 0) {
+		&log_mesg("ERROR: move_sources failed $move_sources_failures time(s)\n");
+		&log_mesg("Note: move_sources succeeded $move_sources_successes times(s)\n");
+	}
+
+	if ($move_sources_successes == 0) {
+		&log_mesg("ERROR: No completely successful executions of move_sources\n");
+		&my_exit(1);
+	}
+}
+
+
+# run other commands to generate deliverables
+
+foreach $run_id (@run_id_list) {
+
+	if ($RUN->{$run_id}->{work_unit_source} eq 'gen_wu') {
+
+		if ((exists($RUN->{$run_id}->{command_success_exit})) and (defined($RUN->{$run_id}->{command_success_exit}))) {
+			$command_success_exit = $RUN->{$run_id}->{command_success_exit};
+		} else {
+			$command_success_exit = 0;
+		}
+
+		$ret = system('gen_wu -t ' . $RUN->{$run_id}->{work_unit_info}->{TYPE} . ' -v ' . $RUN->{$run_id}->{work_unit_info}->{VERSION} . ' -s ' . $RUN->{$run_id}->{work_unit_info}->{SOURCES} . ' ' . $RUN->{$run_id}->{work_unit_info}->{BEGIN_MONTH} . ' ' . $RUN->{$run_id}->{work_unit_info}->{END_MONTH} . " | prun2 -e $command_success_exit -r $PROCESS_HOST_LIST " . $RUN->{$run_id}->{command} . " >> $LOG_FILE 2>&1");
+		$ret = $ret >> 8;
+
+		if ($ret != 0) {
+			&log_mesg("ERROR: prun2 failed for at least one $run_id command " . $RUN->{$run_id}->{command} . "\n");
+			$run_failures++;
+		}
+
+	}
+
+}
+
+# prod_send -c prod_send_configfile -i id
+
+if (defined($opt_f)) {
+	@prod_send_id_list = split(',', $opt_f);
+}
+
+if ($#prod_send_id_list >= 0) {
+
+	if (! -f $PROD_SEND_CONFIG_FILE) {
+		&log_mesg("ERROR: prod_send config file $PROD_SEND_CONFIG_FILE does not exist!\n");
+		&my_exit(1);
+	}
+
+	foreach $id (@prod_send_id_list) {
+
+		$type = $PROD_SEND{$id}{'TYPE'};
+
+		if ($type =~ /^UB|^NSF/i) {
+			$sources = $PROD_SEND{$id}{'SOURCES'};
+			$begin_month = $PROD_SEND{$id}{'BEGIN_MONTH'};
+			$end_month = $PROD_SEND{$id}{'END_MONTH'};
+			$version = $PROD_SEND{$id}{'VERSION'};
+
+			@PS_FILES = `gen_wu -w -e -t $type -v $version -s $sources $begin_month $end_month`;
+
+			$ret = $? >> 8;
+
+			if ($ret != 0) {
+				&log_mesg("ERROR: gen_wu failed for -w -t $type -v $version -s $sources $begin_month $end_month\n");
+				&my_exit(1);
+			}
+
+			for($ind = 0; $ind <= $#PS_FILES; $ind++) {
+				chomp($PS_FILES[$ind]);
+			}
+
+		} elsif ($type =~ /custom/i) {
+
+			$source_dir = $PROD_SEND{$id}{SOURCE_DIR};
+			$file_glob = $PROD_SEND{$id}{FILE_GLOB};
+
+#			if ($PROD_SEND{$id}{PASSIVE}) {
+#				$passive = '-p';
+#			} else {
+#				$passive = '';
+#			}
+
+			@PS_FILES = glob("$source_dir/$file_glob");
+
+		} else {
+			&log_mesg("ERROR: Don't understand PROD_SEND type of '$type'. Only types supported are NSF, UB, or CUSTOM\n");
+			&my_exit(1);
+		}
+
+		# Moved passive check outside of if/elsif - 
+    # was being set for mmub (type custom) and not reset for tulsa_clear_hcfa (type NSF)
+		# should not affect type nsf/ub - 
+		# will set $passive to '' if they don't have the PASSIVE hash key set 
+		if ($PROD_SEND{$id}{PASSIVE}) {
+			$passive = '-p';
+		} else {
+			$passive = '';
+		}
+
+		if (($#PS_FILES < 0) or (! -f $PS_FILES[0])) {
+			next;
+		}
+
+#print STDERR "debug: Calling prod_send $passive -c $PROD_SEND_CONFIG_FILE -i $id ..." . $PROD_SEND{$id}{PASSIVE} . "...\n";
+
+		if (! open(PS, "| prod_send $passive -c $PROD_SEND_CONFIG_FILE -i $id >> $LOG_FILE 2>&1")) {
+			&log_mesg("ERROR: Unable to launch prod_send for id $id: $!\n");
+			&my_exit(1);
+		}
+
+		foreach $fname (@PS_FILES) {
+
+#print STDERR "debug: sending to prod_send: $fname\n";
+
+			if (! print PS $fname . "\n") {
+				&log_mesg("ERROR: Unable to send file list to prod_send for id $id : $!\n");
+				&my_exit(1);
+			}
+		}
+
+		close(PS);
+
+		$ret = $? >> 8;
+
+		if ($ret > 0) {
+			&log_mesg("ERROR: At least one file failed to transfer\n");
+			$prod_send_failures++;
+		}
+	}
+}
+
+if ($move_sources_failures + $c2_gen_failures + $prod_send_failures + $run_failures > 0) {
+
+	&log_mesg("move_sources failures: $move_sources_failures\n");
+	&log_mesg("c2_gen_failures: $c2_gen_failures\n");
+	&log_mesg("prod_send_failures: $prod_send_failures\n");
+	&log_mesg("run_failures: $run_failures\n");
+	&log_mesg("Log file: $LOG_FILE\n");
+
+	&my_exit(80);
+}
+
+&my_exit(0);
+

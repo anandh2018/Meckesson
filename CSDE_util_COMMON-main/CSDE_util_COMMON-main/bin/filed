@@ -1,0 +1,3664 @@
+#!/usr/bin/perl
+
+#------------------------------------------------------------------------#
+# $Id: filed,v 1.41 2006/02/20 12:00:00 aaron.dallas@ndchealth.com Exp $ #
+# $Log: filed,v $                                                        #
+#------------------------------------------------------------------------#
+
+# -- need at least Perl 5.6.0
+require 5.6.0;
+
+# -- @INC needs our local lib
+BEGIN {
+#  use lib '/opt/filed/lib';
+}
+
+# -- our package name
+package Filed;
+
+our $VERSION = '1.90';
+
+# -- strict, warnings, redefined subs
+use strict;
+use warnings;
+use subs qw/warn die log sleep/;
+
+# -- required packages
+use File::Find;
+use File::Basename;
+use File::Copy;
+
+use Getopt::Std;
+
+use XML::Parser;
+use XML::DT;
+
+use Crypt::Simple;
+use Crypt::DSA::Key::PEM;
+
+use Net::FTP;
+use Net::SFTP;
+use Net::SFTP::Util;
+
+use Mail::Sendmail 0.75;
+use MIME::QuotedPrint;
+use MIME::Base64;
+
+use Proc::Queue;
+use Proc::ProcessTable;
+
+use Log::Dispatch::Syslog;
+
+use Linux::Fuser;
+
+use Expect;
+
+use WeakRef;
+
+# DEBUG
+use Data::Dumper;
+
+# -- turn off buffering
+$|=1;
+
+# -- get options
+our($opt_s,$opt_t,$opt_l,$opt_v,$opt_d,$opt_o);
+getopts('stlvdo:');
+
+# -- global file info
+our @FILES;
+our $CURRENT_FILE = '';
+our $CURRENT_DIR;
+our $CURRENT_OP;
+our $CURRENT_POST;
+
+# -- global user info
+our $USERID;
+our $GROUPID;
+our $CURRENT_ID;
+
+# -- syslog
+our $SYSLOG;
+
+# -- fuser
+our $FUSER = Linux::Fuser->new();
+
+# -- show version and *really* exit when we get the -v 
+if ($opt_v){
+  print "\nThis is filed version $VERSION\n\n";
+  CORE::exit;
+}
+
+
+
+sub trigger_file_name($$$) {
+  my ($filename, $trigger_file_suffix, $trim_trigger_file_suffix) = @_;
+
+  my $trigger_file;
+
+  if ($trigger_file_suffix) {
+    my $fname_prefix = $filename;
+
+    if ($trim_trigger_file_suffix) {
+      foreach(my $i = 0; $i < $trim_trigger_file_suffix; $i++) {
+        $fname_prefix =~ s/[.][^.]*$//;
+      }
+    }
+
+    $trigger_file = "${fname_prefix}${trigger_file_suffix}";
+  } else {
+    $trigger_file = "${filename}.trigger";
+  }
+
+  return $trigger_file;
+}
+
+
+# -- *really* die unless we get a config file passed
+CORE::die "usage: filed [-stlvo <account>] config.xml\n  -s serial mode (no forking)\n  -t test configuration filed\n  -l log to terminal\n  -v show version and exit\n  -o <account> run only for this account\n" unless $ARGV[0];
+
+# -- create XML::DT handler for our config
+my %handler = (-default  => sub{ tag_attr($Filed::q, $Filed::c, %Filed::v) },
+               -type     => { filed        => MMAPON('id'),
+                              syslog       => 'MAP',
+                              id           => 'MAP',
+                              root         => 'STR',
+                              dirs         => MMAPON('dir'),
+                              dir          => 'MAP',
+                              ignore       => 'SEQ',
+                              ignore_match => 'SEQ',
+                              match        => 'SEQ',
+                              ops          => 'SEQ',
+                              post_ops     => 'SEQ',
+                              op           => 'MAP',
+                              posts        => MMAPON('post'),
+                              post         => 'MAP',
+                              gets         => MMAPON('get'),
+                              get          => 'MAP',
+                              inuse_ignore_match => 'SEQ',
+                includes     => MMAPON('include'),
+              },
+        include => sub { xml_include($Filed::c) }
+              );
+
+# -- create data structure from xml config file and store it as a reference in $CONF
+our $CONF = dt($ARGV[0], %handler);
+
+foreach(@{$CONF->{includes}->{include}}) {
+  foreach(@{$_->{id}}) {
+    push(@{$CONF->{id}},$_) if($_);
+  }
+}
+delete($CONF->{includes});
+
+# -- exit if we're in test config mode
+if ($opt_t){
+  if ($CONF){
+    print "Configuration structure appears sane - specific values are not checked\n";
+    exit 0;
+  }
+  else {
+    die "Configuration structure appears to broken\n";
+  }
+}
+
+# -- setup file logfile (not syslog)
+if (($CONF->{logfile}) and (! $opt_l)){
+  open STDOUT, ">>$CONF->{logfile}" or CORE::die("Can't open $CONF->{logfile} for logfile: $! - aborting\n");
+  open STDERR, ">&STDOUT" or CORE::die;
+}
+
+# -- setup syslog logging
+if (($CONF->{syslog}) and (! $opt_l)){
+  $SYSLOG = Log::Dispatch::Syslog->new( name      => 'filed1',
+                                        min_level => $CONF->{syslog}->{min_level} || 'info',
+                                        ident     => $CONF->{syslog}->{ident}     || 'filed',
+                                        facility  => $CONF->{syslog}->{facility}  || 'local1',
+                                        socket    => $CONF->{syslog}->{socket}    || 'unix',
+                                      );
+}
+
+if($CONF->{smtp_var}) {
+  if(exists($ENV{$CONF->{smtp_var}}) && length($ENV{$CONF->{smtp_var}})) {
+    $CONF->{smtp} = $ENV{$CONF->{smtp_var}};
+  } else {
+    warn "Error: The environmental variable listed in <smtp_var> - $CONF->{smtp_var} - is undefined or invalid. Skipping...";
+  }
+} 
+
+unless($CONF->{smtp}) {
+  $CONF->{smtp} = 'localhost';
+}
+
+# -- setup seconds.milliseconds to poll processes (this is global)
+Proc::Queue::delay(($CONF->{queue_polling_interval} || 1));
+
+
+# -- find long running filed process and warn if appropriate
+my $proctbl = new Proc::ProcessTable;
+my $filed_script_name = basename($0);
+my $config_fname = $ARGV[0];
+
+# -- loop through the process table looking for filed pids
+for my $proc (@{$proctbl->table}){
+  
+  # -- we are only interested in filed processes
+  my $proc_fname = basename($proc->{fname});
+  next unless $proc_fname =~ /^${filed_script_name}$/;
+
+  no warnings 'uninitialized';
+
+  # -- make sure we limit to filed processes using the same xml config file
+  next unless $proc->{cmndline} =~ /\s+${config_fname}$/;
+
+  # -- determine the number of wall clock seconds the pid has been alive
+  my $seconds = time - $proc->{start};
+  my $hours;
+
+  # -- if seconds greater than zero, compute hours
+  if ($seconds > 0){
+
+    $hours = sprintf("%.2f",(($seconds/60)/60));
+
+    # -- send a warning if filed pid hours greater than number of configured or default hours (48)
+    if ($hours > ($CONF->{warn_hours_filed_pid} || 48)){
+
+      warn "Old filed process detected!\n\nThis filed process has been running for $hours hours: $proc->{pid}.";
+
+    }
+    if ($CONF->{kill_hours_filed_pid} && $hours > $CONF->{kill_hours_filed_pid}){
+
+      warn "Old filed process detected!\n\nThis filed process has been running for $hours hours: $proc->{pid}. Terminating...";
+    kill(15,$proc->{pid}) || warn "Can't terminate $proc->{pid}: $!";
+
+    }
+
+
+  }
+
+}
+
+# --------------------- #
+# -- begin main loop -- #
+# --------------------- #
+
+if($opt_o) {
+  $CURRENT_ID->{userid} = $opt_o;
+  log "Only running for account $opt_o\n";
+}
+
+# -- loop through id's
+ID: for my $i (@{$CONF->{id}}){
+
+  # new for v43 - option 'o' can run the script for 'only' one account
+  next ID if($opt_o && $i->{userid} ne $opt_o);
+
+  # -- set a reference to the global $CURRENT_ID variable for use with our "warn" and other subs out of current scope
+  $CURRENT_ID = $i;
+
+  # -- setup global $USERID and $GROUPID for ops
+  ($USERID,$GROUPID) = (getpwnam($i->{userid}))[2..3];
+
+  # -- bail out if the user/group isn't defined
+  if ((! $USERID) or (! $GROUPID)){
+    $USERID = $i->{userid};
+    warn "'$i->{userid}' doesn't appear to be valid system account - skipping";
+    next ID;
+  }
+
+  # -- setup queue size for concurrent processes
+  Proc::Queue::size(($CONF->{id_queue_size} || 5));
+
+  # -- fork off children to process each id (unless were in serial mode)
+  if ((! $opt_s) and (fork)){
+    next ID;
+  }
+
+  # -- strip trailing slash on $i->{home}
+  $i->{home} =~ s/\/$//;
+
+  # ------------------------------------------ #
+  # -- loop through dirs for the current id -- #
+  # ------------------------------------------ #
+
+  DIR: for my $d (@{$i->{dirs}->{dir}}){
+
+    # -- setup queue size for concurrent processes
+    Proc::Queue::size(($i->{dirs}->{dir_queue_size} || $CONF->{dir_queue_size} || 5));
+
+    # -- patch up $d->{dirname}
+    $d->{dirname} =~ s|^/||;
+    $d->{dirname} = ($d->{dirname} eq '.') ? '' : $d->{dirname};
+
+    # -- setup global $CURRENT_FILE for use with warn(), etc.
+    $CURRENT_FILE = $d->{dirname};
+
+    # -- setup global reference to $d for use with process()
+    $CURRENT_DIR = $d;
+
+    # -- build path for inuse check
+    my $dir = "$i->{home}/$d->{dirname}";
+    $dir    =~ s|/$||;
+
+    # -- add a value for full dir path 
+    $d->{full_path} = $dir;
+
+    # -- verify the target directory exists
+    unless (-e $dir ){
+      warn "Can't stat $dir - does the users home exist?";
+      next;
+    }
+
+    # -- make sure the directory isn't in use before going any further
+    next if (inuse($dir,"dir"));
+
+    # -- fork off children to process each directory (unless were in serial mode)
+    if ((! $opt_s) and (fork)){
+      next DIR;
+    }
+
+    # -- open the directory so our pid shows up inuse
+    # -- this sometimes causes non-related dirs to be opened under load because of Proc::Queue characteristics
+    # open FILED_DIR, $dir or warn "Can't open $dir at directory loop start: $!" if ((-e $dir) and (! $d->{no_dir_lock}));
+
+    log "Scanning $dir" if defined $dir;
+
+    # -- patch up $d->{processed_dir} to valid system path for use below
+    $d->{processed_dir} = ($d->{processed_dir} ? $d->{processed_dir} : '.processed');
+    $d->{processed_dir} =~ s/\/$//;
+    $d->{processed_dir} = $i->{home} . (($d->{dirname}) ? "/$d->{dirname}/" : '/') . $d->{processed_dir};
+
+    # -- setup the processed_dir if it doesn't already exist
+    unless (-d $d->{processed_dir}){
+      
+      log "Creating processed directory: $d->{processed_dir}";
+      mkdir $d->{processed_dir} or warn "Can't create $d->{processed}: $!";
+      # chown($USERID, $GROUPID, $d->{processed_dir}) or warn "Can't chown $USERID, $GROUPID, $d->{processed_dir}";
+      chown(0,0,$d->{processed_dir}) or warn "Can't chown root, root, $d->{processed_dir}";
+      # chmod oct('0750'), $d->{processed_dir} or warn "Can't chmod 750 $d->{processed_dir}";
+      chmod oct('0700'), $d->{processed_dir} or warn "Can't chmod 700 $d->{processed_dir}";
+
+    }
+
+    # -- patch up $d->{failed_dir} to valid system path for use below
+    $d->{failed_dir} = ($d->{failed_dir} ? $d->{failed_dir} : '.failed');
+    $d->{failed_dir} =~ s/\/$//;
+    $d->{failed_dir} = $i->{home} . (($d->{dirname}) ? "/$d->{dirname}/" : '/') . $d->{failed_dir};
+
+    # -- setup the failed_dir if it doesn't already exist
+    unless (-d $d->{failed_dir}){
+
+      log "Creating failed directory: $d->{failed_dir}";
+      mkdir $d->{failed_dir} or warn "Can't create $d->{processed}: $!";
+      # chown($USERID, $GROUPID, $d->{failed_dir}) or warn "Can't chown $USERID, $GROUPID, $d->{failed_dir}";
+      chown(0,0,$d->{failed_dir}) or warn "Can't chown root, root, $d->{failed_dir}";
+      # chmod oct('0750'), $d->{failed_dir} or warn "Can't chmod 750 $d->{failed_dir}";
+      chmod oct('0700'), $d->{failed_dir} or warn "Can't chmod 700 $d->{failed_dir}";
+
+    }
+
+    # --------------------------------------------- #
+    # -- get remote files from each defined site -- #
+    # --------------------------------------------- #
+
+    GET: for my $g (@{$d->{gets}->{get}}){
+
+      # -- set global $CURRENT_POST for use with warn, etc.
+      $CURRENT_POST = $g;
+
+      # -- determine post_queue_size
+      my $get_queue_size = ($d->{gets}->{get_queue_size} || $CONF->{get_queue_size} || 5);
+
+      # -- only fork if we have more than one destination and we're configured for multiple posting
+      if ((@{$d->{gets}->{get}} > 1) and ($get_queue_size > 1)){
+
+        # -- setup queue size for concurrent processes
+        Proc::Queue::size($get_queue_size);
+
+        # -- fork off children to post (unless were in serial mode)
+        next GET if ((! $opt_s) and (fork));
+
+      }
+
+      # -- fix post path to avoid undefined warnings
+      $g->{path} = (defined $g->{path}) ? $g->{path} : '';
+
+      # -- build post path for use below
+      $g->{url} = "$g->{proto}://$g->{userid}\@$g->{host}" .
+                     (($g->{path}) ? ($g->{path} =~ /^\// ? "$g->{path}/" : "/$g->{path}/") :'/');
+
+      # -- ftp get
+      if (lc($g->{proto}) eq 'ftp'){
+
+        ftp_get($g);
+
+      }
+      # -- sftp get
+      elsif (lc($g->{proto}) eq 'sftp'){
+
+        sftp_get($g);
+
+      }
+      # -- unknown protocol
+      else {
+
+        warn "Protocol not supported: $g->{proto}";
+
+      }
+
+      # -- exit the child process unless were in serial mode or have more than one destination
+      exit if ((! $opt_s) and (@{$d->{gets}->{get}} > 1));
+
+    }
+
+    # -- clear global $CURRENT_POST
+    $CURRENT_POST = undef;
+
+    # -- wait for any get child pids to finish before going on
+    1 while wait != -1;
+
+  if($CURRENT_DIR->{no_recurse}) {
+    fakefind(\&process, "$i->{home}/$d->{dirname}");
+  } else {
+      File::Find::find(\&process, "$i->{home}/$d->{dirname}");
+  }
+
+    # -- setup file queue size for concurrent processes in file loop below
+    Proc::Queue::size(($d->{file_queue_size} || $CONF->{file_queue_size} || 3));
+
+    # ---------------------------------------------------------------------- #
+    # -- loop through files and perform various ops, posts, post_ops, mv  -- #
+    # ---------------------------------------------------------------------- #
+
+    FILE: for my $f (sort @FILES){
+
+      # -- skip processed_dir files
+      next if $f =~ /^$d->{processed_dir}/;
+
+      # -- skip failed_dir files
+      next if $f =~ /^$d->{failed_dir}/;
+
+      # -- setup global $CURRENT_FILE for use with warn, etc.
+      $CURRENT_FILE = basename($f);
+
+      # -- skip inuse files before possibly forking
+      next if inuse($f,"file loop start");
+
+      # -- fork off children to process each file (unless were in serial mode)
+      next if ((! $opt_s) and (fork));
+
+      # -- make sure the file *still* isn't in use before going any further (fork lag can affect this under load)
+      if (($d->{ops}) and (inuse($f,"ops"))){
+
+        if ($opt_s){ next } else { exit }
+
+      }
+
+      # -- open the file so our pid shows up inuse
+      open FILED, $f or warn "Can't open $f at file loop start: $!" if -e $f;
+    
+      # -- open the directory so our pid shows up inuse
+      open FILED_DIR, $CURRENT_DIR->{full_path} or warn "Can't open $CURRENT_DIR->{full_path} at file loop start: $!" if ((-e $dir) and (! $CURRENT_DIR->{no_dir_lock}));
+
+      # --
+      # -- apply ops commands to file
+      # --
+      OP: for my $o (@{$d->{ops}}){
+
+        # -- set global $CURRENT_OP for use with warn, etc.
+        $CURRENT_OP = $o;
+
+        # -- save the current file name for use with notify below
+        my $pre_command_file = $CURRENT_FILE;
+
+        # -- run the command
+        my $ret = command(\$f,\$o);
+
+        # -- the command failed
+        unless ($ret){
+
+          # -- if continue_on_failure is set, do the next op on $f
+          next OP if $o->{continue_on_failure};
+
+          # -- otherwise move this file to failed_dir and skip to the next file
+          # -- log and move the file if it still exists
+          if (-e $f){
+
+            # -- move the file to failed_dir
+            log "$o->{command} command has failed, moving $f to $d->{failed_dir}/".basename($f);
+            move($f,$d->{failed_dir}) or warn "Can't move $f to $d->{failed_dir}: $!";
+
+          }
+
+          # -- close the FILED handle (file is either moved or gone, but closing here for good measure)
+          close FILED;
+
+          # -- next file if single thread, otherwise exit
+          if ($opt_s){ next FILE } else { exit }
+
+        }
+
+        # -- command returns 1 on success
+        if ($ret == 1){
+
+          my $command = ($o->{command} eq 'sh') ? "'$o->{arg}'" : $o->{command};
+          notify(($o->{notify_msg} or "Successfully ran $command on $pre_command_file"));
+
+        }
+        # -- command returns -1 when skipping
+        elsif ($ret == -1){
+
+          # -- do we abort on skip
+          if ($o->{abort_on_skip}){
+
+            warn "$o->{command} command was skipped\n\n** Aborting since <abort_on_skip> is set for this command **";
+
+            # -- log and move the file if it still exists
+            if (-e $f){
+
+              log "$o->{command} command was skipped and <abort_on_skip> is set, moving $f to $d->{failed_dir}/".basename($f);
+              move($f,$d->{failed_dir}) or warn "Can't move $f to $d->{failed_dir}: $!";
+
+            }
+
+            # -- close the FILED handle (file is either moved or gone, but closing here for good measure)
+            close FILED;
+
+            # -- next file if single thread, otherwise exit
+            if ($opt_s){ next FILE } else { exit }
+
+          }
+          # -- do we warn on skip
+          elsif ($o->{warn_on_skip}){
+
+            warn "$o->{command} command was skipped, continuing";
+
+          }
+
+        }
+
+      }
+
+      # -- clear global $CURRENT_OP
+      $CURRENT_OP = undef;
+
+      # -- wait for any command child pids to finish before going on
+      1 while wait != -1;
+
+      # --
+      # -- post file to each destination
+      # --
+
+      # -- make sure the file still exists (some commands remove the file) or isn't in use before going any further
+      if ((! -e $f) or (($d->{posts}->{post}) and (inuse($f,"posts")))){
+
+        if ($opt_s){ next } else { exit }
+
+      }
+
+      POST: for my $p (@{$d->{posts}->{post}}){
+        # -- set global $CURRENT_POST for use with warn, etc.
+        $CURRENT_POST = $p;
+
+        # -- determine post_queue_size
+        my $post_queue_size = ($d->{posts}->{post_queue_size} || $CONF->{post_queue_size} || 5);
+
+        # -- only fork if we have more than one destination and we're configured for multiple posting
+        if ((@{$d->{posts}->{post}} > 1) and ($post_queue_size > 1)){
+
+          # -- setup queue size for concurrent processes
+          Proc::Queue::size($post_queue_size);
+
+          # -- fork off children to post (unless were in serial mode)
+          next POST if ((! $opt_s) and (fork));
+
+        }
+
+        # -- fix post path to avoid undefined warnings
+        $p->{path} = (defined $p->{path}) ? $p->{path} : '';
+
+        # -- build post path for use below
+        my $post_path = "$p->{proto}://$p->{userid}\@$p->{host}" .
+                        (($p->{path}) ? ($p->{path} =~ /^\// ? "$p->{path}/" : "/$p->{path}/") :'/') .
+                        basename($f);
+
+        # -- ftp post
+        if (lc($p->{proto}) eq 'ftp'){
+
+          # -- successful post
+          if (ftp_post($f,$p)){
+
+            notify(($p->{notify_msg} or "Successfully put $post_path for $i->{userid}"));
+
+            # -- create and send a trigger file if configured
+            if ($p->{trigger_file}){
+
+              # -- determine trigger file basename and post path
+              my $trigger_file = trigger_file_name($f, $p->{trigger_file_suffix}, $p->{trim_trigger_file_suffix});
+              my $trigger_post_path = dirname($post_path).'/'.$trigger_file;
+
+              # -- save off $CURRENT_FILE then set it to trigger for logging and warnings.
+              my $pre_trigger_file = $CURRENT_FILE;
+              $CURRENT_FILE = basename($trigger_file);
+
+              # -- open a trigger file for writing or warn
+              if (open TRIGGER,">$trigger_file"){
+              
+                # -- print the byte size of the file we're triggering and close the trigger file
+                print TRIGGER (stat $f)[7], "\n" unless ((defined $p->{trigger_file_byte_count}) and ($p->{trigger_file_byte_count} == 0));
+                close TRIGGER;
+
+                # -- now post the trigger file
+                if (ftp_post($trigger_file,$p)){
+
+                  notify(($p->{notify_msg} or "Successfully put trigger file $trigger_post_path for $i->{userid}"));
+
+                }
+                else {
+
+                  log "Post to $trigger_post_path has failed";
+
+                }
+
+                # -- always delete the local trigger file
+                unlink $trigger_file or warn "Can't delete trigger file $trigger_file: $!";
+
+              }
+              else {
+              
+                warn "Can't open trigger file $trigger_file: $!";
+
+              }
+
+              # -- set $CURRENT_FILE back to "real" file
+              $CURRENT_FILE = $pre_trigger_file;
+
+            }
+
+          }
+          # -- failed post and only one destination - move to failed_dir if file exists
+          elsif (@{$d->{posts}->{post}} == 1){
+
+            # -- sometimes the file goes missing during the post
+            if (-e $f){
+
+              log "Post to $post_path has failed, moving $f to $d->{failed_dir}";
+              move($f,$d->{failed_dir}) or warn "Can't move $f to $d->{failed_dir}: $!";
+
+            }
+            else {
+
+              log "Post to $post_path has failed, $f no longer exists";
+
+            }
+
+            # -- close the FILED handle (file is either moved or gone, but closing here for good measure)
+            close FILED;
+
+            # -- next file if single thread, otherwise exit
+            # 2/25/2016 - Hess added continue_on_failure support for posts
+
+            if ($p->{continue_on_failure}) {
+              warn "** Continuing since <continue_on_failure> for $f is set **";
+            } elsif ($opt_s) {
+              next FILE;
+            } else {
+              exit;
+            }
+
+          }
+          else {
+
+            log "More than one destination for $f, continuing";
+
+          }
+
+        }
+        # -- sftp post
+        elsif (lc($p->{proto}) eq 'sftp'){
+
+          # -- sucessful post
+          if (sftp_post($f,$p)){
+
+            notify(($p->{notify_msg} or "Successfully put $post_path for $i->{userid}"));
+
+            # -- create and send a trigger file if configured
+            if ($p->{trigger_file}){
+
+              # -- determine trigger file basename and post path
+              my $trigger_file = trigger_file_name($f, $p->{trigger_file_suffix}, $p->{trim_trigger_file_suffix});
+              my $trigger_post_path = dirname($post_path).'/'.$trigger_file;
+
+              # -- save off $CURRENT_FILE then set it to trigger for logging and warnings.
+              my $pre_trigger_file = $CURRENT_FILE;
+              $CURRENT_FILE = basename($trigger_file);
+
+              # -- open a trigger file for writing or warn
+              if (open TRIGGER,">$trigger_file"){
+              
+                # -- print the byte size of the file we're triggering and close the trigger file
+                print TRIGGER (stat $f)[7], "\n" unless ((defined $p->{trigger_file_byte_count}) and ($p->{trigger_file_byte_count} == 0));
+                close TRIGGER;
+
+                # -- now post the trigger file
+                if (sftp_post($trigger_file,$p)){
+
+                  notify(($p->{notify_msg} or "Successfully put trigger file $trigger_post_path for $i->{userid}"));
+
+                }
+                else {
+
+                  log "Post to $trigger_post_path has failed";
+
+                }
+
+                # -- always delete the local trigger file
+                unlink $trigger_file or warn "Can't delete trigger file $trigger_file: $!";
+
+              }
+              else {
+              
+                warn "Can't open trigger file $trigger_file: $!";
+
+              }
+
+              # -- set $CURRENT_FILE back to "real" file
+              $CURRENT_FILE = $pre_trigger_file;
+
+            }
+
+          }
+          # -- failed post and only one destination - move to failed_dir if file exists
+          elsif (@{$d->{posts}->{post}} == 1){
+
+            # -- sometimes the file goes missing during the post
+            if (-e $f){
+
+              log "Post to $post_path has failed, moving $f to $d->{failed_dir}";
+              move($f,$d->{failed_dir}) or warn "Can't move $f to $d->{failed_dir}: $!";
+
+            }
+            else {
+
+              log "Post to $post_path has failed, $f no longer exists";
+
+            }
+
+            # -- close the FILED handle (file is either moved or gone, but closing here for good measure)
+            close FILED;
+
+            # -- next file if single thread, otherwise exit
+            # 2/25/2016 - Hess added continue_on_failure support for posts
+
+            if ($p->{continue_on_failure}) {
+              warn "** Continuing since <continue_on_failure> for $f is set **";
+            } elsif ($opt_s) {
+              next FILE;
+            } else {
+              exit;
+            }
+          }
+          else {
+
+            log "More than one destination for $f, continuing";
+
+          }
+
+        }
+        # -- unknown protocol
+        else {
+
+          warn "Protocol not supported: $p->{proto}";
+
+        }
+
+        # -- exit the child process unless were in serial mode or have more than one destination
+        exit if ((! $opt_s) and (@{$d->{posts}->{post}} > 1));
+
+      }
+
+      # -- clear global $CURRENT_POST
+      $CURRENT_POST = undef;
+
+      # -- wait for any post child pids to finish before going on
+      1 while wait != -1;
+
+      # --
+      # -- apply post_ops commands to file
+      # --
+
+      # -- make sure the file still exists (some commands remove the file) or isn't in use before going any further
+      if ((! -e $f) or (($d->{posts}->{post}) and (inuse($f,"posts_ops")))){
+
+        if ($opt_s){ next } else { exit }
+ 
+      }
+
+      POP: for my $o (@{$d->{post_ops}}){
+
+        # -- set global $CURRENT_OP for use with warn, etc.
+        $CURRENT_OP = $o;
+
+        # -- save the current file name for use with notify below
+        my $pre_command_file = $CURRENT_FILE;
+
+        # -- run the command
+        my $ret = command(\$f,\$o);
+
+        # -- the command failed
+        unless ($ret){
+
+          # -- if continue_on_failure is set, do the next op on $f
+          next POP if $o->{continue_on_failure};
+
+          # -- otherwise move this file to failed_dir and skip to the next file
+          # -- log and move the file if it still exists
+          if (-e $f){
+
+            # -- move the file to failed_dir
+            log "$o->{command} post_op command has failed, moving $f to $d->{failed_dir}/".basename($f);
+            move($f,$d->{failed_dir}) or warn "Can't move $f to $d->{failed_dir}: $!";
+
+          }
+
+          # -- close the FILED handle (file is either moved or gone, but closing here for good measure)
+          close FILED;
+
+          # -- next file if single thread, otherwise exit
+          if ($opt_s){ next FILE } else { exit }
+
+        }
+
+        # -- command returns 1 on success
+        if ($ret == 1){
+
+          my $command = ($o->{command} eq 'sh') ? "'$o->{arg}'" : $o->{command};
+          notify(($o->{notify_msg} or "Successfully ran $command on $pre_command_file"));
+
+        }
+        # -- command returns -1 when skipping
+        elsif ($ret == -1){
+
+          # -- do we abort on skip
+          if ($o->{abort_on_skip}){
+
+            warn "$o->{command} command was skipped\n\n** Aborting since <abort_on_skip> is set for this command **";
+
+            # -- log and move the file if it still exists
+            if (-e $f){
+
+              log "$o->{command} post_op command was skipped and <abort_on_skip> is set, moving $f to $d->{failed_dir}/".basename($f);
+              move($f,$d->{failed_dir}) or warn "Can't move $f to $d->{failed_dir}: $!";
+
+            }
+
+            # -- close the FILED handle (file is either moved or gone, but closing here for good measure)
+            close FILED;
+
+            # -- next file if single thread, otherwise exit
+            if ($opt_s){ next FILE } else { exit }
+
+          }
+          # -- do we warn on skip
+          elsif ($o->{warn_on_skip}){
+
+            warn "$o->{command} command was skipped, continuing";
+
+          }
+
+        }
+
+      }
+
+      # --
+      # -- move the file to the processed_dir (if it still exists - again concurrency issues)
+      # --
+      if (-e $f){
+
+        # -- move the file to processed_dir
+        log "Moving $f to $d->{processed_dir}/".basename($f);
+        move($f,$d->{processed_dir}) or warn "Can't move $f to $d->{processed_dir}: $!"
+
+      }
+
+      # -- close the FILED handle (file is either moved or gone, but closing here for good measure)
+      close FILED;
+
+      # -- clear global $CURRENT_OP
+      $CURRENT_OP = undef;
+
+      # -- exit the file child process (unless were in serial mode)
+      exit unless $opt_s;
+
+    }
+
+    # -- wait for file child pids to finish before going on
+    1 while wait != -1;
+
+    # --------------------------------------------------------------------------------------------- #
+    # -- loop through processed files and remove those with mtime > processed_dir_retention_days -- #
+    # --------------------------------------------------------------------------------------------- #
+
+    unless (inuse($d->{processed_dir},'processed_dir start')){
+  
+      # -- open the processed dir so our pid shows up inuse
+      open PROCESSED_DIR, $d->{processed_dir} or warn "Can't open $d->{processed_dir} at processed_dir: $!";
+  
+      # -- rebuild @FILE array to include processed_dir paths
+      @FILES = ();
+      File::Find::find(\&process, $d->{processed_dir});
+  
+      for my $f (sort @FILES){
+  
+        # -- skip missing files
+        unless (-e $f){
+          log "Notice: $f no longer exists during processed_dir, skipping";
+        }
+
+        # -- update global $CURRENT_FILE
+        $CURRENT_FILE = basename($f);
+  
+        # -- make sure file isn't in use. Disabled by J Hess 2/16/2014 due to problems w/OS fuser on system causing hangs
+#        next if inuse($f,'processed_dir');
+  
+        # -- open the file so our pid shows up inuse - assuming file *still* exists
+        open FILED, $f or do {
+          if($! =~ /No such file or directory/) {
+            log "Notice: $f no longer available in processed_dir.";
+          } else {
+            warn "Can't open $f at processed_dir: $!";
+          }
+        } if -e $f;
+  
+        # -- get modify time of file
+        my $mtime = (stat $f)[9] || 0;
+  
+        # -- determine processed_dir_retention_days
+        my $processed_dir_retention_days = (defined($CONF->{processed_dir_retention_days}) ? $CONF->{processed_dir_retention_days} : defined($d->{processed_dir_retention_days}) ? $d->{processed_dir_retention_days} : undef);
+  
+        # -- compare mtime to the processed_dir_retention_days (if defined) and remove if necessary
+        if ((defined $processed_dir_retention_days) and ($mtime <= (time - ($processed_dir_retention_days * 86400)))){
+  
+          # -- log and remove file (if they still exist - again concurrency issues)
+          if (-e $f){
+  
+            # -- log and remove file
+            log "Removing $processed_dir_retention_days day aged file $f";
+            unlink $f or warn "Can't remove $processed_dir_retention_days day aged file $f: $!";
+  
+          }
+  
+        }
+        # -- timestamp,gpg_encrypt if configured
+        elsif (($CONF->{processed_dir_encrypt}) or ($d->{processed_dir_encrypt}) or ($CONF->{processed_dir_timestamp}) or ($d->{processed_dir_timestamp})){
+  
+          # -- timestamp
+          if (($CONF->{processed_dir_timestamp}) or ($d->{processed_dir_timestamp})){
+  
+            # -- skip files that are already timestamped
+            next if $f =~ /\d{8}\.\d{6}($|\.\w)/;
+  
+            # -- timestamp
+            command(\$f, \{command=>'timestamp'});
+  
+          }
+  
+          # -- encrypt
+          if (($CONF->{processed_dir_encrypt}) or ($d->{processed_dir_encrypt})){
+  
+            # -- skip files that are already encrypted
+            next if $f =~ /(\.pgp|\.gpg|\.asc)($|\.\w)/;
+  
+            # -- encrypt with the default key
+            command(\$f, \{command=>'pgp_encrypt',key=>$CONF->{pgp_default_key}});
+  
+          }
+  
+        }
+  
+        # -- close the filehandle
+        close FILED;
+  
+      }
+        
+      # -- close the processed dir filehandle
+      close PROCESSED_DIR;
+ 
+    }
+
+    # ----------------------------------------------------------------------- #
+    # -- loop through failed files and timestamp,gpg_encrypt if configured -- # 
+    # ------------------------------------------------------------------------#
+
+    if ((! inuse($d->{failed_dir},'failed_dir start')) and (($CONF->{failed_dir_encrypt}) or ($d->{failed_dir_encrypt}) or ($CONF->{failed_dir_timestamp}) or ($d->{failed_dir_timestamp}))){
+
+      # -- open the file so our pid shows up inuse
+      open FAILED_DIR, $d->{failed_dir} or warn "Can't open $d->{failed_dir} at processed_dir: $!";
+
+      # -- rebuild @FILE array to include failed_dir paths
+      @FILES = ();
+      File::Find::find(\&process, $d->{failed_dir});
+
+      for my $f (sort @FILES){
+
+        # -- skip missing files
+        unless (-e $f){
+          log "Notice: $f no longer exists during failed_dir, skipping";
+        }
+
+        # -- update global $CURRENT_FILE
+        $CURRENT_FILE = basename($f);
+
+        # -- make sure file isn't in use
+        next if inuse($f,'failed_dir');
+
+        # -- open the file so our pid shows up inuse assuming the file *still* exists
+        open FILED, $f or warn "Can't open $f at failed_dir: $!" if -e $f;
+
+        # -- timestamp if configured and file not already timestamped
+        if ((($CONF->{failed_dir_timestamp}) or ($d->{failed_dir_timestamp})) and ($f !~  /\d{8}\.\d{6}($|\.\w)/)){
+
+          # -- timestamp
+          command(\$f, \{command=>'timestamp'});
+
+        }
+
+        # -- encrypt if configured and file not already encrypted
+        if ((($CONF->{failed_dir_encrypt}) or ($d->{failed_dir_encrypt})) and ($f !~ /(\.pgp|\.gpg|\.asc)($|\.\w)/)){
+
+          # -- encrypt with the default key
+          command(\$f, \{command=>'pgp_encrypt',key=>$CONF->{pgp_default_key}});
+
+        }
+
+        # -- close the filehandle
+        close FILED;
+
+      }
+
+      # -- close the failed dir filehandle
+      close FAILED_DIR;
+
+    }
+
+    # -- exit the child process (unless were in serial mode)
+    exit unless $opt_s;
+
+    # -- clear @FILES, $CURRENT_FILE, FILED handle for next <dirs> iteration
+    close FILED;
+    close FILED_DIR unless $CURRENT_DIR->{no_dir_lock};
+    @FILES = ();
+    $CURRENT_DIR  = undef;
+    $CURRENT_FILE = undef;
+
+  }
+
+  # -- wait for child processes to finish then exit (unless were in serial mode)
+  unless ($opt_s){ 1 while wait != -1; exit };
+
+  # -- clear $USERID,$GROUPID,$CURRENT_ID for next <id> iteration (only in serial mode)
+  if ($opt_s){
+    $USERID  = undef;
+    $GROUPID = undef;
+    $CURRENT_ID = undef;
+  }
+
+}
+
+# ------------------- #
+# -- end main loop -- #
+# ------------------- #
+
+# -- wait for child processes to finish then exit
+1 while wait != -1;
+exit;
+
+# ----------------- #
+# -- subroutines -- #
+# ----------------- #
+
+
+
+sub xml_include {
+  my $file = shift || return(undef);
+
+  my @files;
+  if(-d $file) {
+  # open dir, read each file
+    @files = glob("$file/*.xml");
+  } else {
+    return(undef) unless($file =~ /\.xml$/);
+    $files[0] = $file;
+  }
+
+  my $conf;
+  FILE: foreach(@files) {
+    open(XML,"<$_") || do { 
+      notify("Can't open included file $_: $!\n");
+      next FILE;
+    };
+    my $data .= join('',(<XML>));
+    close(XML);
+    eval { $data = dtstring($data,%handler); };
+
+    if($@) {
+      # this error has to be handled better!
+      notify("Error in parsing included file $file:\n$@\n");
+      next FILE;
+    } else { 
+      if($conf) {
+        push(@{$conf->{id}},$data);
+      } else {
+        $conf = { id => [ $data ] };
+      }
+    }
+  }
+
+  return($conf);
+}
+
+# -- our sub for processing various xml attributes (called in %handler above)
+sub tag_attr {
+
+ my $q = shift; # -- element 
+ my $c = shift; # -- content
+ my %v = @_;    # -- attributes
+
+ # -- some fields are encrypted, so decrypt values as we parse
+ if ($v{encrypted}){
+    $c = decrypt($c);
+ }
+
+ return $c;
+
+}
+
+sub fakefind {
+  # a fast and fake version of find that only gets files from the current dir
+  my $proc_ref = shift;
+  my $dir = shift;
+
+  opendir(DIR,$dir) || do {
+    warn "Can't open $dir: $!\n";
+    return(undef);
+  };
+
+  $dir .= '/' unless(substr($dir,length($dir)-1,1) eq '/');
+
+  $File::Find::dir = $dir;
+
+  FILES:
+  while(my $file = readdir(DIR)) {
+    $File::Find::name = "$dir$file";
+    next FILES if(!-e $File::Find::name || -d _);
+    &$proc_ref();
+  }
+
+  closedir(DIR);
+
+  return(1);
+}
+
+sub process {
+  # -- no dirs  
+  return if -d $File::Find::name;
+
+  # -- check against global <ignore>
+  for my $f (@{$CONF->{ignore}}){
+    return if basename($File::Find::name) eq $f;
+  }
+
+  # -- check against local <ignore>
+  for my $f (@{$CURRENT_DIR->{ignore}}){
+    return if basename($File::Find::name) eq $f;
+  }
+
+  # -- check against global <ignore_match>
+  for my $f (@{$CONF->{ignore_match}}){
+    return if $File::Find::name =~ m|$f|;
+  }
+
+  # -- check against local <ignore_match>
+  for my $f (@{$CURRENT_DIR->{ignore_match}}){
+    return if $File::Find::name =~ m|$f|;
+  }
+
+  my $file_match = 0;
+
+  # -- check against global <file_match>
+  for my $f (@{$CONF->{match}}){
+#    return if basename($File::Find::name) !~ m|$f|;
+    $file_match = 1 if basename($File::Find::name) =~ m|$f|;
+  }
+
+  return unless($file_match || !@{$CONF->{match}});
+  $file_match = 0;
+
+  # -- check against local <file_match>
+  for my $f (@{$CURRENT_DIR->{match}}){
+#    return if basename($File::Find::name) !~ m|$f|;
+    $file_match = 1 if basename($File::Find::name) =~ m|$f|;
+  }
+
+  return unless($file_match || !@{$CURRENT_DIR->{match}});
+
+  # -- push $File::Find::name on to the stack for further processing
+  push @FILES, $File::Find::name;
+
+}
+
+sub command {
+
+  my $f = shift;
+  my $o = shift;
+
+  # -- update global $CURRENT_FILE
+  $CURRENT_FILE = basename($$f);
+
+  # -- open the file so our pid shows up inuse (existing FILED handle will be implicity closed)
+  open FILED, $$f or warn "Can't open $$f at command: $!" if -e $f;
+
+  my $ok;
+  my $err;
+
+  # -- make sure we have a command to run
+  unless ($$o->{command}){ warn "No command - broken configuration?"; return 0 };
+
+  # -- run the command $$file if we still have one - concurrency issues sometimes cause the file to be moved
+  if (-e $$f){
+
+    # -- simple case statement, not pretty but faster than using Switch
+    CASE: {
+
+      ($$o->{command} eq 'noop') and do { ($$f,$ok,$err) = ($$f,1,undef); last CASE };
+
+      ($$o->{command} eq 'mail') and do { ($$f,$ok,$err) = mail($$f,$$o->{to},$$o->{cc},$$o->{bcc},$$o->{from},($$o->{max_size_mb} || 10)); last CASE };
+
+      ($$o->{command} eq 'sh') and do { ($$f,$ok,$err) = sh($$f,$$o->{arg}); last CASE };
+
+
+      ($$o->{command} eq 'touch') and do { ($$f,$ok,$err) = touch($$f); last CASE };
+
+      ($$o->{command} eq 'cp') and do  { ($$f,$ok,$err) = cp($$f,$$o->{destination}); last CASE };
+
+      ($$o->{command} eq 'mv') and do  { ($$f,$ok,$err) = mv($$f,$$o->{destination}); last CASE };
+
+      ($$o->{command} eq 'rename_match') and do  { ($$f,$ok,$err) = rename_match($$f,$$o->{search},$$o->{replace},$$o->{no_global}); last CASE };
+
+      ($$o->{command} eq 'gzip') and do { ($$f,$ok,$err) = gzip($$f,$$o->{min_mb}); last CASE };
+
+      ($$o->{command} eq 'gunzip') and do { ($$f,$ok,$err) = gunzip($$f); last CASE };
+
+      ($$o->{command} eq 'zip') and do { ($$f,$ok,$err) = zip($$f,$$o->{min_mb}); last CASE };
+
+      ($$o->{command} eq 'unzip') and do { ($$f,$ok,$err) = unzip($$f,$$o->{destination},$$o->{keep_zip}); last CASE };
+      ($$o->{command} eq 'unzip_single_member') and do { ($$f,$ok,$err) = unzip($$f); last CASE };
+
+      ($$o->{command} eq 'pgp_encrypt') and do { ($$f,$ok,$err) = pgp_encrypt($$f, $$o->{key}); last CASE };
+
+      ($$o->{command} eq 'pgp_decrypt') and do { ($$f,$ok,$err) = pgp_decrypt($$f); last CASE };
+
+      ($$o->{command} eq 'timestamp') and do { ($$f,$ok,$err) = timestamp($$f); last CASE };
+
+      # -- warn if we haven't got a match
+      do { warn "Unknown command: $$o->{command}"; return 0 };
+
+    }
+
+    # -- command failed
+    if ($ok == 0){
+
+      $err .= "\n\n** Continuing since <continue_on_failure> for $$o->{command} is set **" if $$o->{continue_on_failure};
+      warn $err;
+      return 0;
+
+    }
+    # -- command succeeded
+    elsif ($ok == 1){
+
+      # -- update global $CURRENT_FILE again since it probably changed from operation above
+      $CURRENT_FILE = basename($$f);
+
+      # -- open the file again so our pid shows up inuse (existing FILED handle will be implicity closed)
+      open FILED, $$f or warn "Can't open $$f at command: $!" if -e $$f;
+
+      return 1;
+
+    }
+    # -- command skipped
+    elsif ($ok == -1){
+
+      return -1;
+
+    }
+    # -- command returned unrecognized value - shouldn't ever happen
+    else {
+
+      warn "Unknown return code from $$o->{command}: $ok";
+      return 0;
+
+    }
+
+  }
+  else {
+
+    log "Aborting ".$$o->{command}." on ".$$f." - file missing";
+    return 0;
+
+  }
+
+}
+
+sub inuse {
+
+  my $file = shift;
+  my $op   = shift;
+  my $nowait = shift;
+
+  # -- make sure the file exists
+  
+  unless (-e $file) {
+      log "Notice: $file no longer exists, aborting $op";
+  }
+
+  # -- determine seconds to wait
+  my $seconds = $CONF->{inuse_wait_seconds} || 30;
+
+  # -- set counter variables
+  my $myself = 0;
+  my $procs  = 0;
+  my @pid    = ();
+
+  # -- check to see if file is in use
+  my @procs = $FUSER->fuser($file);
+
+  # -- file is inuse
+  if (@procs){
+
+    PROC: for my $proc (@procs){
+
+      # -- fix up command string
+      my $cmd = join('', @{$proc->cmd()});
+      $cmd =~ s/\c@/ /g;
+      $cmd =~ s/\n//g;
+      $cmd =~ s/\s+$//g;
+
+      # -- assign the $pid
+      my $pid = $proc->pid();
+
+      # -- note ourself
+      if ($pid == $$){
+
+        # -- increment both counters
+        $myself++;
+        $procs++;
+        next PROC;
+
+      }
+
+      # -- don't step on other filed procs
+      if ($cmd =~ /$0/){
+
+        log "Existing filed process $pid is using $file, aborting $op";
+        return 1;
+
+      }
+
+      # -- skip any <inuse_ignore_match> pids
+      for my $ignore (@{$CONF->{inuse_ignore_match}}){
+
+        if ($cmd =~ /$ignore/){
+          log "Ignoring '$cmd' process $pid because '$ignore' matches on $op";
+          next PROC; 
+        }
+
+      }
+
+      # -- increment just the proc counter and store the pid since this must be "real"
+      $procs++;
+      push @pid, $pid;
+      log "$file - in use by pid: $pid cmd: '$cmd' user: ". $proc->user() . " while attempting $op";
+
+    }
+
+    # -- we are the only ones using file, return 0
+    if ($procs == $myself){
+    
+      # log "Our filed process $$ is only process using $file, continuing $op";
+      return 0;
+
+    }
+
+    # -- wait $seconds and try again to reduce transient inuse errors unless we're called with nowait
+    unless ($nowait){
+
+      log "Waiting $seconds seconds on $file - in use by pid(s): " . join(',',@pid) . " while attempting $op";
+      sleep($seconds, $file);
+      
+      # -- call ourselves with the nowait flag
+      # -- file still in use
+      if (inuse($file,$op,1)){
+
+        return 1;
+    
+      }
+      # -- file now free
+      else {
+
+        return 0;
+
+      }
+
+    }
+    else {
+
+        log "Skipping $file - still in use by pid(s): " . join(',',@pid) . " while attempting $op";
+        return 1;
+
+    }
+
+  }
+  # -- file is not in use
+  else {
+    
+    return 0;
+
+  }
+
+}
+
+sub touch {
+
+  my $file = shift;  
+
+  if ($file =~ /\.touch($|\.\w)/i){
+    log "Skipping touch on $file - suffix indicates already touched";
+    return $file,-1;
+  }
+
+  log "Touching $file";
+
+  unless (move($file, "$file.touch")){
+    return $file,0,"Error: touch $file failed: $!";
+  }
+  else {
+    return "$file.touch",1;
+  }
+
+}
+
+sub timestamp {
+
+  my $file = shift;  
+
+  if ($file =~ /\d{8}\.\d{6}($|\.\w)/){
+    log "Skipping timestamp on $file - suffix indicates already timestamped";
+    return $file,-1;
+  }
+
+  log "Timestamping $file";
+
+  my @date = (localtime(time))[5,4,3,2,1,0];
+  $date[0] += 1900;
+  $date[1] += 1;
+
+  my $timestamp = sprintf("%04d%02d%02d.%02d%02d%02d", @date);
+
+  unless (move($file, "$file.$timestamp")){
+    return $file,0,"Error: timestamp $file failed: $!";
+  }
+  else {
+    return "$file.$timestamp",1;
+  }
+
+}
+
+sub sh {
+
+  my $file = shift;
+  my $cmd = shift;
+
+  log "Shelling '$cmd $file'";
+
+  my $path = dirname($file) . '/';
+
+  # -- fix up file name for system call
+  my $file_arg = $file;
+  $file_arg =~ s/'/'\\''/g;
+  $file_arg =~ s/\'//g;
+
+  if (system("$cmd '$file_arg' 1>$path.$$.res 2>$path.$$.err")){
+
+    open OUT, "$path.$$.res" or warn "Can't open $path.$$.res for reading";
+    open ERR, "$path.$$.err" or warn "Can't open $path.$$.err for reading";
+
+    my $sep = $/;
+    $/ = undef;
+    my $out = <OUT>;
+    my $err = <ERR>;
+    close OUT;
+    close ERR;
+    $/ = $sep;
+
+    chomp $out;
+    chomp $err;
+
+    unlink "$path.$$.res" or warn "Can't unlink $path.$$.res";
+    unlink "$path.$$.err" or warn "Can't unlink $path.$$.err";
+
+    return $file,0,"Error: sh $cmd $file has failed\n\nStandard Output:\n$out\n\nStandard Error:\n$err";
+
+  }
+
+  unlink "$path.$$.res" or warn "Can't unlink $path.$$.res";
+  unlink "$path.$$.err" or warn "Can't unlink $path.$$.err";
+
+  return $file,1;
+
+}
+
+sub mail {
+
+  my $file    = shift;
+  my $to      = shift;
+  my $cc      = shift;
+  my $bcc     = shift;
+  my $from    = shift;
+  my $max_mb  = shift;
+
+  log "Mailing $file to $to".($cc ? ", $cc" : '').($bcc ? ", $bcc" : '');
+
+  # -- sanity check on recpient(s) - to is required
+  if ($to              !~ /$Mail::Sendmail::address_rx/) { return $file,0,"Can't mail $CURRENT_FILE, bad to address: $to"   };
+  if (($cc)  and ($cc  !~ /$Mail::Sendmail::address_rx/)){ return $file,0,"Can't mail $CURRENT_FILE, bad cc address: $cc"   };
+  if (($bcc) and ($bcc !~ /$Mail::Sendmail::address_rx/)){ return $file,0,"Can't mail $CURRENT_FILE, bad bcc address: $bcc" };
+
+  # -- make sure the file isn't too large
+  my $file_size_mb = sprintf("%.1f",((((stat $file)[7])/1024)/1024));
+  if ($file_size_mb > $max_mb){
+
+    return $file,0,("File is too large at ${file_size_mb}MB, max size limit is ${max_mb}MB. File NOT mailed to: $to".($cc ? ", $cc" : '').($bcc ? ", $bcc" : ''));
+
+  }
+
+  # -- craft a message and send it to the user
+  my %mail = ( To => $to,
+               Cc => $cc,
+               Bcc => $bcc,
+               From => ($from || "$CONF->{company} File Agent <$CONF->{admin}>"),
+         smtp => $CONF->{smtp}, 
+               Subject=> "File Agent Delivery - $CURRENT_FILE - $CURRENT_ID->{userid}");
+
+  my $boundary = "====" . time() . "====";
+  $mail{'content-type'} = "multipart/mixed; boundary=\"$boundary\"";
+
+  my $message = encode_qp($CONF->{disclaimer});
+
+  open FILE, $file or return $file,0,"Cannot read $file: $!";
+
+  binmode FILE;
+  my $sep = $/;
+  $/ = undef;
+  $mail{body} = encode_base64(<FILE>);
+  close FILE;
+  $/ = $sep;
+
+  # -- excuse the lack of indentation - need left justified format
+  $boundary = '--'.$boundary;
+$mail{body} = <<END_OF_BODY;
+$boundary
+Content-Type: text/plain; charset="iso-8859-1"
+Content-Transfer-Encoding: quoted-printable
+
+$message
+$boundary
+Content-Type: application/octet-stream; name="$CURRENT_FILE"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="$CURRENT_FILE"
+
+$mail{body}
+$boundary--
+END_OF_BODY
+
+  unless (sendmail(%mail)){
+    return $file,0,"Error: mail to $to failed: $Mail::Sendmail::error";
+  }
+
+  return $file,1;
+
+}
+
+sub cp {
+
+  my $file = shift;
+  my $destination = shift;
+
+  $destination =~ s/\/$//;
+  $destination = $destination.'/'.basename($file);
+
+  log "Copying $file to $destination";
+
+  unless (copy($file, $destination)){
+    return $file,0,"Error: copy $file $destination failed: $!";
+  }
+  chown($USERID, $GROUPID, $destination) or warn "Can't chown $USERID, $GROUPID, $destination";
+
+  return $file,1;
+
+}
+
+sub mv {
+
+  my $file = shift;
+  my $destination = shift;
+
+  $destination =~ s/\/$//;
+  $destination = $destination.'/'.basename($file);
+
+  log "Moving $file to $destination";
+
+  unless (move($file, $destination)){
+    return $file,0,"Error: move $file $destination failed: $!";
+  }
+  chown($USERID, $GROUPID, $destination) or warn "Can't chown $USERID, $GROUPID, $destination";
+
+  # -- need to return $file for notify() to work
+  return $file,1;
+
+}
+
+sub rename_match {
+
+  my $file = shift;
+  my $search = shift;
+  my $replace = shift;
+  my $no_global = shift;
+
+  # -- check for the existence of $search and $replace, warn appropriately
+  warn "No search pattern defined for rename_match" unless defined $search;
+  warn "No replace pattern defined for rename_match" unless defined $replace;
+
+  # -- allow $USERID, $GROUPID, and $FILE patterns
+  $search  =~ s/\$USERID/$CURRENT_ID->{userid}/g;
+  $search  =~ s/\$FILE/$CURRENT_FILE/g;
+  $replace =~ s/\$USERID/$CURRENT_ID->{userid}/g;
+  $replace =~ s/\$FILE/$CURRENT_FILE/g;
+
+  # -- determine whether global replace is desired
+  my $basename = basename($file);
+
+  # -- apply regex accordingly
+  if ($no_global){
+    $basename =~ s/$search/$replace/;
+  }
+  else {
+    $basename =~ s/$search/$replace/g;
+  }
+
+  # -- construct the new full name
+  my $destination = dirname($file) . '/' . $basename;
+
+  log "Renaming $file to $destination";
+
+  unless (move($file, $destination)){
+    return $file,0,"Error: move $file $destination failed: $!";
+  }
+  chown($USERID, $GROUPID, $destination) or warn "Can't chown $USERID, $GROUPID, $destination";
+
+  # -- need to return $destination here
+  return $destination,1;
+
+}
+
+sub gzip {
+
+  my $file = shift;  
+  my $min_size_mb = shift;
+
+  if ($file =~ /\.gz($|\.\w)/i){
+    log "Skipping gzip on $file - suffix indicates already gzip'd";
+    return $file,-1;
+  }
+
+  if ($min_size_mb){
+    my $file_size_mb = (stat $file)[7] || 0;
+    $file_size_mb = sprintf("%.2f", ($file_size_mb/1024)/1024) if $file_size_mb;
+
+    if ($file_size_mb < $min_size_mb){
+      log "Skipping gzip on $file - file size ${file_size_mb}MB is less than threshold of ${min_size_mb}MB";
+      return $file,-1;
+    }
+  }
+
+  unless ($CONF->{gzip}){
+    return $file,0,"gzip command location not defined - aborting";
+  }
+
+  log "Gzipping $file";
+
+  my $ret = system($CONF->{gzip},$file);
+
+  if ($ret){
+    return $file,0,"Error: gzip $file failed: $!";
+  }
+  else {
+    return "$file.gz",1;
+  }
+
+}
+
+sub gunzip {
+
+  my $file = shift;  
+
+  if ($file !~ /(\.gz|\.tgz)$/i){
+    log "Skipping gunzip on $file - suffix indicates not gzip file";
+    return $file,-1;
+  }
+
+  unless ($CONF->{gunzip}){
+    return $file,0,"gunzip command location not defined - aborting";
+  }
+
+  log "Gunzipping $file";
+
+  my $ret = system($CONF->{gunzip},$file);
+
+  if ($ret){
+    return $file,0,"Error: gunzip $file failed: $!";
+  }
+  else {
+    $file =~ s/\.gz$//i;
+    return $file,1;
+  }
+
+}
+
+sub zip {
+
+  my $file = shift;
+  my $min_size_mb = shift;
+
+  if ($file =~ /\.zip($|\.\w)/i){
+    log "Skipping zip on $file - suffix indicates already zip'd file";
+    return $file,-1;
+  }
+
+  if ($min_size_mb){
+    my $file_size_mb = (stat $file)[7] || 0;
+    $file_size_mb = sprintf("%.2f", ($file_size_mb/1024)/1024) if $file_size_mb;
+
+    if ($file_size_mb < $min_size_mb){
+      log "Skipping zip on $file - file size ${file_size_mb}MB is less than threshold of ${min_size_mb}MB";
+      return $file,-1;
+    }
+  }
+
+  unless ($CONF->{zip}){
+    return $file,0,"zip command location not defined - aborting";
+  }
+
+  log "Zipping $file";
+
+  my $ret = system($CONF->{zip},'-b',$CURRENT_DIR->{processed_dir},'-q','-j','-r',"$file.zip",$file);
+
+  if ($ret){
+    return $file,0,"Error: zip $file failed: $!";
+  }
+  else {
+    unless (unlink $file){
+      return $file,0,"Error: unlink $file failed: $!";
+    }
+    else {
+      return "$file.zip",1;
+    }
+  }
+
+}
+
+sub unzip_single_member {
+
+  my $file = shift;  
+
+  if ($file !~ /\.zip$/i){
+    log "Skipping unzip on $file - suffix indicates not zip file";
+    return $file,-1;
+  }
+
+  unless ($CONF->{gunzip}){
+    return $file,0,"unzip command location not defined (uses gunzip) - aborting";
+  }
+
+  log "Unzipping $file";
+
+  my $ret = system($CONF->{gunzip},'-S','.zip',$file);
+  if ($ret){
+    return $file,0,"Error: unzip $file failed: $!";
+  }
+  else {
+    $file =~ s/\.zip$//i;
+    return $file,1;
+  }
+
+}
+
+sub unzip {
+
+  my $file = shift;
+  my $dir  = shift || "$CURRENT_ID->{home}/$CURRENT_DIR->{dirname}";
+  my $no_rm = shift;
+
+  if ($file !~ /\.zip$/i){
+    log "Skipping unzip on $file - suffix indicates not zip file";
+    return $file,-1;
+  }
+
+  unless ($CONF->{unzip}){
+    return $file,0,"unzip command location not defined - aborting";
+  }
+
+  log "Unzipping $file to $dir";
+
+  my $ret = system($CONF->{unzip},'-qq','-o','-d',$dir,$file);
+
+  if ($ret){
+
+    return $file,0,"Error: unzip $file failed: $!";
+
+  }
+  else {
+
+    unless ($no_rm){
+
+       log "Unlinking $file after successfull unzip";
+
+       unless (unlink $file){
+         return $file,0,"Error: unlink $file failed: $!";
+       }
+       else {
+         return '',1;
+       }
+
+    }
+    else {
+    
+      return $file,1;
+
+    }
+
+  }
+
+}
+
+sub pgp_encrypt {
+
+  my $file = shift;
+  my $key  = shift;
+
+  if ($file =~ /(\.pgp|\.gpg)($|\.\w)/i){
+    log "Skipping PGP encrypt on $file - suffix indicates already encrypted";
+    return $file,-1;
+  }
+
+  my $cmd;
+
+  if ((! exists($CONF->{pgp})) || ! $CONF->{pgp}) {
+    $CONF->{pgp} = 'gpg';
+  }
+
+  $cmd = "/usr/bin/sh -c '" . $CONF->{pgp} . " --batch --yes --encrypt --user $key --output $file.pgp --trust-model always $file 2>/dev/null'";
+
+  log "PGP encrypting: $cmd";
+
+  # -- do pgp encryption (can't use comma delimeters on this command for some reason??)
+  my $ret = system($cmd);
+
+  # -- check for errors
+  if ($ret){
+    return $file,0,"Error: 'PGP encrypt $file with $key' failed: $!";
+  }
+  else {
+    unless (unlink $file){
+      return $file,0,"Error: unlink $file failed: $!";
+    }
+    else {
+      # -- patch up file ownership
+      chown($USERID, $GROUPID, "$file.pgp") or warn "Can't chown $USERID, $GROUPID, $file.pgp";
+      return "$file.pgp",1;
+    }
+  }
+
+}
+
+sub pgp_decrypt {
+
+  my $file = shift;
+
+  if ($file !~ /(\.pgp$|\.gpg$)/i){
+    log "Skipping PGP decrypt on $file - suffix indicates not a pgp file";
+    return $file,-1;
+  }
+
+  unless ($CONF->{pgp}){
+    return $file,0,"pgp command location not defined - aborting";
+  }
+
+  log "PGP decrypting $file";
+
+  # -- do pgp decryption (can't use comma delimeters on this command for some reason??)
+  my $ret = system("$CONF->{pgp} --info quiet --decrypt --overwrite --passphrase $CONF->{pgp_passphrase} $file 2>/dev/null");
+
+  # -- check for errors
+  if ($ret){
+    return $file,0,"Error: decrypt $file failed: $!";
+  }
+  else {
+    unless (unlink $file){
+      return $file,0,"Error: unlink $file failed: $!";
+    }
+    else {
+      $file =~ s/(\.pgp$|\.gpg$)//i;
+      # -- patch up file ownership
+      chown($USERID, $GROUPID, $file) or warn "Can't chown $USERID, $GROUPID, $file";
+      return $file,1;
+    }
+  }
+
+}
+
+sub lwp_get {
+
+  my $get = shift;
+  my $file_basename = basename($get->{url});
+
+  my $url = $get->{url};
+
+  log "Getting $get->{url} to local $CURRENT_ID->{home}/$get->{local_dir}/$file_basename";
+
+  # -- patch up url to include userid/password if defined
+  if (($get->{userid}) and ($get->{password})){
+    my ($proto, $address) = split /:\/\//,$get->{url};
+    $url = "$proto://$get->{userid}:$get->{password}\@$address";
+  }
+
+  # -- attempt to mirror url
+  my $ret = mirror($url, "$CURRENT_ID->{home}/$get->{local_dir}/$file_basename");
+
+  # -- check return code, anything other than 200 requires inspection
+  if ($ret != 200){
+
+    # -- http 404 and missing_ok is not an error
+    if (($ret == 404) and ($get->{url} =~ /https?:\/\//) and ($get->{missing_ok})){
+      log("Skipped $get->{url} for $CURRENT_ID->{userid} - 404 (missing_ok)"); 
+      return 0;
+    }
+
+    # -- http 304 is not an error
+    elsif (($ret == 304) and ($get->{url} =~ /https?:\/\//)){
+      log("Skipped $get->{url} for $CURRENT_ID->{userid} - 304 (not modified)"); 
+      return 0;
+    }
+
+    # -- ftp 401 and missing_ok is not an error
+    elsif (($ret == 401) and ($get->{url} =~ /ftp:\/\//) and ($get->{missing_ok})){
+      log("Skipped $get->{url} for $CURRENT_ID->{userid} - 401 (missing_ok)"); 
+      return 0;
+    }
+
+    # -- otherwise an error
+    warn "Getting $get->{url} failed: $ret, aborting";
+    return 0;
+
+  }
+
+  else {
+
+    return 1;
+
+  }
+
+}
+
+sub ftp_post {
+
+  my $file = shift;
+  my $post = shift;
+  my $noretry = shift || $post->{no_retry};
+  my $nowarn = shift;
+
+  my $ftp;
+
+  # -- get basename for later use
+  my $file_basename = ($post->{remote_name}) ? $post->{remote_name} : basename($file);
+
+  log "Posting $file to $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename";
+
+  # -- determine number of attempts
+  $post->{retry_attempts} = $post->{retry_attempts} ? $post->{retry_attempts} : $CONF->{retry_attempts} ? $CONF->{retry_attempts} : 3;
+
+  # -- setup ftp connection and login (may need passive to get past the firewall)
+  $post->{debug} = 0 if(!defined($post->{debug}) || $post->{debug} != 1);
+
+  *STDERR = *STDOUT if($post->{debug});
+
+  for my $try (1..($post->{retry_attempts}+1)){
+
+    eval { $ftp = Net::FTP->new($post->{host}, Debug=>$post->{debug}, Passive=>$post->{passive}, Port=>($post->{port} ? $post->{port} : 21)) };
+
+    if ($ftp){
+      log "Connection succeeds to $post->{proto}://$post->{userid}\@$post->{host}, $try time";
+      last;
+    }
+    else {
+      log "Connection ** FAILED ** to $post->{proto}://$post->{userid}\@$post->{host}, $try time: $@";
+      sleep(($post->{retry_seconds} ? $post->{retry_seconds} : $CONF->{retry_seconds} ? $CONF->{retry_seconds} : 60), $file) unless ($try == ($post->{retry_attempts}+1));
+    }
+  }
+
+  unless ($ftp){
+    warn "Fatal error while establishing connection to $post->{host}, aborting put of $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename";
+    return 0;
+  }
+
+  unless ($ftp->login($post->{userid}, $post->{password})){
+    warn "Can't login to $post->{host}, aborting put of $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename";
+    return 0;
+  }
+
+  # -- change the transfer mode if defined, else default to binary
+  if ((defined $post->{mode}) and (lc($post->{mode}) eq 'ascii')){
+    $ftp->ascii;
+  }
+  else {
+    $ftp->binary;
+  }
+
+  # -- change remote working directory if $post->{path} was specified
+  if ($post->{path}){
+    unless ($ftp->cwd($post->{path})){
+      warn "Can't cd to $post->{proto}://$post->{userid}\@$post->{host}/$post->{path} as $post->{userid}, aborting put of $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename";
+      return 0;
+    }
+  }
+
+  # -- now put the $file if we still have one - concurrency issues sometimes cause the file to be moved
+  my $remote_file;
+  if (-e $file){
+    
+    # -- sunique put
+    if ($post->{sunique}){
+      
+      eval { $remote_file = $ftp->put_unique($file) };
+      log "Uniquely put $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$remote_file" if $remote_file;
+
+    }
+    # -- regular put
+    else {
+    if($post->{remote_name}) {
+        eval { $remote_file = $ftp->put($file,$post->{remote_name}) };
+    } else {    
+        eval { $remote_file = $ftp->put($file) };
+    }
+    }
+
+  }
+  else {
+
+    log "Aborting post to $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename, file no longer exists";
+    $ftp->quit;
+    return 0;
+
+  }
+
+  # -- conditionally retry ONE more time if $remote_file is undefined and we haven't already retried
+  if ((! defined $remote_file) and (! $noretry)){
+
+    # -- set $retry_seconds, default to 60 seconds if not defined
+    my $retry_seconds = ($post->{retry_seconds} ? $post->{retry_seconds} : $CONF->{retry_seconds} ? $CONF->{retry_seconds} : 60);
+
+    # -- log failure, $retry_seconds
+    log "Post of $file to $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename has failed, waiting $retry_seconds seconds before second attempt";
+
+    # -- wait $retry_seconds before retrying
+    sleep($retry_seconds, $file);
+
+    # -- call ourself using the 'noretry' flag
+    log "Retrying post of $file to $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename";
+    $remote_file = ftp_post($file,$post,1,1);
+
+  }
+
+  # -- see if we have a file now
+  unless ($remote_file){
+
+    # -- warn appropriately 
+    unless ($nowarn){
+
+      if ($noretry){
+        
+        warn "Can't post to $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename, aborting" unless $nowarn;
+      }
+      else {
+
+        warn "Can't post to $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename after retry, aborting" unless $nowarn;
+
+        unless ($post->{no_failed_delete}){
+
+          log "Deleting $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename after failed post";
+          $ftp->delete($file_basename) or log "Can't delete $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename after failed post";
+
+        }
+    
+        # -- close the connection
+        $ftp->quit;
+
+      }
+
+    }
+
+    # -- return false
+    return 0;
+
+  }
+
+  # -- if we've gotten this far, close the connection and return true
+  $ftp->quit;
+  return 1;
+
+}
+
+sub sftp_post {
+
+  my $file = shift;
+  my $post = shift;
+  my $noretry = shift || $post->{no_retry};
+  my $nowarn = shift;
+
+  my $sftp;
+
+  # -- get basename for later use
+  my $file_basename = ($post->{remote_name}) ? $post->{remote_name} : basename($file);
+
+  log "Posting $file to $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename";
+
+  # -- determine number of attempts
+  $post->{retry_attempts} = $post->{retry_attempts} ? $post->{retry_attempts} : $CONF->{retry_attempts} ? $CONF->{retry_attempts} : 3;
+
+  # -- build path to ssh_private_key
+  my $ssh_private_key = ($post->{ssh_private_key} ? ($post->{ssh_private_key} =~ m|^/|) ? $post->{ssh_private_key} : "$CURRENT_DIR->{full_path}/$post->{ssh_private_key}" : undef);
+
+  if ((defined $post->{ssh_private_key}) and (! -e $ssh_private_key )){
+
+    warn "SSH private key file $ssh_private_key not found, aborting put of $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename";
+    return 0;
+
+  }
+
+  my %args = ( user=>$post->{userid}, password=>$post->{password} );
+  my @ssh_args = ( port=>($post->{port} ? $post->{port} : 22 ), protocol=>2, identity_files=>[ $ssh_private_key ], debug=>0 );
+  $args{ssh_args} = \@ssh_args;
+
+  my $exp;
+  my $logged_in = 0;
+  # -- set up sftp connection
+  for my $try (1..($post->{retry_attempts}+1)) {
+
+    my $cmd = '/usr/bin/sftp ';
+    $cmd .= " -oIdentityFile=$ssh_private_key" if($ssh_private_key);
+    $cmd .= " -oPort=$post->{port}" if($post->{port} && $post->{port} != 22);
+    $cmd .= " $post->{userid}\@$post->{host}";
+
+    $exp = Expect->spawn($cmd) || do {
+      warn "Fatal error while spawning SFTP command to $post->{host}, aborting put of $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename";
+      return 0;
+    };
+
+    if($post->{debug}) {
+      $exp->log_stdout(1);
+    }
+
+    if($opt_d) {
+      $exp->exp_internal(1);
+      $exp->log_file('/tmp/sftp_log');
+    } else {
+      $exp->log_stdout(0);
+    }
+
+    $exp->expect(60,
+      [ qr/continue connecting/ => sub { $exp->send("yes\n"); exp_continue } ],
+      [ qr/password/i => sub { $exp->send("$post->{password}\n"); exp_continue } ],
+      [ qr/sftp>/     => sub { $logged_in = 1 } ],
+      [ timeout       => sub { 
+        log "Connection ** FAILED ** to $post->{proto}://$post->{userid}\@$post->{host}, $try time: $@";
+        sleep(($post->{retry_seconds} ? $post->{retry_seconds} : $CONF->{retry_seconds} ? $CONF->{retry_seconds} : 60), $file) unless ($try == ($post->{retry_attempts}+1));
+      }]
+    );
+
+    last if($logged_in);
+  }
+
+  unless($logged_in) {
+    my $localfile = $file;
+    warn "Fatal error while establishing connection to $post->{host}, aborting put of $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename";
+    $exp->send("quit\n");
+    return 0;
+  }
+
+  # -- make a $path for use with $sftp->ls, etc.
+  my $path = $post->{path} || '.';
+
+  # -- verify the remote path exists
+=pod
+  if ($path ne '.') {
+    $exp->send("ls $path\n");
+    if ($exp->expect(30,'No such file or directory')) {
+      warn "Target directory $post->{proto}://$post->{userid}\@$post->{host}/$post->{path} doesn't appear to exist, aborting put of $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename";
+      $exp->send("quit\n");
+      return 0;
+    }
+  }
+=cut
+  if($path ne '.') {
+    my $path_failed = 0;
+    $exp->send("ls $path\n");
+    $exp->expect(3600,
+      [ qr/No such file or directory/ => sub { $path_failed = 1 } ],
+      [ qr/not found/ => sub { $path_failed = 1 } ],
+      [ qr/sftp>/ => sub { $path_failed = 0 } ]
+    );
+    if($path_failed) {
+      my $message = "Target directory $post->{proto}://$post->{userid}\@$post->{host}/$post->{path} doesn't appear to exist, aborting put of $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename";
+
+      if ($nowarn) {
+        log $message;
+      } else {
+        warn $message;
+      }
+
+      $exp->send("quit\n");
+      return 0;
+    }
+  }
+
+  my $put_ret = 0;
+  $exp->send("pwd\n");
+  unless($exp->expect(30,'sftp>')) {
+    log "Host $post->{userid}\@$post->{host} has stopped responding. Retrying...\n";
+    $put_ret = 1;
+  }
+
+  # -- now put the $file if we still have one - concurrency issues sometimes cause the file to be moved
+  # -- sftp->put is braindead - no way to verify success, have to stat below
+  # -- can't retry sftp->put since even in eval, it dies before we can catch it
+  unless($put_ret) {
+    if (-e $file) {
+      $exp->send("put $file $path/$file_basename\n");
+      $exp->expect(86400,
+        [ qr/No such file/ => sub { $put_ret = 1 } ],
+        [ qr/Uploaded/ => sub { $put_ret = 0 } ],
+        [ qr/sftp>/ => sub { $put_ret = 0 } ]
+      );
+    } else {
+      log "Aborting post to $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename, file no longer exists";
+      $exp->send("quit\n");
+      return 0;
+    }
+  }
+
+  # -- conditionally retry ONE more time if $put_ret is not defined or not equal to 0 and we haven't already retried once
+  if (((! defined $put_ret) or ($put_ret != 0)) and (! $noretry)) {
+
+    # -- set $retry_seconds, default to 60 seconds if not defined
+    my $retry_seconds = ($post->{retry_seconds} ? $post->{retry_seconds} : $CONF->{retry_seconds} ? $CONF->{retry_seconds} : 60);
+
+    # -- log failure, $retry_seconds
+    log "Post of $file to $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename has failed, waiting $retry_seconds seconds before second attempt";
+
+    # -- wait $retry_seconds before retrying
+    sleep($retry_seconds, $file);
+
+    log "Retrying post of $file to $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename";
+    my $ret = sftp_post($file,$post,1,1);
+
+    unless ($ret) {
+
+      warn "Can't post to $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename after retry, aborting" unless $nowarn;
+
+      unless ($post->{no_failed_delete}){
+
+        log "Deleting $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename after failed post";
+        #my $ret = $sftp->do_remove("$path/$file_basename");
+        $exp->send("dele $path/$file_basename\n");
+        log "Can't delete $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename after failed post " if $ret;
+
+      }
+      
+    $exp->send("quit\n");
+      return 0;
+
+    }
+
+  }
+
+  # -- failed on retry
+  # elsif (($local_size != $remote_size) and ($noretry)){
+  elsif (((! defined $put_ret) or ($put_ret != 0)) and ($noretry)){
+
+    warn "Can't post to $post->{proto}://$post->{userid}\@$post->{host}/$post->{path}/$file_basename, aborting" unless $nowarn;
+  $exp->send("quit\n");
+    return 0;
+
+  }
+
+  # -- ADDED CODE TO VERIFY posted filesize to local
+  my $remote_match = 0;
+  my $local_size = -s $file || 0;
+
+  # -- account for servers that may or may not recognize ./$filename for ls
+  if ($path eq '.') {
+    $exp->send("ls -l $file_basename\n");
+    $exp->expect(10, [ qr/\b($local_size)\s+(\S+\s+){3}($file_basename)[\s\r\n]*$/m => sub { $remote_match = 1 } ]);
+  } else {
+    $exp->send("ls -l $path/$file_basename\n");
+    $exp->expect(10, [ qr/\b($local_size)\s+(\S+\s+){3}($path\/$file_basename)[\s\r\n]*$/m => sub { $remote_match = 1 } ]);
+  }
+  if ($remote_match == 1) {
+    log "Successfully validated remote filesize to local"
+  } else {                                                                                                                      
+    warn "Remote filesize does not match local for $post->{path}/$file_basename, aborting" unless $nowarn;
+  }
+
+  $exp->send("quit\n");
+
+  # -- return 0 or 1 based on remote filesize verification                                                                        
+  return $remote_match;
+
+} ## - end of sub sftp_post
+
+sub ftp_get {
+
+  my $get = shift;
+  my $retry_seconds = $get->{retry_seconds} || $CONF->{retry_seconds} || 60;
+  my $local_dir = "$CURRENT_ID->{home}/$CURRENT_DIR->{dirname}";
+  $local_dir =~ s/\/$//;
+
+  log "Getting $get->{url} to $local_dir";
+
+  my $ftp;
+
+  # -- determine number of attempts
+  $get->{retry_attempts} = $get->{retry_attempts} || $CONF->{retry_attempts} || 3;
+
+  # -- setup ftp connection and login (may need passive to get past the firewall)
+  for my $try (1..($get->{retry_attempts}+1)){
+
+    eval { $ftp = Net::FTP->new($get->{host}, Passive=>$get->{passive}, Port=>($get->{port} ? $get->{port} : 21)) };
+
+    if ($ftp){
+      log "Connection succeeds to $get->{proto}://$get->{userid}\@$get->{host}, $try time";
+      last;
+    }
+    else {
+      log "Connection ** FAILED ** to $get->{proto}://$get->{userid}\@$get->{host}, $try time: $@";
+      sleep($retry_seconds, $local_dir) unless ($try == ($get->{retry_attempts}+1));
+    }
+  }
+
+  unless ($ftp){
+    warn "Fatal error while establishing connection to $get->{host}, aborting get of $get->{url}";
+    return 0;
+  }
+
+  unless ($ftp->login($get->{userid}, $get->{password})){
+    warn "Can't login to $get->{host}, aborting get of $get->{url}";
+    return 0;
+  }
+
+  # -- change the transfer mode if defined, else default to binary
+  if ((defined $get->{mode}) and (lc($get->{mode}) eq 'ascii')){
+    $ftp->ascii;
+  }
+  else {
+    $ftp->binary;
+  }
+
+  # -- change remote working directory if $get->{path} was specified
+  if ($get->{path}){
+    unless ($ftp->cwd($get->{path})){
+      warn "Can't cd to $get->{url} as $get->{userid}, aborting get";
+      return 0;
+    }
+  }
+
+  # -- list the remote files in path
+  my @list = $ftp->ls();
+
+  # -- if no files were returned by remote host, log a message indicating so and return success
+  if (scalar @list == 0){
+
+    log "No files detected in $get->{url}";
+    return 1;
+
+  }
+
+  # -- define a hash to store file size info
+  my %file;
+
+  # -- now loop through the list of remote files getting/setting the remote size for each
+  for my $file (@list){
+
+    $file{$file}[0] = $ftp->size($file);
+
+  }
+
+  # -- sleep for $get->{stat_wait_seconds} or $CONF->{stat_wait_seconds} or 30 seconds
+  my $stat_wait_seconds = ($get->{stat_wait_seconds} or $CONF->{stat_wait_seconds} or 30);
+  log "Sleeping $stat_wait_seconds seconds to stat $get->{url} again";
+  sleep($stat_wait_seconds,$local_dir);
+
+  # -- now loop through the list of remote files *AGAIN* getting/setting the remote size for each
+  for my $file (@list) {
+
+    $file{$file}[1] = $ftp->size($file);
+
+  }
+
+  # -- define new array to store valid files according to stat
+  my @clean_list;
+
+  # -- compare size values for each from from each run
+  for my $file (sort keys %file){
+
+    # -- if size has changed log and goto the next file
+    if ($file{$file}->[0] != $file{$file}->[1]){
+
+      log "$file has changed size during $stat_wait_seconds second stat wait, removing it from list of available files from $get->{url}";
+      next;
+
+    }
+    # -- else we consider it good to process
+    else {
+
+      push @clean_list, $file;
+
+    }
+
+  }
+
+  # -- overlay the sanitized list onto the original
+  @list = @clean_list;
+
+  # -- set a counter
+  my $count = 0;
+
+  # -- now loop through the list of remote files
+  for my $file (@list){
+
+    # -- save the file name returned from server and use the basename of file
+    # -- (some ftp servers might return full path name)
+    my $server_file = $file;
+    $file = basename($file);
+
+    # -- match against a pattern if defined
+    if ($get->{remote_match}){
+
+      next unless $file =~ /$get->{remote_match}/;
+
+    }
+  
+    # -- define $remote_file to catch $ftp->get() return
+    my $remote_file;
+
+    # -- now get the $file(s)
+    eval { $remote_file = $ftp->get($file,"$local_dir/$file") };
+
+    my @remote_size = $ftp->dir($file);
+    my $remote_size = $remote_size[0];
+    $remote_size =~ s/^\S+\s+\S+\s+\S+\s+\S+\s+(\d+).*$/$1/; 
+
+    # -- dummy up $local_size in the event $file is missing
+    my $local_size = (stat "$local_dir/$file")[7] || 0;
+
+    # -- conditionally retry ONE more time if $remote_file is undefined and we haven't already retried
+    unless (defined $remote_file){
+
+      # -- log failure, $retry_seconds
+      log "Get of $file from $get->{url}/$file has failed, waiting $retry_seconds seconds before second attempt";
+
+      # -- wait $retry_seconds before retrying
+      sleep($retry_seconds, $local_dir);
+
+      # -- try again
+      log "Retrying get of $get->{url}/$file";
+      eval { $remote_file = $ftp->get($file,"$local_dir/$file") };
+      $local_size = (stat "$local_dir/$file")[7] || 0;
+
+    }
+    elsif ($local_size != $remote_size){
+
+      # -- log mismatch size failure, $retry_seconds
+      log "Get of $file from $get->{url}/$file resulted in file size mismatch local=$local_size, remote=$remote_size, waiting $retry_seconds seconds before second attempt";
+
+      # -- wait $retry_seconds before retrying
+      sleep($retry_seconds, $local_dir);
+
+      # -- try again
+      log "Retrying get of $get->{url}/$file";
+      eval { $remote_file = $ftp->get($file,"$local_dir/$file") };
+      $local_size = (stat "$local_dir/$file")[7] || 0;
+
+    }  
+
+    # -- see if we have a file now
+    unless (defined $remote_file){
+
+      # -- warn appropriately 
+      warn "Can't get $get->{url} after retry, aborting";
+
+      # -- unlink local suspect file if exists
+      if (-e "$local_dir/$file"){
+        unlink "$local_dir/$file" or warn "Can't remove $local_dir/$file after failed get: $!";
+      }
+
+    }
+    elsif ($local_size != $remote_size){
+
+      # -- warn about size mismatch
+      warn "Can't get $get->{url}/$file after retry - size mismatch (local=$local_size, remote=$remote_file, aborting";
+
+      # -- unlink local suspect file if exists
+      if (-e "$local_dir/$file"){
+        unlink "$local_dir/$file" or warn "Can't remove $local_dir/$file after size mismatch: $!";
+      }
+
+    }
+    else {
+
+      $CURRENT_FILE = $file;
+      notify("Successfully got $get->{url}/$file");
+
+      unless ((defined $get->{remote_delete}) and ($get->{remote_delete} == 0)){
+        
+        log "Deleting $get->{url}/$file after successful get";
+        $ftp->delete($server_file) or warn "Can't delete $get->{url}/$file";
+
+      }
+    }
+
+    # -- increment the counter
+    $count++;
+
+  }
+
+  # -- log a message indicating no files were found
+  log "No files".($get->{remote_match} ? " matching '".$get->{remote_match}."'" : '') ." detected in $get->{url}" if ($count == 0);
+
+  # -- if we've gotten this far, return true
+  return 1;
+
+}
+
+sub sftp_get {
+
+  my $get = shift;
+  my $retry_seconds = $get->{retry_seconds} || $CONF->{retry_seconds} || 60;
+  my $local_dir = "$CURRENT_ID->{home}/$CURRENT_DIR->{dirname}";
+  $local_dir =~ s/\/$//;
+
+  log "Getting $get->{url} to $local_dir";
+
+  my $sftp;
+
+  # -- determine number of attempts
+  $get->{retry_attempts} = $get->{retry_attempts} || $CONF->{retry_attempts} || 3;
+
+  # -- build path to ssh_private_key
+  my $ssh_private_key = ($get->{ssh_private_key} ? ($get->{ssh_private_key} =~ m|^/|) ? $get->{ssh_private_key} : "$CURRENT_DIR->{full_path}/$get->{ssh_private_key}" : undef);
+
+  if ((defined $get->{ssh_private_key}) and (! -e $ssh_private_key )){
+
+    warn "SSH private key file $ssh_private_key not found, aborting get $get->{url}";
+    return 0;
+
+  }
+
+  my %args = ( user=>$get->{userid}, password=>$get->{password} );
+  my @ssh_args = ( port=>($get->{port} ? $get->{port} : 22 ), protocol=>2, identity_files=>[ $ssh_private_key ], debug=>0 );
+  $args{ssh_args} = \@ssh_args;
+
+  # -- setup sftp connection
+  for my $try (1..($get->{retry_attempts}+1)){
+
+    eval { $sftp = Net::SFTP->new($get->{host}, %args) };
+
+    if ($sftp){
+      log "Connection succeeds to $get->{proto}://$get->{userid}\@$get->{host}, $try time";
+      last;
+    }
+    else {
+      log "Connection ** FAILED ** to $get->{proto}://$get->{userid}\@$get->{host}, $try time: $@";
+      sleep($retry_seconds, $local_dir) unless ($try == ($get->{retry_attempts}+1));
+    }
+  }
+
+  unless ($sftp){
+    warn "Fatal error while establishing connection to $get->{host}, aborting get of $get->{url}";
+    return 0;
+  }
+
+  # -- make a $path for use with $sftp->ls, etc.
+  my $path = $get->{path} || '.';
+
+  # -- verify the remote path exists
+  if ($path ne '.'){
+    unless ($sftp->ls($path)){
+      warn "Target directory $get->{url} doesn't appear to exist, aborting get";
+      return 0;
+    }
+  }
+
+  # -- define array to store files
+  my @list;
+  my @clean_list;
+  my $remote_file;
+
+  # -- now list the files in path
+  @list = $sftp->ls($path);
+
+  # -- sftp returns always . and .. which aren't valid "files", clean them out of the array
+  for my $file (@list){
+
+    next if ($file->{filename} =~ /^(\.|\.\.)$/);
+    push @clean_list, $file;
+
+  }
+
+  # -- overlay the sanitized list onto the original
+  @list = @clean_list;
+
+  # -- reset array clean_list array for later use
+  @clean_list = ();
+
+  # -- if no files were returned by remote host, log a message indicating so and return success
+  if (scalar @list == 0){
+
+    log "No files detected in $get->{url}";
+    return 1;
+
+  }
+
+  # -- define a hash to store file size array info
+  my %file;
+
+  # -- now loop through the list of remote files getting/setting the remote size for each
+  for my $file (@list){
+
+    $file{$file->{filename}}[0] = $file->{longname};
+    $file{$file->{filename}}[0] =~ s/^\S+\s+\S+\s+\S+\s+\S+\s+(\d+).*$/$1/; 
+
+  }
+
+  # -- sleep for $get->{stat_wait_seconds} or $CONF->{stat_wait_seconds} or 30 seconds
+  my $stat_wait_seconds = ($get->{stat_wait_seconds} or $CONF->{stat_wait_seconds} or 30);
+  log "Sleeping $stat_wait_seconds seconds to stat $get->{url} again";
+  sleep($stat_wait_seconds,$local_dir);
+
+  # -- list the files in path *AGAIN*
+  @list = $sftp->ls($path);
+
+  # -- sftp returns always . and .. which aren't valid "files", clean them out of the array
+  for my $file (@list){
+
+    next if ($file->{filename} =~ /^(\.|\.\.)$/);
+    push @clean_list, $file;
+
+  }
+
+  # -- overlay the sanitized list onto the original
+  @list = @clean_list;
+
+  # -- reset array clean_list array to store only valid files according to stat below
+  @clean_list = ();
+
+  # -- now loop through the list of remote files *AGAIN* getting/setting the remote size for each
+  for my $file (@list){
+
+    # -- ignore any files that weren't listed the first time
+    if (defined $file{$file->{filename}}[0]){
+
+      $file{$file->{filename}}[1] = $file->{longname};
+      $file{$file->{filename}}[1] =~ s/^\S+\s+\S+\s+\S+\s+\S+\s+(\d+).*$/$1/; 
+    }
+    else {
+
+      log "Found $file->{filename} on second stat pass, but not on first - skipping";
+
+    }
+
+  }
+
+  # -- compare size values for each from from each run
+  for my $file (@list){
+
+    # -- if size is defined for both runs and has changed, log and goto the next file
+    if ((defined $file{$file->{filename}}[0]) and (defined $file{$file->{filename}}[1])){
+
+      if ($file{$file->{filename}}[0] != $file{$file->{filename}}[1]){
+
+        log "$file->{filename} has changed size during $stat_wait_seconds second stat wait, removing it from list of available files from $get->{url}";
+        next;
+
+      }
+      # -- else we consider it good to process
+      else {
+
+        push @clean_list, $file;
+
+      }
+
+    }
+
+  }
+
+  # -- overlay the sanitized list onto the original
+  @list = @clean_list;
+
+  # -- set a counter
+  my $count = 0;
+
+  # -- now loop through the list of remote files
+  for my $file (@list){
+ 
+    # -- store ref to detail hash info for later inspection
+    my $file_detail = $file;
+
+    # -- make $file a plan scalar for use below
+    $file = $file->{filename};
+
+    # -- save the file name returned from server and use the basename of file
+    # -- (some sftp servers might return full path name)
+    $file = basename($file);
+
+    # -- match against a pattern if defined
+    if ($get->{remote_match}){
+
+      next unless $file =~ /$get->{remote_match}/;
+
+    }
+
+    # -- now get the $file(s)
+    eval { $remote_file = $sftp->get("$path/$file","$local_dir/$file") };
+
+    # -- dummy up $local_size in the event $file is missing
+    my $local_size = (stat "$local_dir/$file")[7] || 0;
+  
+    # -- conditionally retry ONE more time if $remote_file is undefined and we haven't already retried
+    unless (defined $remote_file){
+
+      # -- log failure, $retry_seconds
+      log "Get of $file from $get->{url}/$file has failed, waiting $retry_seconds seconds before second attempt";
+
+      # -- wait $retry_seconds before retrying
+      sleep($retry_seconds, $local_dir);
+
+      # -- try again
+      log "Retrying get of $get->{url}/$file";
+      eval { $remote_file = $sftp->get("$path/$file","$local_dir/$file") };
+      $local_size = (stat "$local_dir/$file")[7] || 0;
+
+    }
+    elsif ($local_size != $file{$file}[0]){
+
+      # -- log mismatch size failure, $retry_seconds
+      log "Get of $file from $get->{url}/$file resulted in file size mismatch local=$local_size, remote=$file{$file}[0], waiting $retry_seconds seconds before second attempt";
+
+      # -- wait $retry_seconds before retrying
+      sleep($retry_seconds, $local_dir);
+
+      # -- try again
+      log "Retrying get of $get->{url}/$file";
+      eval { $remote_file = $sftp->get("$path/$file","$local_dir/$file") };
+      $local_size = (stat "$local_dir/$file")[7] || 0;
+
+    }
+
+    # -- see if we have a file now
+    unless (defined $remote_file){
+
+      # -- warn appropriately 
+      warn "Can't get $get->{url}/$file after retry, aborting";
+
+      # -- unlink local suspect file if exists
+      if (-e "$local_dir/$file"){
+        unlink "$local_dir/$file" or warn "Can't remove $local_dir/$file after failed get: $!";
+      }
+
+    }
+    elsif ($local_size != $file{$file}[0]){
+
+      # -- warn about size mismatch
+      warn "Can't get $get->{url}/$file after retry - size mismatch (local=$local_size, remote=$file{$file}[0]), aborting";
+
+      # -- unlink local suspect file if exists
+      if (-e "$local_dir/$file"){
+        unlink "$local_dir/$file" or warn "Can't remove $local_dir/$file after size mismatch: $!";
+      }
+
+    }
+    else {
+
+      $CURRENT_FILE = $file;
+      notify("Successfully got $get->{url}/$file");
+
+      unless ((defined $get->{remote_delete}) and ($get->{remote_delete} == 0)){
+        
+        # -- delete the remote noting the error
+        log "Deleting $get->{url}/$file after successful get";
+        my $ret = $sftp->do_remove("$path/$file");
+        warn("Can't delete $get->{url}/$file: ". Net::SFTP::Util::fx2txt($ret)) if $ret;
+
+      }
+    }
+
+    # -- increment the counter
+    $count++;
+
+  }
+
+  # -- log a message indicating no files were found
+  log "No files".($get->{remote_match} ? " matching '".$get->{remote_match}."'" : '') ." detected in $get->{url}" if ($count == 0);
+
+  # -- if we've gotten this far, return true
+  return 1;
+
+}
+
+sub log {
+
+  my $message = shift;
+
+  no warnings 'uninitialized';
+
+  # -- remove extraneous path info from message since path isn't always defined
+  $message =~ s/(\w)\/\/(\w)/$1\/$2/ if $message;
+
+  # -- print to terminal if -l option
+  print scalar localtime," [$CURRENT_ID->{userid}". ($CURRENT_FILE ? " $CURRENT_FILE " : " "). "$$] ",$message,"\n" if $opt_l;
+
+  # -- print to regular logfile (if configured)
+  print scalar localtime," [$CURRENT_ID->{userid}". ($CURRENT_FILE ? " $CURRENT_FILE " : " "). "$$] ",$message,"\n" if $CONF->{logfile};
+
+  # -- print to syslog (if configured)
+  $SYSLOG->{ident} = "$CONF->{syslog}->{ident}\[$$\]" if $SYSLOG;
+  $SYSLOG->log( level => 'info', message => ($CURRENT_ID->{userid} ? $CURRENT_ID->{userid} : '') . ($CURRENT_FILE ? " $CURRENT_FILE - " : " - ") . ($message ? $message : '')) if $SYSLOG;
+
+}
+
+sub notify {
+
+  my $message = shift;
+
+  # -- remove extraneous path info from message since path isn't always defined
+  $message =~ s/(\w)\/\/(\w)/$1\/$2/ if $message;
+
+  # -- replace $FILE with $CURRENT_FILE
+  $message =~ s/\$FILE/$CURRENT_FILE/g if $message;
+
+  # -- determine who to notify
+  my $notify;
+
+  if (($CURRENT_POST->{notify} and $CURRENT_POST->{notify_on_success}) or
+      ($CURRENT_OP->{notify}   and $CURRENT_OP->{notify_on_success}  ) or
+      ($CURRENT_DIR->{notify}  and $CURRENT_DIR->{notify_on_success} ) or
+      ($CURRENT_ID->{notify}   and $CURRENT_ID->{notify_on_success}  ) or
+      ($CONF->{notify}         and $CONF->{notify_on_success}        )) {
+
+     $notify  = ($CURRENT_POST->{notify} and $CURRENT_POST->{notify_on_success}) 
+              ?  $CURRENT_POST->{notify} : '';
+     $notify .= ($CURRENT_OP->{notify}   and $CURRENT_OP->{notify_on_success}  )
+              ? ($notify ? ','.$CURRENT_OP->{notify} : $CURRENT_OP->{notify})    : '';
+     $notify .= ($CURRENT_DIR->{notify}  and $CURRENT_DIR->{notify_on_success} )
+              ? ($notify ? ','.$CURRENT_DIR->{notify} : $CURRENT_DIR->{notify})  : '';
+     $notify .= ($CURRENT_ID->{notify}   and $CURRENT_ID->{notify_on_success}  )
+              ? ($notify ? ','.$CURRENT_ID->{notify}  : $CURRENT_ID->{notify})   : '';
+     $notify .= ($CONF->{notify}         and $CONF->{notify_on_success}        )
+              ? ($notify ? ','.$CONF->{notify}        : $CONF->{notify})         : '';
+
+     # log "notify: $notify";
+  }
+
+  # -- determine who to notify cc
+  my $notify_cc;
+
+  if (($CURRENT_POST->{notify_cc} and $CURRENT_POST->{notify_cc_on_success}) or
+      ($CURRENT_OP->{notify_cc}   and $CURRENT_OP->{notify_cc_on_success}  ) or
+      ($CURRENT_DIR->{notify_cc}  and $CURRENT_DIR->{notify_cc_on_success} ) or
+      ($CURRENT_ID->{notify_cc}   and $CURRENT_ID->{notify_cc_on_success}  ) or
+      ($CONF->{notify_cc}         and $CONF->{notify_cc_on_success}        )) {
+
+     $notify_cc  = ($CURRENT_POST->{notify_cc} and $CURRENT_POST->{notify_cc_on_success}) 
+              ?  $CURRENT_POST->{notify_cc} : '';
+     $notify_cc .= ($CURRENT_OP->{notify_cc}   and $CURRENT_OP->{notify_cc_on_success}  )
+              ? ($notify_cc ? ','.$CURRENT_OP->{notify_cc} : $CURRENT_OP->{notify_cc})    : '';
+     $notify_cc .= ($CURRENT_DIR->{notify_cc}  and $CURRENT_DIR->{notify_cc_on_success} )
+              ? ($notify_cc ? ','.$CURRENT_DIR->{notify_cc} : $CURRENT_DIR->{notify_cc})  : '';
+     $notify_cc .= ($CURRENT_ID->{notify_cc}   and $CURRENT_ID->{notify_cc_on_success}  )
+              ? ($notify_cc ? ','.$CURRENT_ID->{notify_cc}  : $CURRENT_ID->{notify_cc})   : '';
+     $notify_cc .= ($CONF->{notify_cc}         and $CONF->{notify_cc_on_success}        )
+              ? ($notify_cc ? ','.$CONF->{notify_cc}        : $CONF->{notify_cc})         : '';
+
+     # log "notify_cc: $notify_cc";
+  }
+
+  # -- determine who to notify bcc
+  my $notify_bcc;
+
+  if (($CURRENT_POST->{notify_bcc} and $CURRENT_POST->{notify_bcc_on_success}) or
+      ($CURRENT_OP->{notify_bcc}   and $CURRENT_OP->{notify_bcc_on_success}  ) or
+      ($CURRENT_DIR->{notify_bcc}  and $CURRENT_DIR->{notify_bcc_on_success} ) or
+      ($CURRENT_ID->{notify_bcc}   and $CURRENT_ID->{notify_bcc_on_success}  ) or
+      ($CONF->{notify_bcc}         and $CONF->{notify_bcc_on_success}        )) {
+
+     $notify_bcc  = ($CURRENT_POST->{notify_bcc} and $CURRENT_POST->{notify_bcc_on_success}) 
+              ?  $CURRENT_POST->{notify_bcc} : '';
+     $notify_bcc .= ($CURRENT_OP->{notify_bcc}   and $CURRENT_OP->{notify_bcc_on_success}  )
+              ? ($notify_bcc ? ','.$CURRENT_OP->{notify_bcc} : $CURRENT_OP->{notify_bcc})    : '';
+     $notify_bcc .= ($CURRENT_DIR->{notify_bcc}  and $CURRENT_DIR->{notify_bcc_on_success} )
+              ? ($notify_bcc ? ','.$CURRENT_DIR->{notify_bcc} : $CURRENT_DIR->{notify_bcc})  : '';
+     $notify_bcc .= ($CURRENT_ID->{notify_bcc}   and $CURRENT_ID->{notify_bcc_on_success}  )
+              ? ($notify_bcc ? ','.$CURRENT_ID->{notify_bcc}  : $CURRENT_ID->{notify_bcc})   : '';
+     $notify_bcc .= ($CONF->{notify_bcc}         and $CONF->{notify_bcc_on_success}        )
+              ? ($notify_bcc ? ','.$CONF->{notify_bcc}        : $CONF->{notify_bcc})         : '';
+
+     # log "notify_bcc: $notify_bcc";
+  }
+
+  # -- make sure we have someone to notify
+  unless (($notify) or ($notify_cc) or ($notify_bcc)){
+
+    log "$message - no confirmation message sent";
+    return;
+
+  }
+
+  # -- craft a message and send it to the recipients
+  my %mail = ( To => $notify,
+               Cc => $notify_cc,
+               Bcc => $notify_bcc,
+               From => "$CONF->{company} File Agent <$CONF->{admin}>",
+         smtp => $CONF->{smtp}, 
+               Subject=> "File Agent Results - $CURRENT_FILE - $CURRENT_ID->{userid}",
+               'X-filed-file' => $CURRENT_FILE,
+               'X-filed-success' => 1,
+               Message=> $message . (($CONF->{disclaimer}) ? "\n\n".$CONF->{disclaimer} : '') );
+
+  sendmail(%mail) or CORE::warn $Mail::Sendmail::error;
+
+  # -- build a log message of notified recipients
+  my $notifyed;
+  $notifyed  = $notify     ? ($notify                                 ) : '';
+  $notifyed .= $notify_cc  ? ($notifyed ? ",$notify_cc"  : $notify_cc ) : '';
+  $notifyed .= $notify_bcc ? ($notifyed ? ",$notify_bcc" : $notify_bcc) : '';
+
+  log "$message - confirmation message sent to $notifyed" if $notifyed;
+
+}
+
+sub warn {
+
+  my $message = shift;
+  my $fatal = shift;
+
+  # -- remove extraneous path info from message since path isn't always defined
+  $message =~ s/(\w)\/\/(\w)/$1\/$2/ if $message;
+
+  log $message;
+
+  my $warn;
+
+  if ($CURRENT_POST->{notify} or $CURRENT_OP->{notify} or $CURRENT_DIR->{notify} or $CURRENT_ID->{notify} or $CONF->{notify}){
+
+    $warn  = $CURRENT_POST->{notify} ? $CURRENT_POST->{notify} : '';
+    $warn .= $CURRENT_OP->{notify}   ? ($warn ? ','.$CURRENT_OP->{notify} : $CURRENT_OP->{notify})    : '';
+    $warn .= $CURRENT_DIR->{notify}  ? ($warn ? ','.$CURRENT_DIR->{notify} : $CURRENT_DIR->{notify})  : '';
+    $warn .= $CURRENT_ID->{notify}   ? ($warn ? ','.$CURRENT_ID->{notify}  : $CURRENT_ID->{notify})   : '';
+    $warn .= $CONF->{notify}         ? ($warn ? ','.$CONF->{notify}        : $CONF->{notify})         : '';
+
+    # log "warn: $warn";
+
+  }
+
+  my $warn_cc;
+
+  if ($CURRENT_POST->{notify_cc} or $CURRENT_OP->{notify_cc} or $CURRENT_DIR->{notify_cc} or $CURRENT_ID->{notify_cc} or $CONF->{notify_cc}){
+
+    $warn_cc  = $CURRENT_POST->{notify_cc} ? $CURRENT_POST->{notify_cc} : '';
+    $warn_cc .= $CURRENT_OP->{notify_cc}   ? ($warn_cc ? ','.$CURRENT_OP->{notify_cc}  : $CURRENT_OP->{notify_cc})   : '';
+    $warn_cc .= $CURRENT_DIR->{notify_cc}  ? ($warn_cc ? ','.$CURRENT_DIR->{notify_cc} : $CURRENT_DIR->{notify_cc})  : '';
+    $warn_cc .= $CURRENT_ID->{notify_cc}   ? ($warn_cc ? ','.$CURRENT_ID->{notify_cc}  : $CURRENT_ID->{notify_cc})   : '';
+    $warn_cc .= $CONF->{notify_cc}         ? ($warn_cc ? ','.$CONF->{notify_cc}        : $CONF->{notify_cc})         : '';
+
+    # log "warn_cc: $warn_cc";
+
+  }
+
+  my $warn_bcc;
+
+  if ($CURRENT_POST->{notify_bcc} or $CURRENT_OP->{notify_bcc} or $CURRENT_DIR->{notify_bcc} or $CURRENT_ID->{notify_bcc} or $CONF->{notify_bcc}){
+
+    $warn_bcc  = $CURRENT_POST->{notify_bcc} ? $CURRENT_POST->{notify_bcc} : '';
+    $warn_bcc .= $CURRENT_OP->{notify_bcc}  ? ($warn_bcc ? ','.$CURRENT_OP->{notify_bcc} : $CURRENT_OP->{notify_bcc})  : '';
+    $warn_bcc .= $CURRENT_DIR->{notify_bcc}  ? ($warn_bcc ? ','.$CURRENT_DIR->{notify_bcc} : $CURRENT_DIR->{notify_bcc})  : '';
+    $warn_bcc .= $CURRENT_ID->{notify_bcc}   ? ($warn_bcc ? ','.$CURRENT_ID->{notify_bcc}  : $CURRENT_ID->{notify_bcc})   : '';
+    $warn_bcc .= $CONF->{notify_bcc}         ? ($warn_bcc ? ','.$CONF->{notify_bcc}        : $CONF->{notify_bcc})         : '';
+
+    # log "warn_bcc: $warn_bcc";
+
+  }
+
+  ## v42 addition by adallas : new notify_failure tag to only send failure notifications
+  if (
+    $CURRENT_POST->{notify_failure} || 
+    $CURRENT_OP->{notify_failure} || 
+    $CURRENT_DIR->{notify_failure} || 
+    $CURRENT_ID->{notify_failure} || 
+    $CONF->{notify_failure}
+  ) {
+    $warn  = $CURRENT_POST->{notify_failure} ? $CURRENT_POST->{notify_failure} : '';
+    $warn .= $CURRENT_OP->{notify_failure}   ? ($warn ? ','.$CURRENT_OP->{notify_failure} : $CURRENT_OP->{notify_failure})    : '';
+    $warn .= $CURRENT_DIR->{notify_failure}  ? ($warn ? ','.$CURRENT_DIR->{notify_failure} : $CURRENT_DIR->{notify_failure})  : '';
+    $warn .= $CURRENT_ID->{notify_failure}   ? ($warn ? ','.$CURRENT_ID->{notify_failure}  : $CURRENT_ID->{notify_failure})   : '';
+    $warn .= $CONF->{notify_failure}         ? ($warn ? ','.$CONF->{notify_failure}        : $CONF->{notify_failure})         : '';
+  }
+
+  # -- make sure we have someone to warn
+  unless (($warn) or ($warn_cc) or ($warn_bcc)){
+    log "$message - no warning message sent";
+    return;
+
+  }
+
+  # -- now remove filed path info from the message to make it more sutiable for public consumption
+  $message =~ s/(at)*\s*$0\s*line*\s*\d*.*$//s if $message;
+
+  my $current_file = $CURRENT_FILE ? " $CURRENT_FILE" : '';
+  my $current_userid  = $CURRENT_ID->{userid} ? " for $CURRENT_ID->{userid}" : '';
+  $message = "While processing$current_file$current_userid:\n\n$message\n\nPlease contact $CONF->{company} to resolve this issue.\n\nThank you.";
+
+  # -- craft a message and send it
+  my %mail = ( To => $warn,
+               Cc => $warn_cc,
+               Bcc => $warn_bcc,
+               From => "$CONF->{company} File Agent <$CONF->{admin}>",
+         smtp => $CONF->{smtp}, 
+               Subject => "** File Agent Error Alert " . ($CURRENT_FILE ? "- $CURRENT_FILE " : '') .
+                                                         ($CURRENT_ID->{userid} ? "- $CURRENT_ID->{userid}" : '') .
+                                                         " **",
+               'X-Priority' => 1, # -- turns on red ! in outlook (high priority)
+               'X-filed-file' => $CURRENT_FILE,
+               'X-filed-success' => 0,
+               Message=> $message . (($CONF->{disclaimer}) ? "\n\n".$CONF->{disclaimer} : '') );
+
+  sendmail(%mail) or CORE::warn $Mail::Sendmail::error;
+
+  # -- build a log message of warned recipients
+  my $warned;
+  $warned  = $warn     ? ($warn                             ) : '';
+  $warned .= $warn_cc  ? ($warned ? ",$warn_cc"  : $warn_cc ) : '';
+  $warned .= $warn_bcc ? ($warned ? ",$warn_bcc" : $warn_bcc) : '';
+
+  log "Warning message sent to $warned" if $warned;
+
+  # -- exit with a non-zero status if it's $fatal, otherwise just return
+  if ($fatal){
+    exit 1;
+  }
+  else {
+    return;
+  }
+
+}
+
+sub sleep {
+
+  # -- special sleep holds file open to prevent duplicate processing while we sleep (again concurrency)
+  my $sec =  shift;
+  my $file = shift;
+  open SLEEP_FILE, $file or warn "Can't open $file for sleeping: $!";
+  CORE::sleep $sec;
+  close SLEEP_FILE;
+
+}
+
+
+sub die {
+
+  # -- die just invokes our warn with fatal flag set
+  warn $_[0],1
+
+}
+
+
+__END__
+
+=head1 NAME
+
+filed - A Perl script for batch file processing.
+
+=head1 SYNOPSIS
+
+filed [-stl] config.xml
+
+-s serial mode (no forking)
+
+-t test configuration file and exit
+
+-l log to terminal
+
+The config.xml format and options are described in detail below.
+
+=head1 DESCRIPTION
+
+Filed supports FTP and SFTP file transfer protocols for "posts" and "gets" along with these file operations: gzip, gunzip, zip, unzip, sh, PGP/GPG encrypt, PGP/GPG decrypt. The encrypt/decrypt commands require that *official* PGP software be used. FTP and SFTP protocols are supported via the Net::FTP and Net::SFTP modules which are bundled with the script for Linux deployments.
+
+Filed is configured through the use of an XML schema representing userid's, directories, operations, get, and post directives. A sample configuration appears below:
+
+    <filed>
+
+      <!-- general config info -->
+      <company>Your Company, Inc.</company>
+      <admin>admin@yourdomain.com</admin>
+      <notify_bcc>root@localhost</notify_bcc>
+      <notify_bcc_on_success>0</notify_bcc_on_success>
+      <disclaimer>This message is appended to all outgoing messages generated by filed</disclaimer>
+
+      <!-- command locations -->
+      <gzip>/usr/bin/gzip</gzip>
+      <gunzip>/usr/bin/gunzip</gunzip>
+      <zip>/usr/bin/zip</zip>
+      <pgp>/usr/local/bin/pgp</pgp>
+
+      <!-- pgp -->
+      <pgp_passphrase encrypted='1'>QA5AN0DyEaSenbHB7tKPjjNLJ4gZdV5hW5xvl62zYfaa8XUNyuriIDmM976PcRY6</pgp_passphrase>
+
+      <!-- queuing properties -->
+      <queue_polling_interval>1</queue_polling_interval>
+      <id_queue_size>5</id_queue_size>
+      <dir_queue_size>5</dir_queue_size>
+      <post_queue_size>5</post_queue_size>
+
+      <!-- logging -->
+      <syslog>
+        <min_level>info</min_level>
+        <ident>filed</ident>
+        <facility>local1</facility>
+        <socket>unix</socket>
+      </syslog>
+
+      <!-- below is an example of plain text logging -->
+      <logfile>/home/filed/log/filed.log</logfile>
+
+      <!-- connection properties -->
+      <retry_seconds>60</retry_seconds>
+      <retry_attempts>3</retry_attempts>
+
+      <!-- inuse properties -->
+      <inuse_wait_seconds>30</inuse_wait_seconds>
+
+      <inuse_ignore_match>
+        <process>^rsync</process>
+        <process>^tar</process>
+        <process>/bin/cat</process>
+        <process>^cat</process>
+      </inuse_ignore_match>
+
+      <!-- ignore -->
+      <ignore>
+        <file>.hidden</file>
+        <file>keep.txt</file>
+        <file>forever.txt</file>
+      </ignore>
+
+      <!-- ignore_match -->
+      <ignore_match>
+        <file>^\.</file> <!-- anything that starts with a . -->
+        <file>\.txt$</file> <!-- anything that ends with .txt -->
+        <file>skip</file> <!-- anything that contains skip -->
+      </ignore_match>
+
+      <!-- begin id's -->
+      <id>
+        <userid>mjordan</userid>
+        <home>/home/mjordan</home>
+
+        <!-- notification parameters -->
+        <notify>mjordan@nba.com</notify>
+        <notify_on_success>1</notify_on_success>
+        <notify_cc>user@someother.com</notify_cc>
+        <notify_cc_on_success>0</notify_cc_on_success>
+        <notify_bcc_on_success>1</notify_bcc_on_success>
+
+        <!-- fetch files from some other host -->        
+        <gets>
+          <get_queue_size>2</get_queue_size>
+          <get>
+            <url>http://www.bigcorp.com/your/file.txt</url>
+            <missing_ok>0</missing_ok>
+            <userid>joe</userid>
+            <password encrypted='1'>niMHAY4b05m4Bvw</password>
+            <local_dir>test</local_dir>
+          </get>
+        </gets>
+
+        <!-- list of local directories to process -->
+        <dirs>
+          <dir>
+            <dirname>outbound</dirname>
+            <processed_dir>.processed</processed_dir>
+            <processed_dir_retention_days>2</processed_dir_retention_days>
+            <ignore>
+              <file>salary.cap</file>
+              <file>ignorethis</file>
+              <file>another.txt</file>
+            </ignore>
+
+            <ignore_match>
+              <file>^skipper</file>
+            </ignore_match>
+
+            <match>
+              <!-- match files that start with s or end with .txt -->
+              <file>^s</file>
+              <file>.txt$</file>
+            </match>
+
+            <!-- list of operations to perform on each file -->
+            <ops>
+              <op>
+                <command>gzip</command>
+              </op>
+              <op>
+                <command>encrypt</command>
+                <key>your@publickey.com</key>
+              </op>
+            </ops>
+
+            <!-- list of sites to post each file -->
+            <posts>
+              <post_queue_size>2</post_queue_size>
+              <post>
+                <proto>ftp</proto>
+                <passive>1</passive>
+                <port>21</port>
+                <host>ftp.somedomain.com</host>
+                <userid>mjordan</userid>
+                <password encrypted>niMhay4B05m4BvwX</password>
+                <path>incoming</path>
+              </post>
+              <post>
+                <proto>sftp</proto>
+                <host>ftp.otherdomain.com</host>
+                <port>22</port>
+                <userid>idb000</userid>
+                <password>secret345</password>
+                <path></path>
+              </post>
+            </posts>
+
+            <!-- list of operations to perform on each file after posting -->
+            <post_ops>
+              <op>
+                <command>gzip</command>
+              </op>
+            </post_ops>
+
+          </dir>
+          <dir>
+            <dirname>other</dirname>
+            <processed_dir>.processed</processed_dir>
+            <processed_dir_retention_days>90</processed_dir_retention_days>
+            <ops>
+              <op>
+                <command>zip</command>
+              </op>
+              ...
+              ... more operations, post destinations, etc ...
+              ...
+          </dir>
+        </dirs>
+      </id>
+      <id>
+        <userid>lbird</userid>
+        <home>/home/lbird</home>
+        <notify>lbird@retirednow.com</notify>
+        <notify_on_success>0</notify_on_success>
+        <dirs>
+          <dir>
+          ... 
+          ... more operations, post destinations, etc ...
+          ...
+          </dir>
+          ...
+          ... more directories, etc ...
+          ...
+        </dirs>
+      </id>
+    </filed>
+
+The various XML tags are described in detail below:
+
+=head2 General Configuration
+
+These tags define basic properties that appear on email messages generated by filed.
+
+<company> - Appears on email messages.
+
+<admin> - Email address used in "from" address on email messages sent.
+
+<notify_bcc> - Email address to blind copy all warnings and notifications messages sent to users.  Warning and notification notify_bcc can be individually overridden at the <id> level.
+
+<disclaimer> - This text will appear at the bottom of all email messages.
+
+
+=head2 Command Locations
+
+These tags define the locations of the command line utilities used by filed.
+
+<gzip> - Location of the gzip command.
+
+<gunzip> - Location of the gunzip command.
+
+<zip> - Location of the zip command.
+
+<unzip> - Location of the unzip command.
+
+<pgp> - Location of the pgp command.
+
+
+=head2 PGP
+
+<pgp_passphrase> - The passphrase for decrypting files with the default key.  The value can be encrypted using the included encrypt script and adding the encrypt='1' attribute (e.g. <pgp_passphrase encrypt='1'>EnCrYpTeDvAuE</pgp_phassphrase>)
+
+<pgp_default_key> - The default key to be used with <failed_dir_encrypt>.
+
+=head2 Queuing Properties
+
+Filed uses the Proc::Queue module which has several options for controlling the behavior of forked processes.
+
+<queue_polling_interval> - Determines how frequently processes are polled for queuing statistics.  A default of one second is assumed if no value is provided.
+
+<id_queue_size> - Number of ID's that can be concurrently processed.  A default of 5 is assumed if no value is provided.
+
+<dir_queue_size> - Number of directories that can be concurrently processed under a given ID.  A default of 5 is assumed if no value is provided.
+
+<post_queue_size> - Number of posts that can be concurrently processed under a given ID.  A default of 5 is assumed if no value is provided.
+
+
+=head2 Logging
+
+Filed supports both plain text and syslog logging.  Both features can be run simultaneously if desired.  The syslog directives must appear in a <syslog> section and are:
+
+<min_level> - Minimum logging level for syslog.  Defaults to 'info'.
+
+<ident> - Value will be prepended to all messages in the syslog.  Defaults to 'filed'.
+
+<facility> - Type of program is doing the logging to the system log.  Defaults to 'local1'.
+
+<socket> - Type of socket to use for sending syslog messages.  Valid options are 'unix' or 'inet'.  Defaults to 'inet'.
+
+
+=head2 Connection Properties
+
+<retry_seconds> - The number of seconds to wait before retrying a connection.  Can be overridden at the <post> level.  Defaults to 60 seconds.
+
+<retry_attempts> - The number of times to retry a connection before giving up.  Can be overridden at the <post> level.  Defaults to 3.
+
+=head2 Inuse
+
+<inuse_wait_seconds> - The number of seconds to wait before checking file for concurrent usage by other processes. Defaults to 30 seconds.
+
+<inuse_ignore_match> - Processes can be globally ignored by placing entries in this list.
+
+<process> - Individual process names to be compared against.
+
+=head2 PID Hours
+
+<warn_hours_filed_pid> - Numeric value that indicates the number of hours a filed process can run before a warning is generated.  Intended to catch hung processes that block processing.  The default is 48 hours.
+
+=head2 Ignore
+
+Specific files can be globally ignored by filed by placing the file basename in an <ignore> section.  Directory specific <ignore> directives can also appear in <dir>.
+
+<file> - Name of file to be ignored.
+
+
+=head2 Ignore Match
+
+Files can also be globally ignored by filed by placing the file basename regex pattern in an <ignore_match> section.  Directory specific <ignore_match> directives can also appear in <dir>.
+
+<file> - Pattern of the file name to be ignored.
+
+=head2 Match
+
+Files can also be globally matched by filed by placing the file basename regex pattern in an <match> section.  Directory specific <match> directives can also appear in <dir>.
+
+<file> - Pattern of the file name to be matched.
+
+
+=head2 ID
+
+The <id> tag delineates directives for each user that filed will process.
+
+<userid> - The text user named (e.g. juser).  This user must exist on the host that is running filed so that file permissions can be maintained.
+
+<home> - Location of the users home directory.
+
+<notify> - Email address that filed should send messages to for this user.
+
+<notify_on_success> - A 1 or 0 value that determines if success messages are sent to the <notify> address.
+
+<notify_cc> - Email address that will be copied on messages sent by filed for this user.
+
+<notify_cc_on_success> - A 1 or 0 value that determines if success messages are sent to the <notify_cc> address.
+
+<notify_bcc_on_success> - A 1 or 0 value that determines if success messages are sent to the <notify_bcc> address.
+
+
+=head2 GET
+
+Filed can fetch remote files and store them locally using FTP and SFTP.
+
+<gets> - Defines a list of <get> directives for fetching files on remote hosts.
+
+<get_queue_size> - Overrides default <get_queue_size> for this <get> item.
+
+<get> - Defines a specific get operation.  Supports these directives:
+
+  <proto> - Defines the protocol to be used.  Valid values are ftp and sftp.
+
+  <passive> - A 1 or 0 value that determines if passive transfers should be used.  Default is 1.
+
+  <host> - The hostname or IP address of the system to get from.
+
+  <port> - Defines the port to be used.  Defaults to 21 for ftp and 22 for sftp.
+
+  <userid> - The userid to be used for this post.
+
+  <password> - The userid to be used for this post.  The value can be encrypted using the included encrypt script and adding the encrypt='1' attribute (e.g. <password encrypted='1'>ThIsIsEnCrYpTeD</password>).
+
+  <ssh_private_key> - When using sftp protocol, use this key file to authenticate.  This overrides any password value.  If value starts with a '/', path is taken as absolute.  Otherwise path is taken as relative to the current home/directory path.
+
+  <path> - Remote location to get files.
+
+  <remote_match> - Regular expression to match remote files against for retrieval.
+
+  <remote_delete> - A 1 or 0 value that determines if files should be deleted after successful retrieval.
+
+=head2 Directories
+
+Filed scans directories defined for each user and performs various local operations as defined for each directory in the <dirs> list.
+
+<dirs> - Defines a list of <dir> directives.
+
+<dir_queue_size> - Overrides default <dir_queue_size> for this <dir> item.
+
+<dir> - Defines a directory structure to process using these directives:
+
+  <no_dir_lock> - Overrides default behavior of "locking" the directory to prevent multiple filed processes from accessing files.
+
+  <dirname> - Name of the directory for this <dir> item.  This value is relative the the user's <home> defined above.
+
+  <processed_dir> - Name of the directory to store processed files.  Defaults to .processed in the current <dirname> directory.
+
+  <processed_dir_retention_days> - Determines the number of days files should be stored in the <processed_dir>.  If this tag is not defined, processed files will remain indefinitely.  This can be set globally to affect retention of <processed_dir> for all <userid>'s.
+
+  <processed_dir_timestamp> - A 1 or 0 value that determines if failed files should be timestamped.  Defaults to 0.  This can be set globally to affect timestamping of <processed_dir> for all <userid>'s.
+
+  <processed_dir_encrypt> - A 1 or 0 value that determines if failed files should be GPG encrypted with <pgp_default_key>.  Defaults to 0.  This can be set globally to affect encryption of <processed_dir> for all <userid>'s.
+
+  <failed_dir> - Name of the directory to store failed files.  Defaults to .failed in the current <dirname> directory.
+
+  <failed_dir_timestamp> - A 1 or 0 value that determines if failed files should be timestamped.  Defaults to 0.  This can be set globally to affect timestamping of <failed_dir> for all <userid>'s.
+
+  <failed_dir_encrypt> - A 1 or 0 value that determines if failed files should be GPG encrypted with <pgp_default_key>.  Defaults to 0.  This can be set globally to affect encryption of <failed_dir> for all <userid>'s.
+
+  <file_queue_size> - The number of files to process concurrently in a given directory.
+
+<ops> - Defines a list of operations to be performed on each file in the current directory to be executed before posting.
+
+<post_ops> - Defines a list of operations to be performed on each file in the current directory executed after posting.
+
+<op> - Defines a specific operation to be performed on each file in the current directory.
+
+  <continue_on_failure> - allows filed to continue processing additional <op> commands on failure. Normally, a command failure will cause all subsequent processing to be aborted and the next file to be processed.
+
+  <warn_on_skip> - Warning is genereated whenever the <op> is skipped.  Processing of continues.
+
+  <abort_on_skip> - Warning is genereated whenever the <op> is skipped and all additional processing is aborted.
+
+  <command> - Command to be run on each file in the current directory.
+
+  Possible values are: 
+
+    <sh> - Run a shell command.
+
+      <arg> - the command line to run.  Filename is fed as last argument.
+
+    <gzip> - Compress using gzip.
+
+      <min_mb> - Megabyte threshold over which gzip will be performed.  Files smaller than this value will not be gzipped.
+
+    <gunzip> Uncompress using gunzip.
+
+    <zip> - Compress using zip.
+      
+      <min_mb> - Megabyte threshold over which zip will be performed.  Files smaller than this value will not be zipped.
+
+    <unzip> - Uncompress using unzip.  Supports single and multi-member zip files using these options:
+
+      <destination> Location to unzip files.  Default is same directory as source zip file.
+
+      <keep_zip> - Keep the source zip file upon successfull unzip.  Default is to remove.
+
+    <unzip_single_member> - Uncompress single-member zip file like gzip does (transform zip file to unzipped version - eg. file.txt.zip -> file.txt)
+
+    <pgp_encrypt> - Encrypt using PGP.  Supports these options:
+
+      <key> - Determines which key should be used.  The key must exist on the keyring. 
+
+    <pgp_decrypt> - Decrypt using PGP.
+
+    <gpg_encrypt> - Encrypt using GPG. Supports these options:
+
+      <key> - Determines which key should be used.  The key must exist on the keyring. 
+
+      <armor> - Determines if the file should be ascii-armor escaped.
+
+      <sign> - Determines if the file should be signed with the default key.
+
+    <gpg_decrypt> - Decrypt using GPG.
+
+    <timestamp> - Timestamp a file name suffix in the form of: YYYYMMDD.HHMMSS
+
+    <cp> - Copy file to another location.  Soure permissions are maintained.  Supports these options:
+
+      <destination> - Location to copy destination.
+
+    <mv> - Move file to another location.  Soure permissions are maintained.  Supports these options:
+
+      <destination> - Location to move destination.
+
+    <rename_match> - Rename a file based on supplied regular expression.  $USERID, $GROUPID, and $FILE are replaced with current "real" variable values.  Supports these options:
+    
+      <search> - the pattern to search for (required)
+
+      <replace> - the pattern to replace with (required)
+
+      <no_global> - An optional 1 or 0 value that determines if the expression should be applied globally.  Defaults to 0. 
+
+    <mail> - Mail an attachment of the file.   Supports these options:
+
+      <to> Primary recipient
+
+      <cc> Carbon copy recipient
+
+      <bcc> Blind carbon copy recipient
+
+      <from> Spoof the from address as this value
+
+      <max_size_mb> File size limit in megabytes.  An error will be sent to <notify>, <notify_cc>, <notify_bcc> when files exceed this value.  Defaults to 10MB.
+
+    <noop> - No operation to be performed.  Always returns success.  Useful with <notify> when no processing is required.
+
+=head2 POST
+
+Filed can post local files to remote hosts.  Filed supports FTP and SFTP gets.
+
+<posts> - Defines a list of <post> directives for fetching files on remote hosts.
+
+<post_queue_size> - Overrides default <post_queue_size> for this <post> item.
+
+<post> - Defines a specific post operation.
+
+<proto> - Defines the protocol to be used.  Valid values are ftp and sftp.
+
+<passive> - A 1 or 0 value that determines if passive transfers should be used.  Default is 1.
+
+<sunique> - A 1 or 0 value that determines if sunique put should be used.  Foreign server dependent.  Default is 0.
+
+<host> - The fully qualified hostname of the system to post to.
+
+<port> - Defines the port to be used.  Defaults to 21 for ftp and 22 for sftp.
+
+<userid> - The userid to be used for this post.
+
+<password> - The userid to be used for this post.  The value can be encrypted using the included encrypt script and adding the encrypt='1' attribute (e.g. <password encrypted='1'>ThIsIsEnCrYpTeD</password>).
+
+<ssh_private_key> - When using sftp protocol, use this key file to authenticate.  This overrides any password value.  If value starts with a '/', path is taken as absolute.  Otherwise path is taken as relative to the current home/directory path.
+
+<path> - Remote location to store the posted file.
+
+<no_retry> - A 1 or 0 value that determines if post should be retried *one* additional time on error.
+
+<no_failed_delete> - A 1 or 0 value that determines if remote file should be deleted when post fails.  Default is 0 - will attempt to delete remote file on post fail.
+
+<trigger_file> - A 1 or 0 value that determines if a trigger file should be posted along with each file.  Default is 0 - no trigger file sent.
+
+<trigger_file_suffix> - If defined, this value will be appended to the end of original file name on the zero byte trigger file.  Defaults to ".trigger".
+
+<trigger_file_byte_count> - A 1 or 0 value that determines if trigger file should contain the byte count of the file it is triggering.  Default is 1 - file contains byte count.
+
+=head1 DEPENDENCIES
+
+Filed requires these modules:
+
+  File::Find            (core Perl)
+  File::Basename        (core Perl)
+  File::Copy            (core Perl)
+  Getopt::Std           (core Perl)
+  XML::Parser           (bundled)
+  XML::DT               (bundled)
+  Crypt::Simple         (bundled)
+  Net::FTP              (bundled)
+  Net::SFTP             (bundled)
+  Net::SFTP::Util       (bundled)
+  Mail::Sendmail        (bundled)
+  MIME::QuotedPrint     (bundled)
+  MIME::Base64          (bundled)
+  Proc::Queue           (bundled)
+  Proc::ProcessTable    (bundled)
+  Log::Dispatch::Syslog (bundled)
+  Linux::Fuser          (bundled)
+
+Perl 5.6.0 or higher is also required.
+
+Because of file permission issues, this script needs to run as root.
+
+=head1 VERSION
+
+  1.29 - 20040930 revamped <get> support to smartly stat remote file sizes for local comparison
+  1.30 - 20041013 added post fail delete option
+  1.31 - 20041102 added trigger file support for ftp and sftp posts
+  1.32 - 20041108 added check for long running filed process and warn
+  1.33 - 20041123 added check to prevent processed_dir, failed_dir from being processed by multiple pids
+  1.34 - 20041129 bugfix for timestamped failed files, check for existence of file before using at processed_dir, failed_dir
+  1.42 -          added <no_recurse> tag to prevent subfolder processing.
+  1.43 -          added -o <account> option to allow for processing a single account.
+  1.44 - 20070503 fixed bug related to <no_recurse> tag, added <remote_name> tag under post for FTP or SFTPing a remote file as a given name.
+  1.45 - 20070529 'Old' processes detected are also sent SIGTERM.
+  1.46 - 20080321 new no_recurse process - uses fakefind sub instead of tracking File::Find. Can now use <smtp> tag at top of conf file to use a different SMTP server besides localhost. Can now use <smtp_var> tag to refer to an environmental var that holds the SMTP host (just put the name of the var without an '$' in front).
+  1.47 - 20080415 Removed functionality from 1.45 - processes older than warn_hours_filed_pid are just warned about. Added tag kill_hours_filed_pid to set number of hours after which to kill processes.
+  1.47.1 - 20100302 Changed timeout in expet() call for "put" operation from 60 minutes to 24 hours. J. Hess.
+  1.48 - 20100827 Added <trim_trigger_file_suffix> tag, which will remove things like .dat or .txt from end of file name when constructing trigger file name. Set to 1 to trim once like ".dat", set to 2 to trim twice like ".dat.gz", etc.  J. Hess.
+  1.71 - 20200508 - Phil Zimmerman Made changes to sub sftp_post to verify posted filesize with localsize and warn/return accordingly.
+  1.90 - 20210422 - Phil Zimmerman made changes to merge v1.80 changes to fix issue where filed could kill another filed process after kill_hours_filed_pid
+
+=head1 AUTHOR
+
+Steven E. Wilson swilson@ndchealth.com
+Aaron Dallas aaron.dallas@relayhealth.com
+John Hess john.hess2@relayhealth.com (bug fixes and enhancements beginning with version 1.47.1).
+
+Copyright (c) 2008 McKesson Corp.
+
+=cut

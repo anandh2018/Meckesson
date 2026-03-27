@@ -1,0 +1,569 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use DateTime;
+use File::Basename;
+use DS::Dimension;
+use Getopt::Long;
+use Data::Dumper;
+use Proc::ProcessTable;
+$Data::Dumper::Useqq = 1;
+
+our $DIM_CONSTANTS;
+
+$DIM_CONSTANTS->{'ADDRESS'}{'BASEDIR'} = '/ds/data_sources/dimensions/address';
+$DIM_CONSTANTS->{'ADDRESS'}{'FILEMASK'}	= '.*';
+$DIM_CONSTANTS->{'MEDCONTROL'}{'BASEDIR'} = '/ds/data_sources/dimensions/medcontrol';
+$DIM_CONSTANTS->{'MEDCONTROL'}{'FILEMASK'} = '.*';
+$DIM_CONSTANTS->{'MEDICAID'}{'BASEDIR'}	= '/ds/data_sources/dimensions/medicaid';
+$DIM_CONSTANTS->{'MEDICAID'}{'FILEMASK'} = '.*';
+$DIM_CONSTANTS->{'CONTRACTUAL'}{'BASEDIR'} = '/ds/pal/lookup_data/contract_exclusions';
+$DIM_CONSTANTS->{'CONTRACTUAL'}{'FILEMASK'} = '(InclExcl)|([.]PX)|([.]IL)';
+#$DIM_CONSTANTS->{'ZIPCODE'}{'BASEDIR'}	= '/ds/data_source/dimensions/zipcode';
+
+
+our $mode;
+our $prog;
+our $ret;
+our $debug;
+our $dim_maint_obj;
+our $dim_obj;
+our @filenames;
+
+sub file_exists($) {
+  my($input_file) = shift;
+
+  if (-f $input_file ||	-l $input_file)	{
+    return 1;
+  } elsif (system("ls $input_file > /dev/null 2>&1") !=	0) {
+    return 0;
+  } else {
+    return 1;
+  }
+}
+
+
+sub Usage()
+{
+	print "\n";
+	print "USAGE:\n";
+	print "	      dimension_maint [	options	] [ filename ]\n";
+	print "\n";
+	print "	      dimension_load [ options ] [ filename ]\n";
+	print "\n";
+	print "	      dimension_list [ options ]\n";
+	print "\n";
+	print "	      dimension_report [ options ]\n";
+	print "\n";
+
+	print "OPTIONS:\n";
+	print "	       -list	     List the availiable packages\n";
+	print "\n";
+	print "	       -dim	     Indicates the Dimension package to	use\n";
+	print "\n";
+	print "	       -load	     Do	not register the data source as	an available data source to the	BLUELITE\n";
+	print "			     database\n";
+	print "\n";
+	print "	       -dir	     Specify the directory to move the file after loading (only	used with load)\n";
+	print "\n";
+
+}
+
+our ($method, $option);
+our $report = 0;
+our $load = 0;
+our $list = 0;
+our $stats = 0;
+our $dimension;
+our $post_date;
+our $base_dir;
+our $file_mask;
+
+	$prog =	$0;
+
+	if ($prog =~ /dimension_list2/)
+	{
+		$list =	1;
+		$mode =	"LIST";
+	}
+	elsif ($prog =~	/dimension_report2/)
+	{
+		$report	= 1;
+		$mode =	"REPORT";
+	}
+	elsif ($prog =~	/dimension_load2/)
+	{
+		$load =	1;
+		$mode =	"LOAD";
+	}
+	else
+	{
+		$mode =	"MAINT";
+	}
+
+
+
+$ret = GetOptions(  "debug", \$debug,
+					"load",	\$load,
+					"report", \$report,
+					"stats", \$stats,
+					"list",	\$list,
+					"dim|d=s", \$dimension,
+					"help|h", sub {	Usage()	; exit(0) },
+					"post_date|p=s", \$post_date,
+					"dir=s", \$base_dir,
+					"filemask=s",\$file_mask
+					);
+
+if (! $ret)
+{
+	Usage();
+	exit(1);
+}
+
+if (defined($post_date))
+{
+		if (! DS::Dimension::is_date_valid($post_date))
+		{
+			print STDERR "$prog: The specified date	of \"$post_date\" is invalid\n";
+			print STDERR "$prog: Use the format YYYYMMDD and/or Check the validity of the date\n";
+			exit(1);
+		}
+}
+
+if ($list)
+{
+	if (scalar(@ARGV) != 0)
+	{
+		$dimension = shift @ARGV;
+	}
+
+	if ($dimension)
+	{
+		$dim_maint_obj=	&get_dimension($dimension);
+	}
+	else
+	{
+		$dim_maint_obj = DS::Dimension->new();
+	}
+
+	$dim_maint_obj->list;
+
+	exit(0);
+}
+elsif ($report)
+{
+	if (scalar(@ARGV) != 0)
+	{
+		$dimension = shift @ARGV;
+	}
+
+	if ($dimension)
+	{
+		$dim_maint_obj = &get_dimension($dimension);
+	}
+	else
+	{
+		$dim_maint_obj = DS::Dimension->new();
+	}
+
+	$dim_maint_obj->report;
+
+	exit(0);
+}
+elsif ($load)
+{
+	if(not defined $dimension) {
+		print STDERR "No dimension package indicated.\nRerun command with -h for help\n";
+		exit(1);
+	}
+
+	if(($base_dir) && (! (-e $base_dir && -d $base_dir)) ) {
+		print STDERR "Ouput directory '$base_dir' does not exist!\n";
+		exit(1);
+	}
+
+	if(scalar(@ARGV) != 0)
+	{
+		@filenames = @ARGV;
+
+		### Only allow 1 file to be loaded (remove this	section	of code	if you want to allow multiple files)
+
+		if(scalar(@filenames) >	1) {
+			print "WARNING:	Loading	only the first file specified\n";
+			@filenames = $ARGV[0];
+		}
+		####################################################################################################
+
+		foreach	(@filenames) {
+			if(not -f $_) {
+				print STDERR "Unable to	locate file '$_'\n";
+				exit (1);
+			}
+		}
+
+		if(not defined $post_date)
+		{
+			$post_date = get_post_date_from_file(@filenames);
+		}
+	}
+	else
+	{
+		print STDERR "No files specified for loading\n";
+		exit(1);
+	}
+
+	my $t = new Proc::ProcessTable;
+
+    foreach my $p ( @{$t->table} ){
+      if(($p->pid != $$) && ($p->cmndline =~ /$filenames[0]/) && ($p->cmndline =~ m!/usr/bin/perl/!)) {
+        print STDERR "Duplicate process already running!\n";
+        exit(1);
+      }
+    }
+
+	$dim_obj = &get_dimension($dimension);
+	$dim_obj->load(POST_DATE => $post_date,	FILES => \@filenames);
+
+	# Rename/Move after loading
+	foreach	(@filenames) {
+
+		my $file = $_;
+		my ($name, $path, $suff) = File::Basename::fileparse($file);
+		my $cps_source_dir = "/ds/data_sources/incoming/cps/";
+		my $tandem_source_dir =	"/ds/data_sources/incoming/tandem/";
+		my $pscbr_source_dir = "/ds/data_sources/incoming/prescriber/";
+		my $out_dir = $base_dir;
+
+		if(($path eq $cps_source_dir) || ($path	eq $tandem_source_dir) || ($path eq $pscbr_source_dir))	{ # move files only if they haven't been moved from the	source directory
+
+			if ($name =~ /^\$?([^.]+)[.](DOWNLOAD|HCPSDNLD)[.]([^0-9]+)([0-9]{2})([0-9]{2})([0-9]{2})[^0-9]*$/i){
+				my ($prefix, $root, $suffix, $yy, $mm, $dd) = ($1, $2, $3, $4, $5, $6);
+				my $new_full_name = "$out_dir/"	. "${prefix}.${root}.${suffix}${yy}${mm}${dd}.gz";
+
+				$ret = system("gzip -c '$file' > $new_full_name");
+				$ret = $ret >> 8;
+				if ($ret == 0) {
+					if (-f $new_full_name) {
+						unlink($file);
+					}
+				} else {
+
+					print STDERR "ERROR: Unable to gzip '$file' to $new_full_name\n";
+					unlink($new_full_name);
+					exit(1);
+				}
+			}
+			elsif (($name =~ /^(.*MDCAID[0-9]{4}.*)$/) || ($name =~	/^(.*ADDR[0-9]{4}.*)$/)	||
+			       ($name =~ /^(medctrl_(\d){8}\.dat)$/) ||	($name =~ /^(.*BIN[0-9]{4}.*)$/) ||
+			       ($name =~ /^(.*PIDS[0-9]{4}.*)$/) || ($name =~ /^(.*GRP[0-9]{4}.*)$/) ||
+			       ($name =~ /^(.*PHGP[0-9]{4}.*)$/)) {
+
+				my $new_full_name = "$1.gz";
+				$out_dir = "$base_dir/". substr($post_date,0,4)	. "/";
+
+				if(! -e	$out_dir) {
+					$ret = system("mkdir $out_dir");
+					$ret = $ret >> 8;
+					if($ret	!= 0) {
+						print STDERR "ERROR: Unable to create dir $out_dir\n";
+						exit(1);
+					}
+				}
+
+				$new_full_name = $out_dir . $new_full_name;
+
+				$ret = system("gzip -c '$file' > $new_full_name");
+				$ret = $ret >> 8;
+				if ($ret == 0) {
+					if (-f $new_full_name) {
+						unlink($file);
+					}
+				} else {
+					print STDERR "ERROR: Unable to gzip '$file' to $new_full_name\n";
+					unlink($new_full_name);
+					exit(1);
+				}
+			}
+			elsif (($name =~ /^WA\d{6}\.zip$/)) {
+
+				$out_dir = "$base_dir/active/". substr($post_date,0,4)	. "/";
+
+				if(! -e	$out_dir) {
+					$ret = system("mkdir $out_dir");
+					$ret = $ret >> 8;
+					if($ret	!= 0) {
+						print STDERR "ERROR: Unable to create dir $out_dir\n";
+						exit(1);
+					}
+				}
+
+				$ret = system("mv $file $out_dir");
+				$ret = $ret >> 8;
+				if ($ret != 0) {
+					print STDERR "ERROR: Unable to mv '$file' to $out_dir\n";
+					exit(1);
+				}
+			}
+			elsif (($name =~ /^MAR\d{6}\.zip$/)) {
+				$out_dir = "$base_dir/retired/". substr($post_date,0,4)	. "/";
+
+				if(! -e	$out_dir) {
+					$ret = system("mkdir $out_dir");
+					$ret = $ret >> 8;
+					if($ret	!= 0) {
+						print STDERR "ERROR: Unable to create dir $out_dir\n";
+						exit(1);
+					}
+				}
+
+				$ret = system("mv $file $out_dir");
+				$ret = $ret >> 8;
+				if ($ret != 0) {
+					print STDERR "ERROR: Unable to mv '$file' to $out_dir\n";
+					exit(1);
+				}
+			}
+			elsif (    ($name =~ /^\d{8}_NPI\.csv\.gz$/) 
+							|| ($name =~ /^\d{8}_csr\.txt\.gz$/) 
+							|| ($name =~ /^\d{4}EXCL\.DBF$/) 
+							|| ($name =~ /^\d{4}REIN\.DBF$/)
+							|| ($name =~ /^\d{8}_surescripts\.txt\.zip$/)
+							|| ($name =~ /^\d{8}_AI_(PHY|DDS)\.txt\.gz$/)
+							|| ($name =~ /^\d{8}_STLICENSE_FL\.txt\.gz$/)
+						 ) {
+				$out_dir = "$base_dir/". substr($post_date,0,4)	. "/";
+
+				if(! -e	$out_dir) {
+					$ret = system("mkdir $out_dir");
+					$ret = $ret >> 8;
+					if($ret	!= 0) {
+						print STDERR "ERROR: Unable to create dir $out_dir\n";
+						exit(1);
+					}
+				}
+
+				$ret = system("mv $file $out_dir");
+				$ret = $ret >> 8;
+				if ($ret != 0) {
+					print STDERR "ERROR: Unable to mv '$file' to $out_dir\n";
+					exit(1);
+				}
+			}					
+
+		}
+	}
+	exit(0);
+}
+elsif($stats) {
+
+	# Gets stats on	existing or potential dimensions
+	# If a dimension is not	specified, it will get stats on	files located in the dir with filemask
+	# If a dimension is specified, it will get stats on existing dimensions
+
+	# Stats	returned:
+	#	a) Number of files scanned
+	#	b) Average number of records per file
+	#   c) Average number of characters per	record
+
+	my @stats = (0,0,0);
+
+	if(not defined $dimension) {
+		if((not	defined	$base_dir) or (not defined $file_mask))	{
+			&Usage();
+			exit(0);
+		}
+
+		&get_stats($base_dir, $file_mask, \@stats);
+
+	}
+	else {
+		my $dim_obj = &get_dimension($dimension);
+		my $base_dir = $DIM_CONSTANTS->{uc($dimension)}{'BASEDIR'};
+		my $file_mask =	$DIM_CONSTANTS->{uc($dimension)}{'FILEMASK'};
+
+		&get_stats($base_dir,$file_mask	, \@stats);
+
+	}
+
+	if($stats[0] &&	$stats[1] && $stats[2])	{
+		print "Number of files:	$stats[0]\n";
+		print "Avg. num	of records per file: " . $stats[1]/$stats[0] ."\n";
+		print "Avg. chars per line: " .	$stats[2]/$stats[1] . "\n";
+		exit(0);
+	}
+}
+
+sub get_stats {
+
+	my $dir	= shift;
+	my $mask = shift; #mask	is a regex expression to match files in	that directory
+	my $stats_ref =	shift;
+	opendir	DH, $dir or die	"ERROR:	Could not open directory '$dir'\n";
+	foreach	(readdir(DH)) {
+		next if	$_ =~ /^\./;
+		if ( -d	"$dir/$_" ) {
+			&get_stats("$dir/$_", $mask, $stats_ref);
+		}
+		else {
+			if ($_ =~ /$mask/) {
+				open (IN,"read_file '$dir/$_' |") || die "Cannot open file (via	readfile) \"$_\" due to	$!";
+				print "collecting stats: $_\n";
+				$stats_ref->[0]++;
+
+				while(<IN>) {
+					$stats_ref->[1]+=1;
+					$stats_ref->[2]+=length($_) - 1;
+				}
+				close IN;
+#print "files: $stats_ref->[0],	recs: $stats_ref->[1], chars: $stats_ref->[2]\n";
+			}
+		}
+	}
+	close DH;
+}
+
+sub get_dimension {
+	my $dimension =	shift;
+	my $dim_maint_obj = DS::Dimension->new();
+	my $dimension_obj = $dim_maint_obj->new_dimension(DIM_ID => $dimension);
+	if(!$dimension_obj) {
+		print STDERR "ERROR: Unable to aquire Dimension	Maint object - aborting\n";
+		exit(1);
+	}
+	else {
+		return $dimension_obj;
+	}
+}
+
+sub get_post_date_from_file {
+	my $file = shift;
+
+	if(scalar(@_) >	1)
+	{
+		printf "WARNING: Cannot	generate post date from	multiple files\n";
+		return undef;
+	}
+
+	my ($cc, $yy, $mm, $dd);
+	my ($name, $path, $suffix) = File::Basename::fileparse($file);
+	my $stat_date =	&date_from_stat($file);
+	my $file_date;
+
+	# name could be	CCYYMMDD, YYMMDD, MMDD,	MM
+
+	if($name =~ /^.*([0-9]{8}).*$/)			# CCYYMMDD?
+	{
+		my $tmp_date = $1;
+		if($stat_date !~ /^$tmp_date$/)
+		{
+			print STDERR "WARNING: Date in filename	'$name'	does not match stat date '$stat_date'\n";
+			print STDERR "WARNING: Assuming	date '$1'\n";
+		}
+
+		if (! DS::Dimension::is_date_valid($tmp_date))
+		{
+			print STDERR "ERROR: Date '$tmp_date' in file '$file' is an invalid date\n";
+			exit(1);
+		}
+		else
+		{
+			return $tmp_date;
+		}
+	}
+	elsif($name =~ /^.*([0-9]{2})([0-9]{2})([0-9]{2}).*$/)	# YYMMDD?
+	{
+		$yy = $1;
+		$mm = $2;
+		$dd = $3;
+
+		$file_date = substr($stat_date,0,2) . $yy . $mm	. $dd;
+
+		if($stat_date !~ /^([0-9]{2})($yy)($mm)($dd)$/)
+		{
+			print STDERR "WARNING: Date in filename	'$name'	does not match stat date '$stat_date'\n";
+			print STDERR "WARNING: Assuming	date '$file_date'\n";			
+			#print STDERR "WARNING: Assuming date '$stat_date'\n";
+		}
+
+		if (! DS::Dimension::is_date_valid($file_date))
+		{
+			print STDERR "ERROR: Date '$file_date' in file is an invalid date\n";
+			exit(1);
+		}
+		else
+		{
+			print $file_date ."\n";
+			return $file_date;
+			#return $stat_date;
+		}
+	}
+	elsif($name =~ /^.*([0-9]{2})([0-9]{2}).*$/)	# MMDD?
+	{
+		$mm = $1;
+		$dd = $2;
+
+		$file_date = substr($stat_date,0,4)  . $mm . $dd;
+
+		if($stat_date !~ /^([0-9]{4})($mm)($dd)$/)
+		{
+			print STDERR "WARNING: Date in filename	'$name'	does not match stat date '$stat_date'\n";
+			#print STDERR "WARNING: Assuming	date '$file_date'\n";
+			print STDERR "WARNING: Assuming	date '$stat_date'\n";
+		}
+
+
+		if (! DS::Dimension::is_date_valid($stat_date))
+		{
+			print STDERR "ERROR: Date '$stat_date' in file is an invalid date\n";
+			exit(1);
+		}
+		else
+		{
+			return $stat_date;
+		}
+	}
+	elsif($name =~ /^.*([0-9]{2}).*$/)	# MM?
+	{
+		$mm = $1;
+
+		$file_date = DS::Dimension::end_of_month(substr($stat_date,0,4) .	$mm);
+
+		if($stat_date !~ /^([0-9]{4})($mm)([0-9]{2})$/)
+		{
+			print STDERR "WARNING: Date in filename	'$name'	does not match stat date '$stat_date'\n";
+			print STDERR "WARNING: Assuming	date '$file_date'\n";
+		}
+
+		if (! DS::Dimension::is_date_valid($file_date))
+		{
+			print STDERR "ERROR: Date '$file_date' in file is an invalid date\n";
+			exit(1);
+		}
+		else
+		{
+			return $file_date;
+		}
+	}
+	else
+	{
+		print STDERR "WARNING: No date in filename, using date from stat '$stat_date'\n";
+		return $stat_date;
+	}
+
+}
+
+sub date_from_stat($) {
+
+  my $file = shift;
+	my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks)	= stat $file;
+	my $dt = DateTime->from_epoch( epoch =>	$mtime,	time_zone  => 'local' );
+	my $date = sprintf ("%04d%02d%02d", $dt->year, $dt->month, $dt->day);
+	return $date;
+}
+
+if(! shift @ARGV) {
+	&Usage();
+}
+

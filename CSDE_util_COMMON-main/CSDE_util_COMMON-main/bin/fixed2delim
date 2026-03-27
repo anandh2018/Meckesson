@@ -1,0 +1,62 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+
+our $PGM = $0;
+$PGM =~ s/.*\///g;
+
+sub Usage() {
+	print "Usage: $PGM [-format-file config_fname] [-delimiter delim_char] [input_fname]...\n";
+}
+
+my $delimiter = '|';
+my $format_file = 'fixed2delim.config';
+
+if (! GetOptions('-format-file=s' => \$format_file, '-delimiter=s' => \$delimiter)) {
+	&Usage();
+	exit 1;
+}
+
+if ((-t 0) && (! @ARGV)) {
+	&Usage;
+	exit(1);
+}
+
+open(FF, $format_file) || die "Could not open config file '$format_file' : $!\n";
+
+my $line_num = 0;
+my ($length, $format);
+
+while (<FF>) {
+	chomp;
+	($length) = ($_);
+	$line_num++;
+
+	next if ($length =~ /^\s*#/);
+	next if ($length =~ /^\s*$/);
+
+	if ($length =~ /^\s*\d+\s*$/) {
+		if ($length >= 1) {
+			$format .= 'a' . ($length + 0);
+		} else {
+			die "ERROR: Line $line_num of config file $format_file has a invalid length of '$length'\n";
+		}
+	} else {
+			die "ERROR: Line $line_num of config file $format_file has a non-numeric length of '$length'\n";
+	}
+}
+
+close(FF);
+
+if (! defined($format)) {
+	die "ERROR: No field info found in config file '$format_file'\n";
+}
+
+while (<>) {
+	chomp;
+	print join($delimiter, unpack($format, $_)) . "\n";
+}
+

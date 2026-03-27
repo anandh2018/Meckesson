@@ -1,0 +1,161 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use Getopt::Long;
+
+my $PGM = $0;
+$PGM =~ s/^.*\///g;
+
+sub Usage() {
+	print "Usage 1: $PGM <-num-files # | -num-records-per-file #> [-options] input_file\n";
+	print "Usage 2: $PGM [-options] input_file [output_file ...]\n";
+	print "Options:\n";
+	print "   [-prefix s]\n";
+	print "   [-output-dir d]\n";
+	print "   [-suffix-length #]\n";
+	print "   [-no-empty-files]\n";
+}
+
+if (scalar(@ARGV) == 0) {
+	Usage;
+	exit(1);
+}
+
+my $num_files;
+my ($suffix_length, $output_file_prefix, $output_dir);
+my $no_empty_files = 0;
+my $records_per_file;
+
+my $ret = GetOptions(
+  'num-files=s' => \$num_files,
+  'num-records-per-file=s' => \$records_per_file,
+  'suffix-length=s' => \$suffix_length,
+  'prefix=s' => \$output_file_prefix,
+  'output-dir=s' => \$output_dir,
+  'no-empty-files' => \$no_empty_files
+);
+
+if (! @ARGV) {
+	die "Input file not specified!\n";
+}
+
+my @output_files = ();
+my $input_file = shift(@ARGV);
+
+if (! -r $input_file) {
+	die "Cannot access $input_file : $!\n";
+}
+
+if (defined($num_files) && defined($records_per_file)) {
+	print STDERR "ERROR: -num-files and -num-records-per-file cannot be used together!\n";
+	Usage;
+	exit(1);
+}
+
+if (defined($num_files) || defined($records_per_file)) {
+	if (@ARGV) {
+		print STDERR "ERROR: Cannot specify output file names when using -num-files or -num-records-per-file\n";
+		Usage;
+		exit(1);
+	}
+} else {
+	@output_files = @ARGV;
+	$num_files = @output_files;
+}
+
+my $num_records = `run_pipe "read_file $input_file | wc -l"`;
+die "ERROR: Unable to determine # of records in $input_file !\n" if ($? != 0);
+
+chomp($num_records);
+
+if (defined($records_per_file)) {
+	$num_files = int($num_records / $records_per_file + 0.5);
+} else {
+	$records_per_file = int($num_records / $num_files);
+	$records_per_file = 1 if ($records_per_file < 1);
+}
+
+$suffix_length = length($num_files) if (! defined($suffix_length));
+
+if (! defined($output_file_prefix)) {
+	$output_file_prefix = $input_file;
+	$output_file_prefix =~ s|\.[^/]*$||;
+	$output_file_prefix .= '.';
+}
+
+if (defined($output_dir)) {
+	die "Can't write to $output_dir\n" if (! -w $output_dir);
+
+	$output_file_prefix =~ s|^.*/||g;
+	$output_file_prefix = "${output_dir}/${output_file_prefix}";
+}
+
+if (! @output_files) {
+	@output_files = map { "${output_file_prefix}${_}" } (1..$num_files);
+}
+
+my @all_output_files = (@output_files);
+
+my $curr_output_file;
+my $num_curr_file_records = 0;
+our %OUTPUT_FILES_CREATED = ();
+
+sub mydie($) {
+	my $msg = shift;
+	unlink(keys %OUTPUT_FILES_CREATED) if (keys %OUTPUT_FILES_CREATED);
+	die $msg;
+}
+
+open(IN, "read_file $input_file |") || die "ERROR: Cannot open $input_file : $!\n";
+
+while (<IN>) {
+	if (($num_curr_file_records == $records_per_file) || ($num_curr_file_records == 0)) {
+			if ($num_curr_file_records != 0) {
+				close(OUT) || mydie "ERROR: Cannot close output file $curr_output_file : $!\n";
+			}
+
+			if (! @output_files) {
+				@output_files = (@all_output_files);
+				$records_per_file = 1;
+			}
+
+			$curr_output_file = shift(@output_files);
+
+			my $mode;
+
+			if (exists($OUTPUT_FILES_CREATED{$curr_output_file})) {
+				$mode = '>>';
+			} else {
+				$mode = '>';
+			}
+
+			open(OUT, "$mode $curr_output_file") || mydie "Cannot create output file $curr_output_file : $!";
+			$OUTPUT_FILES_CREATED{$curr_output_file} = undef;
+			$num_curr_file_records = 0;
+	}
+
+	if (! print OUT $_) {
+		mydie "ERROR: Could not write to $curr_output_file : $!\n";
+	}
+
+	$num_curr_file_records++;
+}
+
+if (($num_curr_file_records != 0) && (tell OUT != -1)) {
+	close(OUT) || mydie "ERROR: Cannot close output file $curr_output_file : $!\n";
+}
+
+mydie "Cannot close input file $input_file : $!\n" if (! close(IN));
+
+if (! $no_empty_files) {
+	foreach my $fname (@all_output_files) {
+		if (! exists($OUTPUT_FILES_CREATED{$fname})) {
+			open(OUT, "> $fname") || mydie "Cannot create empty output file $fname : $!";
+			close(OUT) || mydie "ERROR: Cannot close empty output file $fname : $!\n";
+		}
+	}
+}
+
+exit(0);
+

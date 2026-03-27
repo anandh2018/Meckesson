@@ -1,0 +1,5 @@
+
+echo "ERROR: The job_concat_post_date script is no longer supported! Please use the 'job_concat' script instead." >&2
+
+exit 1
+

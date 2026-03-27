@@ -1,0 +1,451 @@
+#!/usr/bin/perl
+
+use BLUELITE::Job;
+use Data::Dumper;
+#use autodie qw(:all); # so that CTRL-C also kills this script during system() calls
+use strict;
+use warnings;
+
+#	job_run: Invoke job_launcher and job_concat for all requested post dates
+#
+# 2/27/2014
+#
+# - Initial release
+#
+# 8/7/2014 - Version 5.2
+# - Added call to detect_long_work_units() method just before calling ready() method. This causes
+# the status of non-running work units in the PROCESSING status to change to FAILED status so they
+# can be retried.
+#
+# - Added -no-max-records-check command line option, to be passed down to job_concat when used
+#
+# - When -daily option is used, post dates are now removed one at a time prior to each launch call
+# instead of all dates being removed prior to the first launch.
+#
+# Version 6.0 - 10/31/2014
+# - Added support for "autohoc" requests (i.e. automated on-demand ad-hoc processing).
+#
+# Version 6.2 - 5/26/2015
+# - Accomodate additional return value from remove_post_date method
+
+our $PGM = $0;
+$PGM =~ s/.*\///g;
+
+if (scalar(@ARGV) == 0) {
+	print "$PGM: Invoke job_launcher and job_concat for all requested post dates
+
+Usage: $PGM -app-id app_id -post-date pd_spec [-options]
+
+Options:
+  -rerun                 Process post dates even if ALREADY processed (unconditionally runs job_remove_post_date)
+  -request-id #          Process existing request in job_queue table
+  -daily                 Run job_launcher/job_concat cycles 1 post date at a time
+  -keep-log              Keep both job_launcher and job_concat logfiles, even if no errors are encountered
+  -keep-concat-log       Keep job_concat logfiles, even if no errors are encountered
+  -span-post-dates       Do NOT limit each output file to 1 post date (1 post date per file)
+  -keep-launcher-log     Keep job_launcher logfiles, even if no errors are encountered
+  -keep-worker-files     Preserve worker files after concatenation
+  -mark-delivered        Mark concatenated output as 'delivered'
+  -no-max-records-check  Do NOT check for violation of max # of output records (max records checked)
+                         {in production, use only with management approval}
+
+Note: pd_spec may be a comma-separated list of any combination of the following syntaxes:
+
+ YYYYMMDD
+ YYYYMMDD-YYYYMMDD
+ YYYYMM
+ YYYYMM-YYYYMM
+ YYYYMMDD-YYYYMM
+ YYYYMM-YYYYMMDD
+";
+	exit(1);
+}
+
+use Getopt::Long;
+
+my ($APP_ID, $post_date_spec);
+our $RERUN = 0;
+our $KEEP_LOG = 0;
+our $KEEP_CONCAT_LOG = 0;
+our $KEEP_LAUNCH_LOG = 0;
+our $SCREEN_ONLY = 0;
+our $KEEP_WORKER_FILES = 0;
+our $MARK_DELIVERED = 0;
+my $daily = 0;
+our $SPAN_POST_DATES = 0;
+our $NO_MAX_RECORDS_CHECK = 0;
+our ($REQUEST_ID, $WORKER_OPTS);
+
+GetOptions(
+            'app-id=s' => \$APP_ID,
+            'request-id=i' => \$REQUEST_ID,
+            'post-date=s' => \$post_date_spec,
+            'rerun' => \$RERUN,
+            'daily' => \$daily,
+            'keep-log' => \$KEEP_LOG,
+            'screen-only' => \$SCREEN_ONLY,
+            'keep-concat-log' => \$KEEP_CONCAT_LOG,
+            'span-post-dates' => \$SPAN_POST_DATES,
+            'keep-launch-log' => \$KEEP_LAUNCH_LOG,
+            'keep-worker-files' => \$KEEP_WORKER_FILES,
+            'mark-delivered' => \$MARK_DELIVERED,
+            'no-max-records-check' => \$NO_MAX_RECORDS_CHECK,
+            'worker-opts=s' => \$WORKER_OPTS,
+) || exit(1);
+
+die "$PGM: -app-id parameter not provided!\n" if (! defined($APP_ID));
+die "$PGM: -post-date parameter not provided!\n" if (! defined($post_date_spec));
+die "$PGM: -span-post-dates cannot be used with -daily option!\n" if ($SPAN_POST_DATES && $daily);
+
+$KEEP_LAUNCH_LOG = 1 if ($KEEP_LOG);
+$KEEP_CONCAT_LOG = 1 if ($KEEP_LOG);
+
+my @obj_options = ();
+
+if (defined($REQUEST_ID)) {
+	push(@obj_options, request_id => $REQUEST_ID);
+}
+
+our $JOB = BLUELITE::Job->new(app_id => $APP_ID, @obj_options) || die "Could not obtain BLUELITE::Job object\n";
+
+# use span-post-dates mechanism to support output scope=ALL if not requested on command line
+my $output_scope = $JOB->output_scope;
+
+if ((! $SPAN_POST_DATES) && ($output_scope eq 'ALL')) {
+	$SPAN_POST_DATES = 1;
+}
+
+my $post_dates = $JOB->post_date_list($post_date_spec);
+
+# todo: swap these back for production
+#my $launcher = 'perl -I /ds/development/Job/dev/blib/lib /ds/development/Job/dev/job_launcher';
+#my $concat = 'perl -I /ds/development/Job/dev/blib/lib /ds/development/Job/dev/job_concat';
+my $launcher = 'job_launcher';
+my $concat = 'job_concat';
+
+sub elapsed_min($) {
+  my $curr_time = time;
+	my $prev_time = shift;
+
+	return sprintf('%.1f', ($curr_time - $prev_time) / 60);
+}
+
+sub mylog($) {
+  my $msg = shift;
+	chomp($msg);
+	my $ltime = localtime;
+
+	print "$ltime - $msg\n";
+}
+
+sub unconcatenated_dates($@) {
+ my ($post_date_spec, @post_dates) = @_;
+
+ my @unconcatenated_dates = ();
+
+ if ($SPAN_POST_DATES) {
+		my $post_date_spec_alt = $post_date_spec;
+		$post_date_spec_alt =~ s/,/_/g;
+
+		my $concat_history = $JOB->get_delivery_history(recent_post_dates => 1, post_date_spec => $post_date_spec_alt, delivery_type => 'DATA');
+
+		if (! @{$concat_history}) {
+			return ($post_date_spec);
+		}
+	} else {
+	 foreach my $post_date (sort @post_dates) {
+		my $concat_history = $JOB->get_delivery_history(recent_post_dates => 1, max_post_date => $post_date, delivery_type => 'DATA');
+
+		if (! @{$concat_history}) {
+			push(@unconcatenated_dates, $post_date);
+		}
+	 }
+	}
+
+ return @unconcatenated_dates;
+}
+
+sub concat($@) {
+ my ($post_date_spec, @post_dates) = @_;
+
+ if (! unconcatenated_dates($post_date_spec, @post_dates)) {
+	mylog("All " . scalar(@post_dates) . " post dates in $post_date_spec have already been concatenated. job_concat was not needed.");
+	return 0;  # already concatenated (success)
+ }
+
+ my ($msg, $time0);
+
+	my $cmd = "$concat -app-id $APP_ID -post-date $post_date_spec";
+	$cmd .= " -request-id $REQUEST_ID" if (defined($REQUEST_ID));
+	$cmd .= ' -keep-log' if ($KEEP_CONCAT_LOG);
+	$cmd .= ' -keep-worker-files' if ($KEEP_WORKER_FILES);
+	$cmd .= ' -mark-delivered' if ($MARK_DELIVERED);
+	$cmd .= ' -span-post-dates' if ($SPAN_POST_DATES);
+	$cmd .= ' -no-max-records-check' if ($NO_MAX_RECORDS_CHECK);
+	$cmd .= " -screen-only" if ($SCREEN_ONLY);
+
+	mylog("Concatenation attempt: $cmd");
+	$time0 = time;
+
+	system($cmd);
+
+ my @missing_post_dates = unconcatenated_dates($post_date_spec, @post_dates);
+
+ if (@missing_post_dates) {
+	mylog("The following " . scalar(@missing_post_dates) . " post dates have not yet been concatenated!:\n" . join(',', @missing_post_dates));
+	return 2;  # concat problem
+ } else {
+	mylog("All " . scalar(@post_dates) . " post dates in $post_date_spec are now concatenated");
+	return 0;  # success
+ }
+
+}
+
+
+sub launch($@) {
+ my ($post_date_spec, @post_dates) = @_;
+ my ($msg, $time0);
+ my @dates_to_launch = ();
+
+ POST_DATE:
+ foreach my $post_date (sort @post_dates) {
+	my $concat_history = $JOB->get_delivery_history(recent_post_dates => 1, max_post_date => $post_date, delivery_type => 'DATA');
+
+	if (@{$concat_history}) {
+		if (! $RERUN) {
+			# Skipping $post_date since it is already concatenated
+			next POST_DATE;
+		} else {
+			$msg = "Concatenation record for $post_date exists, even though it was previously removed due to the -rerun option!";
+			print STDERR "$PGM: ERROR: $msg\n";
+			return 1;  # launch problem
+		}
+	}
+
+	my $num_workers_running_long = $JOB->detect_long_work_units(begin_post_date => $post_date);
+
+	if ($num_workers_running_long) {
+		return 99;
+	}
+
+	my $ready_to_launch = $JOB->ready(enqueue => 0, post_date => $post_date);
+
+#print "\ngot back $ready_to_launch\n" if (defined($ready_to_launch));
+
+	if (! defined($ready_to_launch)) {
+		my $num_incomplete = scalar($JOB->incomplete_workers(post_date => $post_date));
+
+		if ($num_incomplete) {
+			$msg = "No workers are ready to launch for $post_date because $num_incomplete remain in an incomplete state. Use 'job_remove_workers -app-id $APP_ID -post-date $post_date -incomplete' to fix and then retry.";
+			print STDERR "$PGM: ERROR: $msg\n";
+			return 1;  # launch problem
+		}
+
+		next POST_DATE;
+	}
+
+	if ($ready_to_launch eq 'STILL_RUNNING') {
+		return 99;
+	}
+
+	push(@dates_to_launch, $post_date);
+ }
+
+ if (@dates_to_launch) {
+	my $time_start = time;
+
+	for(my $attempt_num = 0; $attempt_num <= ($JOB->worker_retry_attempts() + 1); $attempt_num++) {
+		if ($attempt_num == ($JOB->worker_retry_attempts() + 1)) {
+			print STDERR "$PGM: ERROR: unprocessed work units remain after $attempt_num launch attempts\n";
+			return 1;  # launch problem
+		}
+
+		my $cmd = "$launcher -app-id $APP_ID -post-date $post_date_spec";
+		$cmd .= " -request-id $REQUEST_ID" if (defined($REQUEST_ID));
+		$cmd .= ' -keep-log' if ($KEEP_LAUNCH_LOG);
+		$cmd .= " -worker-opts '$WORKER_OPTS'" if ($WORKER_OPTS);
+		$cmd .= " -screen-only" if ($SCREEN_ONLY);
+
+		mylog("Launch attempt #" . ($attempt_num + 1) . " : $cmd");
+
+		$time0 = time;
+		my $ret = system($cmd);
+		$ret = $ret >> 8;
+
+		if ($ret == 99) {
+			return $ret;  # too many workers already running for this app or group
+		}
+
+		mylog("Launch attempt #" . ($attempt_num + 1) . " for $post_date_spec completed in " . elapsed_min($time0) . " minutes");
+
+		my $ready_to_launch = $JOB->ready(enqueue => 0, post_date => \@dates_to_launch);
+
+		if (defined($ready_to_launch) && ($ready_to_launch eq 'STILL_RUNNING')) {
+			return 99;
+		}
+
+		if ((! defined($ready_to_launch)) || ($ready_to_launch ne 'READY')) {
+			foreach my $post_date (@dates_to_launch) {
+				my $num_incomplete = scalar($JOB->incomplete_workers(post_date => $post_date));
+
+				if ($num_incomplete) {
+					$msg = "No workers are ready to launch for $post_date because $num_incomplete remain in an incomplete state. Use 'job_remove_workers -app-id $APP_ID -post-date $post_date -incomplete' to fix and then retry.";
+					print STDERR "$PGM: ERROR: $msg\n";
+					return 1;  # launch problem
+				}
+			}
+
+			last;
+		}
+	}
+
+	mylog("Completed launchers for " . scalar(@dates_to_launch) . " post dates in $post_date_spec in " . elapsed_min($time_start) . " minutes");
+
+ } else {
+	mylog("All workers for all " . scalar(@post_dates) . " post dates in $post_date_spec have already completed successfully. job_launcher was not needed.");
+ }
+
+	return 0;  # success
+}
+
+
+sub cycle_daily($@) {
+ my ($post_date_spec, @post_dates) = @_;
+ my ($msg, $time0);
+
+ POST_DATE:
+ foreach my $post_date (sort @post_dates) {
+
+	if ($RERUN) {
+		remove_post_dates($post_date, $post_date);
+	}
+
+	my $concat_history = $JOB->get_delivery_history(recent_post_dates => 1, max_post_date => $post_date, delivery_type => 'DATA');
+
+	if (@{$concat_history}) {
+		if (! $RERUN) {
+			mylog("Skipping $post_date since it is already concatenated");
+			next POST_DATE;
+		} else {
+			$msg = "Concatenation record for $post_date exists, even though it was previously removed due to the -rerun option!";
+			print STDERR "$PGM: ERROR: $msg\n";
+			return 1;  # launch problem
+		}
+	}
+
+	LAUNCH:
+	for(my $attempt_num = 0; $attempt_num <= ($JOB->worker_retry_attempts() + 1); $attempt_num++) {
+		my $ready_to_launch = $JOB->ready(enqueue => 0, post_date => $post_date);
+
+		if (! defined($ready_to_launch)) {
+			my $num_incomplete = scalar($JOB->incomplete_workers(post_date => $post_date));
+
+			if ($num_incomplete) {
+				$msg = "No workers are ready to launch for $post_date because $num_incomplete remain in an incomplete state. Use 'job_remove_workers -app-id $APP_ID -post-date $post_date -incomplete' to fix and then retry.";
+				print STDERR "$PGM: ERROR: $msg\n";
+				return 1;  # launch problem
+			}
+
+			if ($attempt_num == 0) {
+				if (! $RERUN) {
+					mylog("No workers to launch for $post_date");
+				} else {
+					$msg = "Even though the -rerun option was used, there are no workers ready for the 1st attempt to launch $post_date";
+					print STDERR "$PGM: ERROR: $msg\n";
+					return 1;  # launch problem
+				}
+			}
+
+			last LAUNCH;
+		}
+
+		if ($attempt_num == ($JOB->worker_retry_attempts() + 1)) {
+			print STDERR "$PGM: ERROR: unprocessed work units remain for $post_date after $attempt_num launch attempts\n";
+			return 1;  # launch problem
+		}
+
+		my $cmd = "$launcher -app-id $APP_ID -post-date $post_date";
+		$cmd .= " -request-id $REQUEST_ID" if (defined($REQUEST_ID));
+		$cmd .= ' -keep-log' if ($KEEP_LAUNCH_LOG);
+		$cmd .= " -worker-opts '$WORKER_OPTS'" if ($WORKER_OPTS);
+		$cmd .= " -screen-only" if ($SCREEN_ONLY);
+
+		mylog("Launch attempt #" . ($attempt_num + 1) . " : $cmd");
+
+		$time0 = time;
+		my $ret = system($cmd);
+		$ret = $ret >> 8;
+
+		if ($ret == 99) {
+			return $ret;  # too many workers already running for this app or group
+		}
+
+		mylog("Launch attempt #" . ($attempt_num + 1) . " for $post_date completed in " . elapsed_min($time0) . " minutes");
+	}
+
+	my $cmd = "$concat -app-id $APP_ID -post-date $post_date";
+	$cmd .= " -request-id $REQUEST_ID" if (defined($REQUEST_ID));
+	$cmd .= ' -keep-log' if ($KEEP_CONCAT_LOG);
+	$cmd .= ' -keep-worker-files' if ($KEEP_WORKER_FILES);
+	$cmd .= ' -mark-delivered' if ($MARK_DELIVERED);
+	$cmd .= ' -span-post-dates' if ($SPAN_POST_DATES);
+	$cmd .= " -screen-only" if ($SCREEN_ONLY);
+
+	mylog("Concatenation attempt: $cmd");
+	$time0 = time;
+
+	system($cmd);
+
+	$concat_history = $JOB->get_delivery_history(recent_post_dates => 1, max_post_date => $post_date, delivery_type => 'DATA');
+
+	if (! @{$concat_history}) {
+		print STDERR "$PGM: ERROR: Could not concatenate $post_date !\n";
+		return 2;  # concat problem
+	}
+
+	mylog("Completed $post_date concatenation in " . elapsed_min($time0) . " minutes");
+ }
+
+	return 0;  # success
+}
+
+sub remove_post_dates($@) {
+  my ($post_date_spec, @post_dates) = @_;
+
+	my ($time0, $msg);
+	$time0 = time;
+
+	my $post_date_list = \@post_dates;
+	my ($post_dates_not_removed, $post_dates_removed) = $JOB->remove_post_date(post_date => $post_date_list, post_date_spec => $post_date_spec);
+
+	foreach my $post_date (sort @{$post_date_list}) {
+		my $concat_history = $JOB->get_delivery_history(recent_post_dates => 1, max_post_date => $post_date, delivery_type => 'DATA');
+
+		if (@{$concat_history}) {
+			my $msg = "The -rerun option was used, but the concatenation record for $post_date was not removed for some reason!";
+			die "$PGM: ERROR: $msg\n";
+		}
+	}
+
+	mylog("Completed removing $post_dates_removed post dates in " . elapsed_min($time0) . " minutes\n");
+}
+
+
+### main ###
+
+if ($daily) {
+	exit(cycle_daily($post_date_spec, @{$post_dates}));
+} else {
+
+	if ($RERUN) {
+		remove_post_dates($post_date_spec, @{$post_dates});
+	}
+	my $ret = launch($post_date_spec, @{$post_dates});
+
+	if ($ret != 0) {
+		exit($ret);
+	}
+
+	exit(concat($post_date_spec, @{$post_dates}));
+}
+

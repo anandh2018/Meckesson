@@ -1,0 +1,74 @@
+#!/usr/bin/perl
+
+# job_trigger_post_date: Create a "end of day" trigger file BLUELITE::Job apps
+#
+# Author(s): John Hess		RelayHealth
+#
+# Version history:
+# Version 1.0 - 3/27/2009
+#
+
+use IO::Compress::Gzip qw($GzipError);
+use DateTime::Format::Strptime;
+use Getopt::Long;
+use Mail::SendEasy;
+use File::Copy;
+use File::PathConvert qw(rel2abs);
+use File::Spec;
+
+use BLUELITE::Job;
+use BLUELITE::Logger;
+use BLUELITE::Mail qw(email);
+
+use strict;
+use warnings;
+
+my @dir_parts = File::Spec->splitdir(rel2abs($0));
+our $PGM = pop(@dir_parts);
+
+
+sub Usage() {
+  print "$PGM: Clear trigger files for BLUELITE::Job apps\n\n";
+  print "Usage: $PGM [-options] -app-id i\n";
+  print " Required parameters\n";
+  print "  -app-id i                     Application id as recorded in JOB_CONFIG table\n";
+	print "  -post-date YYYYMMDD\n";
+}
+
+
+############# MAIN ###########
+
+if (scalar(@ARGV) == 0) {
+  Usage;
+  exit(1);
+}
+
+# Get command-line options
+
+my ($app_id, $post_date);
+
+GetOptions(
+            'app-id=s' => \$app_id,
+            'post-date=s' => \$post_date,
+) || exit(1);
+
+die "ERROR: The mandatory -app-id parameter was not specified!\n" if (! defined($app_id));
+
+my $job = BLUELITE::Job->new(app_id => $app_id) || die "Unable to obtain BLUELITE::Job object for app_id = '$app_id' : $@\n";
+my @clear_opts;
+
+if (defined($post_date)) {
+	@clear_opts = (post_date => $post_date);
+} else {
+	die "Must provide -post-date parameter\n";
+}
+
+my @trigger_files = $job->clear_trigger(@clear_opts);
+
+if (! @trigger_files) {
+	die "Could not clear trigger file for post date $post_date\n";
+}
+
+print "Trigger files cleared from database:\n";
+print join("\n", @trigger_files) . "\n";
+

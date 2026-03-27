@@ -1,0 +1,80 @@
+
+if [ "$*" = "" ]
+  then
+	echo "Usage:
+prun_done <done_file1> [done_file2] ...
+
+{usually just run 'prun_done *.done'}"
+	exit
+fi
+
+for f in $* ALL
+  do
+	if [ $f = ALL ]
+	  then
+		echo
+		echo "$lines" | sort -nr -k 2
+
+		all_pct_done=`echo "scale=1
+		$total_done_count * 100 / $total_master_count" | bc`
+
+		echo "ALL	$all_pct_done"
+	else
+		bdir=`dirname $f`
+		bfname=`basename $f`
+		master_fname=`echo $bfname | sed 's/^\(.*\).done$/\1/'`
+
+		if [ "$bdir" = '.' ]
+		  then
+			bname=$master_fname
+		  else
+			bname="$bdir/$master_fname"
+		fi
+
+		if [ ! -f "$bname" ]
+		  then
+			echo Cannot find master file $bname for $f
+			exit 1
+		fi
+
+		master_count=`cat $bname | wc -l`
+		done_count=`cat $f | wc -l`
+
+		pct_done=`echo "scale=1
+$done_count * 100 / $master_count" | bc`
+
+		total_master_count=`expr ${total_master_count:-0} + $master_count`
+		total_done_count=`expr ${total_done_count:-0} + $done_count`
+
+		logfile="${bname}.log"
+		if [ -r "${logfile}" ]
+		  then
+			grep -i 'remaining time' ${logfile} /dev/null | tail -1
+
+			if tail -1 ${logfile} | grep 'Number of failed executions' > /dev/null
+				then
+					if [ "$pct_done" != 100.0 ]
+						then
+							run_stat='NOT running'
+						else
+							run_stat='Completed'
+					fi
+				else
+					run_stat=''
+			fi
+
+			num_errors=`grep -i ' returned error status ' ${logfile} | wc -l`
+			error_stat=`echo errors=$num_errors`
+
+		fi
+
+		if [ "$lines" = "" ]
+		  then
+				lines="$f	${pct_done} %	$run_stat	$error_stat"
+		  else
+				lines="${lines}
+$f	$pct_done %	$run_stat	$error_stat"
+		fi
+
+	fi
+  done

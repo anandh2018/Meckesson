@@ -1,0 +1,38 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use BLUELITE::TandemSwitchAuditLog::Index_Mgr;
+use BLUELITE::Logger;
+use Params::Validate qw(:all);
+use Data::Dumper;
+
+my $log_file = "/tmp/index_delete_child.$$.log";
+
+initialize_logging(logfile => $log_file, screen_only => 0, screen_threshold => 'INFO', file_threshold => 'ALL');
+
+my $logger = get_logger;
+
+my %option = validate_with
+    ( params  => \@ARGV,
+      spec    => {  PROCESS_DATE => { type => SCALAR, optional => 0 },
+                    INDEX_LIST => { type => SCALAR, optional => 0 },
+										EXIT_SUCCESS => { type => SCALAR, optional => 1, default => 200 },
+                    AUDIT_LOG => { type => SCALAR, optional => 0 }
+      },
+      called  => $0,
+      normalize_keys => sub { my $k = shift; $k =~ s/^-//; return uc $k }
+    );
+
+my $maint_grp = BLUELITE::TandemSwitchAuditLog::Index_Mgr::Maint_Group->new(process_date => $option{PROCESS_DATE});
+
+$maint_grp->add_index(split(/\s*,\s*/, $option{INDEX_LIST}));
+
+if ($maint_grp->delete($option{AUDIT_LOG})) {
+	unlink($log_file);
+	exit($option{EXIT_SUCCESS});
+} else {
+	exit(1);
+}
+

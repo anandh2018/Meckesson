@@ -1,0 +1,539 @@
+#!/usr/bin/perl
+
+our $DS_BASE_DIR = $ENV{DS_BASE_DIR};
+die "ERROR: DS_BASE_DIR environment variable is '$DS_BASE_DIR', which is not an existing directory\n" if (! ((defined($DS_BASE_DIR)) && (-d $DS_BASE_DIR)));
+
+$lookup_dir = "$DS_BASE_DIR/common/etc";	# default lookup dir
+
+$zip_population_file_basename = 'zip_population.dat';
+$restricted_provider_zip_population_file_basename = 'restricted_prov_zip_population.dat';
+
+$prog_name = $0;
+
+use Getopt::Std;
+
+if (! defined($ARGV[0])) {
+	if (-t 0) {
+		print STDERR "Usage: $prog_name [-c] [-p 2|23|full] [-r restricted_provider_zip_file] [-z zip_population_file] [-d reference_dir] [input_file]\n";
+		exit(1);
+	}
+}
+
+getopts('cp:r:z:d:');
+
+if (defined($opt_c)) {
+	$compress_output = 1;
+} else {
+	$compress_output = 0;
+}
+
+if (defined($opt_d)) {
+	$lookup_dir = $opt_d;
+}
+
+# jmh, 20041202, fixed 2 assignments below, as they were previously transposed
+$zip_population_file = "$lookup_dir/$zip_population_file_basename";
+$restricted_provider_zip_population_file = "$lookup_dir/$restricted_provider_zip_population_file_basename";
+
+# Initialize restricted provider zipsec info
+
+if (defined($opt_r)) {
+	$restricted_provider_zip_population_file = $opt_r;
+}
+
+if (defined($opt_z)) {
+	$zip_population_file = $opt_z;
+}
+
+$restricted_provider_zip_method = '2';
+
+if (defined($opt_p)) {
+	if ($opt_p eq '23') {
+		$restricted_provider_zip_method = '23';
+		open(RESTR_PROV_ZIP, $restricted_provider_zip_population_file) || die "Cannot open restricted provider zip population file $restricted_provider_zip_population_file : $!\n";
+		while (<RESTR_PROV_ZIP>) {
+			chomp;
+			$line = $_;
+
+			# ignore comment or blank lines
+			if ($line =~ /^\s*#|^\s*$/) {
+				next;
+			}
+
+			if ($line =~ /^\s*([0-9][0-9][0-9])\s*$/) {
+				$RESTRICTED_PROVIDER_ZIPSEC{$1} = 1;
+			} else {
+				die "ERROR: Invalid zipsec listed in restricted provider zip population file $restricted_provider_zip_population_file ($line)\n";
+			}
+		}
+	} elsif ($opt_p eq '2') {
+		$restricted_provider_zip_method = '2';
+	} elsif ($opt_p eq 'full') {
+		$restricted_provider_zip_method = 'full';
+	} else {
+		die "ERROR: '$opt_p' is not a valid restricted provider zip method for -p option\n";
+	}
+}
+
+sub replace_substr() {
+  my($in_val) = shift;
+  my($start_pos) = shift;
+  my($end_pos) = shift;
+  my($replace_val) = shift;
+  my($begin_val, $end_val, $formatted_substr, $input_length);
+
+	# make position values 0-based instead of 1-based
+	$start_pos--;
+	$end_pos--;
+
+	$input_length = length($in_val);
+
+	if ($start_pos > 0) {
+		$begin_val = substr($in_val, 0, $start_pos);
+	}
+
+	if ($end_pos + 1 <= $input_length) {
+		$end_val = substr($in_val, $end_pos + 1);
+	}
+
+	$field_length = $end_pos - $start_pos + 1;
+
+	if ($start_pos + $field_length > $input_length) {
+		$field_length = $input_length - $start_pos;
+	}
+
+	$formatted_substr = sprintf("%-${field_length}.${field_length}s", $replace_val);
+
+	return $begin_val . $formatted_substr . $end_val;
+}
+
+sub range_substr() {
+	my($input_val) = shift;
+	my($start_pos) = shift;
+	my($end_pos) = shift;
+
+	return substr($input_val, $start_pos - 1, $end_pos - $start_pos + 1);
+}
+
+
+@VALID_RECORD_TYPES = (
+'AA0',
+'BA0',
+'BA1',
+'BB7',
+'CA0',
+'CA1',
+'CA7',
+'CA8',
+'CB0',
+'CB7',
+'DA0',
+'DA1',
+'DA2',
+'DA3',
+'DA6',
+'DA7',
+'DA8',
+'DA9',
+'EA0',
+'EA1',
+'EA7',
+'FA0',
+'FA9',
+'FB0',
+'FB1',
+'FB2',
+'XA0',
+'YA0',
+'ZA0',
+'01',
+'10',
+'20',
+'30',
+'31',
+'32',
+'34',
+'40',
+'41',
+'50',
+'60',
+'61',
+'70',
+'80',
+'90',
+'95',
+'99'
+);
+
+foreach $rec_type (@VALID_RECORD_TYPES) {
+	$VALID_REC_TYPES{$rec_type} = 1;
+}
+
+# load low-population zips
+
+if (! -f $zip_population_file) {
+	die "ERROR: Unable to find $zip_population_file file\n";
+}
+
+open(ZIP_POP, $zip_population_file) || die "ERROR: Unable to open $zip_population_file file : $!\n";
+
+while (<ZIP_POP>) {
+
+	chomp;
+	$zip = $_;
+
+	$FACILITY_LOW_POPULATION{$zip} = 1;
+
+}
+
+close(ZIP_POP);
+
+if (! defined($ARGV[0])) {
+	if (-t 0) {
+		print STDERR "$prog_name: ERROR: Standard input cannot be a terminal when input_file is not specified\
+n";
+		exit(1);
+	} else {
+		$INPUT = *STDIN;
+	}
+} else {
+	$input_files = join(' ', @ARGV);
+
+	if (! open(IN, "read_file $input_files |")) {
+		print STDERR "$prog_name: ERROR: Unable to start uncompressing input files $input_files : $!\n";
+		exit(1);
+	}
+
+	$INPUT = *IN;
+}
+
+if ($compress_output) {
+	if (! open($OUTPUT, "| gzip -c")) {
+		print STDERR "$prog_name: ERROR: Unable to start compressing output for $input_files : $!\n";
+		exit(1);
+	}
+} else {
+	$OUTPUT = *STDOUT;
+}
+
+while (<$INPUT>) {
+  chomp;
+  $input_rec = $_;
+  $output_rec = $_;
+
+  $rec_type3 = substr($input_rec, 0, 3);
+  $rec_type2 = substr($input_rec, 0, 2);
+
+  if ((! defined($VALID_REC_TYPES{$rec_type3}) and (! defined($VALID_REC_TYPES{$rec_type2})))) {
+		next;	# skip invalid records
+  }
+
+  SWITCH: {
+
+	# NSF records
+
+	/^[ABCXYZ]A0/	&& do {
+		# reset "current claim" variables since this record necessarily means we are no longer processing the previous claim
+		$source_of_pay = '';
+	};
+
+	/^[ABYZ]A0/	&& do {
+		# reset "current batch" variables since this record necessarily means we are no longer processing the previous batch
+		$prov_tax_id = '';
+	};
+
+	/^BA0/	&& do {
+
+			$prov_tax_id = &range_substr($output_rec, 32, 40);
+
+			last SWITCH;
+	};
+
+	/^BA1/	&& do {
+
+			# change provider zips to 2 digits for Tulsa restricted accounts (tax id is blank or all 0)
+
+			if ($prov_tax_id =~ /^[ 0]*$/) {	
+				$provider_zip1 = &range_substr($output_rec, 117, 125);
+				$provider_zip2 = &range_substr($output_rec, 218, 226);
+				$provider_zip1 =~ s/^ +//;
+				$provider_zip1 =~ s/ +$//;
+				$provider_zip2 =~ s/^ +//;
+				$provider_zip2 =~ s/ +$//;
+
+                                if ($restricted_provider_zip_method eq '2') {
+
+                                        # 2 digit method
+					$provider_zip1 = substr($provider_zip1, 0, 2);
+					$provider_zip2 = substr($provider_zip2, 0, 2);
+
+                                } elsif ($restricted_provider_zip_method eq '23') {
+
+                                        # 2 or 3 digit method
+
+					$provider_zipsec1 = substr($provider_zip1, 0, 3);
+
+                                        if (defined($RESTRICTED_PROVIDER_ZIPSEC{$provider_zipsec1})) {
+						$provider_zip1 = substr($provider_zip1, 0, 2);
+                                        } else {
+						$provider_zip1 = $provider_zipsec1;
+                                        }
+
+					$provider_zipsec2 = substr($provider_zip2, 0, 3);
+
+                                        if (defined($RESTRICTED_PROVIDER_ZIPSEC{$provider_zipsec2})) {
+						$provider_zip2 = substr($provider_zip2, 0, 2);
+                                        } else {
+						$provider_zip2 = $provider_zipsec2;
+                                        }
+                                } elsif ($restricted_provider_zip_method ne 'full') {
+                                        die "ERROR: Don't know what provider zip to use because restricted_provider_zip_method variable is set to an invalid value of '$restricted_provider_zip_method'\n";
+				}
+
+				$output_rec = &replace_substr($output_rec, 117, 125, $provider_zip1);
+				$output_rec = &replace_substr($output_rec, 218, 226, $provider_zip2);
+			}
+
+			last SWITCH;
+	};
+
+	/^DA0/	&& do {
+			$output_rec = &replace_substr($output_rec, 69, 88);	# group no
+			$output_rec = &replace_substr($output_rec, 89, 121);	# group name
+			$output_rec = &replace_substr($output_rec, 214, 214);	# insured MI
+			$output_rec = &replace_substr($output_rec, 215, 217);	# insured generation
+
+			$source_of_pay = &range_substr($output_rec, 24, 24);
+
+			if ($source_of_pay =~ /^[Aa0]$/) {	# if self pay
+				$output_rec =&replace_substr($output_rec, 36, 68);	# payer name
+			}
+
+			last SWITCH;
+	};
+
+	/^DA1/	&& do {
+			if ($source_of_pay =~ /^[Aa0]$/) {	# if self pay
+				$output_rec = &replace_substr($output_rec, 23, 52);	# payer addr 1
+				$output_rec = &replace_substr($output_rec, 53, 82);	# payer addr 2
+				$output_rec = &replace_substr($output_rec, 83, 102);	# payer city
+				$output_rec = &replace_substr($output_rec, 105, 113);	# payer zip
+			}
+
+			last SWITCH;
+	};
+
+	/^DA2/	&& do {
+			$output_rec = &replace_substr($output_rec, 124, 131);	# insured retire date
+			$output_rec = &replace_substr($output_rec, 132, 139);	# insured spouse retire 
+			last SWITCH;
+	};
+
+	/^EA0/	&& do {
+			$output_rec = &replace_substr($output_rec, 32, 33);	# accident/symptom date DD
+			$output_rec = &replace_substr($output_rec, 52, 53);	# release of info date DD
+			$output_rec = &replace_substr($output_rec, 61, 62);	# same/similar symptom date DD
+			$output_rec = &replace_substr($output_rec, 70, 71);	# disability from date DD
+			$output_rec = &replace_substr($output_rec, 78, 79);	# disability to date DD
+			$output_rec = &replace_substr($output_rec, 161, 162);	# admission date1 DD
+			$output_rec = &replace_substr($output_rec, 169, 170);	# discharge date1 DD
+			$output_rec = &replace_substr($output_rec, 207, 208);	# prov signature date DD
+			$output_rec = &replace_substr($output_rec, 273, 274);	# date last seen DD
+			$output_rec = &replace_substr($output_rec, 281, 282);	# date document sent DD
+
+			last SWITCH;
+	};
+
+
+	/^EA1/	&& do {
+			$output_rec = &replace_substr($output_rec, 167, 168);	# return to work date DD
+			$output_rec = &replace_substr($output_rec, 175, 176);	# consult/surgery date DD
+			$output_rec = &replace_substr($output_rec, 183, 184);	# admission date2 DD
+			$output_rec = &replace_substr($output_rec, 191, 192);	# discharge date2 DD
+
+			$output_rec = &replace_substr($output_rec, 258, 277);	# emt/paramedic last name
+			$output_rec = &replace_substr($output_rec, 278, 289);	# emt/paramedic first name
+			$output_rec = &replace_substr($output_rec, 290, 290);	# emt/paramedic middle name
+
+			last SWITCH;
+	};
+
+	/^EA7/	&& do {
+			$output_rec = &replace_substr($output_rec, 117, 148);	# facility/lab zip code encrypted
+			$output_rec = &replace_substr($output_rec, 149, 180);	# facility/lab zipsec1 encrypted
+			$output_rec = &replace_substr($output_rec, 181, 183);	# facility/lab zipsec2
+
+			last SWITCH;
+	};
+
+	/^FA0/	&& do {
+			$output_rec = &replace_substr($output_rec, 46, 47);	# service from date DD
+			$output_rec = &replace_substr($output_rec, 54, 55);	# service to date DD
+			$output_rec = &replace_substr($output_rec, 219, 220);	# serum creatine date DD
+
+			$output_rec = &replace_substr($output_rec, 207, 209);	# patient weight
+
+			last SWITCH;
+	};
+
+	/^FB0/	&& do {
+			$output_rec = &replace_substr($output_rec, 149, 150);	# prescription date DD
+
+			$hpsa_facility_zip = &range_substr($output_rec, 173, 181);
+			$hpsa_facility_zip =~ s/^ +//;
+			$hpsa_facility_zipsec = substr($hpsa_facility_zip, 0, 3);
+
+			# 3 digit zipsec or 2 digit zipsec, based on population
+
+			if (defined($FACILITY_LOW_POPULATION{$hpsa_facility_zipsec})) {
+				$zipsec = substr($hpsa_facility_zip, 0, 2);
+			} else {
+				$zipsec = substr($hpsa_facility_zip, 0, 3);
+			}
+
+			$output_rec = &replace_substr($output_rec, 173, 181, $zipsec);
+
+			last SWITCH;
+	};
+
+	# UB records
+
+	/^01/	&& do {
+
+			$output_rec = &replace_substr($output_rec, 161, 162);	# processing date DD
+
+			last SWITCH;
+	};
+
+	/^10/	&& do {
+
+			$output_rec = &replace_substr($output_rec, 80, 81);	# NDC processing date DD
+
+			$prov_tax_id = &range_substr($output_rec, 8, 17);
+
+			# change provider zips to 2 or 3 digits for Tulsa restricted accounts (tax id is blank or all 0)
+
+			if ($prov_tax_id =~ /^[ 0]*$/) {
+				$provider_zip = &range_substr($output_rec, 163, 171);
+				$provider_zip =~ s/^ +//;
+				$provider_zip =~ s/ +$//;
+
+				if ($restricted_provider_zip_method eq '2') {
+
+					# 2 digit method
+					$provider_zip = substr($provider_zip, 0, 2);
+
+				} elsif ($restricted_provider_zip_method eq '23') {
+
+					# 2 or 3 digit method
+
+					$provider_zipsec = substr($provider_zip, 0, 3);
+
+					if (defined($RESTRICTED_PROVIDER_ZIPSEC{$provider_zipsec})) {
+						$provider_zip = substr($provider_zip, 0, 2);
+					} else {
+						$provider_zip = $provider_zipsec;
+					}
+                                } elsif ($restricted_provider_zip_method ne 'full') {
+                                        die "ERROR: Don't know what provider zip to use because restricted_provider_zip_method variable is set to an invalid value of '$restricted_provider_zip_method'\n";
+				}
+
+				$output_rec = &replace_substr($output_rec, 163, 171, $provider_zip);
+			}
+
+			last SWITCH;
+	};
+
+	/^20/	&& do {
+
+			$output_rec = &replace_substr($output_rec, 289, 290);	# admission date DD
+			$output_rec = &replace_substr($output_rec, 299, 300);	# statement covers from date DD
+			$output_rec = &replace_substr($output_rec, 307, 308);	# statement covers through date DD
+
+			last SWITCH;
+	};
+
+	/^30/	&& do {
+
+			$output_rec = &replace_substr($output_rec, 169, 185);	# group number
+			$output_rec = &replace_substr($output_rec, 186, 199);	# group name
+
+			last SWITCH;
+	};
+
+	/^34/	&& do {
+
+			$output_rec = &replace_substr($output_rec, 141, 142);	# authorization from date DD
+			$output_rec = &replace_substr($output_rec, 149, 150);	# authorization thru date DD
+			$output_rec = &replace_substr($output_rec, 232, 233);	# authorization from date DD
+			$output_rec = &replace_substr($output_rec, 240, 241);	# authorization thru date DD
+			$output_rec = &replace_substr($output_rec, 323, 324);	# authorization from date DD
+			$output_rec = &replace_substr($output_rec, 331, 332);	# authorization thru date DD
+
+			last SWITCH;
+	};
+
+	/^40/	&& do {
+
+			$output_rec = &replace_substr($output_rec, 272, 273);	# occurrence date 1 DD
+			$output_rec = &replace_substr($output_rec, 282, 283);	# occurrence date 2 DD
+			$output_rec = &replace_substr($output_rec, 292, 293);	# occurrence date 3 DD
+			$output_rec = &replace_substr($output_rec, 302, 303);	# occurrence date 4 DD
+			$output_rec = &replace_substr($output_rec, 312, 313);	# occurrence date 5 DD
+			$output_rec = &replace_substr($output_rec, 322, 323);	# occurrence date 6 DD
+			$output_rec = &replace_substr($output_rec, 332, 333);	# occurrence date 7 DD
+			$output_rec = &replace_substr($output_rec, 342, 343);	# occurrence span from date DD
+			$output_rec = &replace_substr($output_rec, 350, 351);	# occurrence span through date DD
+			$output_rec = &replace_substr($output_rec, 360, 361);	# occurrence span from date DD
+			$output_rec = &replace_substr($output_rec, 368, 369);	# occurrence span through date DD
+
+			last SWITCH;
+	};
+
+	/^60/	&& do {
+
+			$output_rec = &replace_substr($output_rec, 120, 121);	# service date DD
+			$output_rec = &replace_substr($output_rec, 176, 177);	# service date DD
+			$output_rec = &replace_substr($output_rec, 232, 233);	# service date DD
+
+			last SWITCH;
+	};
+
+	/^61/	&& do {
+
+			$output_rec = &replace_substr($output_rec, 122, 123);	# revenue date of service DD
+			$output_rec = &replace_substr($output_rec, 178, 179);	# revenue date of service DD
+			$output_rec = &replace_substr($output_rec, 234, 235);	# revenue date of service DD
+
+			last SWITCH;
+	};
+
+	/^70/	&& do {
+
+			$output_rec = &replace_substr($output_rec, 136, 137);	# principle procedure date DD
+			$output_rec = &replace_substr($output_rec, 151, 152);	# other procedure date 1 DD
+			$output_rec = &replace_substr($output_rec, 166, 167);	# other procedure date 2 DD
+			$output_rec = &replace_substr($output_rec, 181, 182);	# other procedure date 3 DD
+			$output_rec = &replace_substr($output_rec, 196, 197);	# other procedure date 4 DD
+			$output_rec = &replace_substr($output_rec, 211, 212);	# other procedure date 5 DD
+
+			last SWITCH;
+	};
+
+  }
+
+  print $OUTPUT $output_rec . "\n" || die "Unable to write record to output: $!\n";
+
+}
+
+if (! close($OUTPUT)) {
+	print STDERR "$prog_name: ERROR: Problem closing or writing compressed output for $input_files: $!\n";
+	exit(1);
+}
+
+if (! close($INPUT)) {
+	print STDERR "$prog_name: ERROR: Problem closing or reading compressed input files $input_files: $!\n";
+	exit(1);
+}
+
+

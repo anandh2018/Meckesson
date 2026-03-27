@@ -1,0 +1,96 @@
+#!/usr/bin/perl
+
+use BLUELITE::Job;
+use List::Util qw(min max);
+use Data::Dumper;
+use strict;
+use warnings;
+
+# Version 2.75 - 4/6/2011
+#
+# - Added support for flexible date specifications in -post-date option (ranges, months, etc).
+# - Added interactive confirmation when more than 1 post date is requested for reset.
+# - Added -no-confirm command line option in case this script ever needs to be used non-interactively.
+#
+# Version 6.0 - 10/31/2014
+# - Added support for "autohoc" requests (i.e. automated on-demand ad-hoc processing).
+#
+
+our $PGM = $0;
+$PGM =~ s/.*\///g;
+
+if (scalar(@ARGV) == 0) {
+	print "$PGM: Reset concatenation/deliverable info in the database for specific post dates and app_id (+ optional request_id).
+
+This will remove all rows associated to the given application and post date from the
+JOB_DELIVERY and JOB_DELIVERY_SEQ tables, and will disassociate all related workers
+in the JOB_WORKER table from any concatenated deliverables.
+
+Usage: $PGM -app-id a [-request-id #] -post-date pd_spec
+
+Note: pd_spec may be a comma-separated list of any combination of the following syntaxes:
+
+ YYYYMMDD
+ YYYYMMDD-YYYYMMDD
+ YYYYMM
+ YYYYMM-YYYYMM
+ YYYYMMDD-YYYYMM
+ YYYYMM-YYYYMMDD
+";
+	exit(1);
+}
+
+use Getopt::Long;
+
+my ($app_id, $post_date, $no_confirm, $request_id);
+my $confirm = 1;
+
+GetOptions(
+            'app-id=s' => \$app_id,
+            'request-id=i' => \$request_id,
+            'post-date=s' => \$post_date,
+            'no-confirm' => \$no_confirm
+) || exit(1);
+
+$confirm = 0 if (defined($no_confirm));
+
+die "$PGM: -app-id parameter not provided!\n" if (! defined($app_id));
+
+my @job_params = (app_id => $app_id);
+push(@job_params, request_id => $request_id) if (defined($request_id));
+
+my $job = BLUELITE::Job->new(@job_params) || die "Could not obtain BLUELITE::Job object\n";
+
+if (defined($request_id)) {
+	die "$PGM: Cannot provide -post-date parameter when using -request-id!\n" if (defined($post_date));
+
+	$post_date = $job->{RQ_POST_DATE};
+}
+
+die "$PGM: -post-date parameter not provided!\n" if (! defined($post_date));
+
+my $post_date_list = BLUELITE::Job->post_date_list($post_date);
+die "ERROR: Could not decipher post date of '$post_date'\n" if (! defined($post_date_list));
+
+if ($confirm && (scalar(@{$post_date_list}) > 1)) {
+  print "WARNING! This will reset concatenation for up to " . scalar(@{$post_date_list}) . " post dates between " . min(@{$post_date_list}) . " and " . max(@{$post_date_list}) . "\n";
+  print "ARE YOU SURE YOU WISH TO PROCEED? (y/N) : ";
+
+  my $response = <STDIN>;
+
+  if ($response !~ /^\s*(y|yes)\s*$/i) {
+    print "Did not attempt to reset anything\n";
+    exit(1);
+  }
+}
+
+if ($job->reset_concat(post_date => $post_date_list, post_date_spec => $post_date)) {
+	if (defined($request_id)) {
+		$job->update_job_config(assignments => { rq_resume => 'Y', rq_process_end_date => '', rq_step => 'EXTRACT', rq_status => 'QUEUE', rq_status_detail => 'Queued by job_concat_reset for re-concatenation'});
+	}
+
+  $job->commit;
+} else {
+  print "No concatenations to reset\n";
+}
+

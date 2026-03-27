@@ -1,0 +1,23 @@
+#!/usr/bin/perl
+
+use String::Nysiis qw(nysiis);
+use Text::Soundex;
+use Getopt::Long;
+use strict;
+
+my @nysiis;
+my @soundex;
+
+my $result = GetOptions("nysiis=s" => \@nysiis,
+                        "soundex=s" => \@soundex,
+                       );
+
+foreach my $raw_word (@nysiis) {
+  my $phoneticized_word = nysiis($raw_word);
+  print "$raw_word: $phoneticized_word (Nysiis)\n";
+}
+
+foreach my $raw_word (@soundex) {
+  my $phoneticized_word = soundex($raw_word);
+  print "$raw_word: $phoneticized_word (Soundex)\n";
+}

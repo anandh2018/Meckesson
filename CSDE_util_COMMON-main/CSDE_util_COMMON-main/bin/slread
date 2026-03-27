@@ -1,0 +1,78 @@
+#!/usr/bin/perl
+
+use Getopt::Long;
+use BLUELITE::SLFile qw($SLFileError);
+use strict;
+use warnings;
+
+our $PGM = $0;
+$PGM =~ s|.*/||g;
+
+our $DS_BASE_DIR = $ENV{DS_BASE_DIR};
+die "ERROR: DS_BASE_DIR environment variable is '$DS_BASE_DIR', which is not an existing directory\n" if (! ((defined($DS_BASE_DIR)) && (-d $DS_BASE_DIR)));
+
+my $exit_success = 0;
+my $encrypt_key_file = "$DS_BASE_DIR/common/etc/.al.pp";
+my $use_stdout = 1;
+
+GetOptions(
+            'exit=s' => \$exit_success,
+						'encrypt-key-file=s' => \$encrypt_key_file,
+						'c' => \$use_stdout	# deprecated
+) || exit(1);
+
+
+
+sub usage() {
+	print STDERR "$PGM: unwrap the contents of sl files\n\n";
+	print STDERR "Usage: $PGM [-options] file [file ...]\n";
+	print STDERR "  Options:\n";
+	print STDERR "	-c			Write output to STDOUT (default)\n";
+	print STDERR "	-exit #			Exit with status # on successful conversion (default $exit_success)\n";
+	print STDERR "	-encrypt-key-file f	Location of file containing encryption key\n";
+}
+
+if (scalar(@ARGV) == 0) {
+	usage;
+	exit(1);
+}
+
+my @input_files = @ARGV;
+my $read_error = 0;
+
+my ($buffer, $sl, $infile);
+
+
+# make sure that ALL input files are readible
+
+foreach $infile (@input_files) {
+	if (! -r $infile) {
+		print STDERR "$PGM: ERROR: Input file '$infile' is not readible\n";
+		$read_error = 1;
+	}
+}
+
+exit(1) if ($read_error);
+
+# read each SL file
+
+foreach $infile (@input_files) {
+
+	$sl = BLUELITE::SLFile->new($infile, encrypt_key_file => $encrypt_key_file);
+
+	die "$PGM: ERROR: Could not get SLFile object for input file '$infile': $SLFileError\n" if (! defined($sl));
+
+	while ($sl->read(\$buffer, $sl->blocksize)) {
+
+		if (! print $buffer) {
+			die "$PGM: ERROR: Could not append output for input file '$infile' : $!\n";
+		};
+
+	}
+
+	if (! $sl->close) {
+		die "$PGM: ERROR: Could not close input file '$infile' : $SLFileError\n";
+	}
+}
+
+exit($exit_success);

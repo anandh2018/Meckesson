@@ -1,0 +1,99 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+my $dir;
+
+if (! (scalar(@ARGV) >= 1)) {
+	print "Usage 1: fragreport\n";
+	print "Usage 2: fragreport file [..]\n";
+	exit(1);
+}
+
+my @files;
+
+if (-d $ARGV[0] || -l $ARGV[0]) {
+
+	if (scalar(@ARGV) > 1) {
+			die "ERROR: no more arguments may be specified when 1st argument is a directory\n";
+	}
+
+	$dir = $ARGV[0];
+
+	@files = grep { -f $_ } glob("$ARGV[0]/*");
+} else {
+	@files = @ARGV;
+
+	my @non_files = grep { ! -f $_ } @files;
+
+	if (scalar(@non_files) >= 1) {
+		print STDERR "ERROR: the following arguments were not regular files:\n";
+		print STDERR join("\n", @non_files) . "\n";
+		exit(1);
+	}
+}
+
+my ($size, $blocks, $total_blocks, $total_extents, $extents, $fragment_pct, $total_files);
+
+$total_blocks = 0;
+$total_extents = 0;
+$total_files = 0;
+
+print "FILE	BLOCKS	EXTENTS	FRAGMENTATION %\n";
+print "----	------	-------	---------------\n";
+
+foreach my $file (@files) {
+
+  if (! open(FH, "sudo filefrag $file 2>&1 |")) {
+    die "ERROR: unable to launch filefrag $file : $!\n";
+  }
+
+	$extents = undef;
+
+  while (my $record = <FH>) {
+    chomp $record;
+		$record =~ /^${file}:\s*(\d+)\s+extents?\s+found/i;
+		$extents = $1;
+
+		if ($extents !~ /^\d+$/) {
+			die "ERROR: Could not determine # of extents for file $file\n";
+		}
+
+		$total_extents += $extents;
+	}
+
+	if (! defined($extents)) {
+		die "ERROR: Could not get # of extents for file $file\n";
+	}
+
+	$size = -s $file;
+	$blocks = int(($size + 4095) / 4096);
+	$total_blocks += $blocks;
+
+	if ($extents == 1) {
+		$fragment_pct = 0;
+	} else {
+		$fragment_pct = sprintf('%.1f', $extents / $blocks * 100);
+	}
+
+	print "$file	$blocks	$extents	$fragment_pct %\n";
+
+	$total_files++;
+	close(FH);
+}
+
+if ($total_extents == $total_files) {
+	$fragment_pct = 0;
+} else {
+	$fragment_pct = sprintf('%.1f', $total_extents / $total_blocks * 100);
+}
+
+print "\n";
+
+if (defined($dir)) {
+	print "TOTAL ($dir)	$total_blocks	$total_extents	$fragment_pct %\n";
+} else {
+	print "TOTAL	$total_blocks	$total_extents	$fragment_pct %\n";
+}
+

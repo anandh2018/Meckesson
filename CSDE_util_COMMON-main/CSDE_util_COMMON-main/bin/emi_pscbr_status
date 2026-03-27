@@ -1,0 +1,28 @@
+#!/usr/bin/bash
+
+#Author: W Hampton
+#Status GlassFish/Tomcat Elim
+
+export USER=`whoami`
+if [ "${USER}" = "pscbr" ];
+then
+    # Find current PIDs running Glassfish
+    export GLASS_PID_PSCBR=`ps ux | grep -w "domain" | grep -v "grep" | tr -s ' ' | cut -f 2 -d ' '`
+    export TOMCAT_PID_PSCBR=`ps ux | grep -w "Dcatalina" | grep -v "grep" | tr -s ' ' | cut -f 2 -d ' '`
+    #Checking if the PIDs are running
+    if [ "${GLASS_PID_PSCBR}" = "" ]
+  then
+     echo "domain1 is not running..."
+  else
+     echo "domain=[domain1] running: ${GLASS_PID_PSCBR}"
+   fi
+     if [ "${TOMCAT_PID_PSCBR}" = "" ]
+     then  
+        echo "Tomcat is not running..."
+    else 
+        echo "Tomcat is running: ${TOMCAT_PID_PSCBR}" 
+    fi
+    else
+        echo "Need to be pscbr to execute."
+fi
+

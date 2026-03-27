@@ -1,0 +1,44 @@
+#!/usr/bin/perl
+
+use SSN::Validate;
+use strict;
+use warnings;
+
+my $ssn_validate_obj = new SSN::Validate;
+my $ssn;
+my $msg;
+my $valid;
+
+
+while (<>)
+{
+        $ssn = $_;
+
+        $ssn =~ s/\015?\012$//;
+
+        if ($ssn =~ /^\s*$/)
+        {
+                $msg =  "BLANK";
+                $valid = 0;
+        }
+        elsif ($ssn !~ /^[0-9]{3}[-]?[0-9]{2}[-]?[0-9]{4}$/)
+        {
+                $msg =  "NOT FORMAT OF SSN";
+                $valid = 0;
+        }
+        elsif (! $ssn_validate_obj->valid_ssn($ssn))
+        {
+                $valid = 0;
+                $msg = "NOT VALID";
+        }
+        else
+        {
+                $valid = 1;
+                $msg = "";
+        }
+
+        print join(",", $ssn,
+                        ($valid ? "GOOD" : "BAD"),
+                        $msg) . "\n";
+}
+

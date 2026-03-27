@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+
+# Program: job_status - Report current status of Data Services Job package data feeds
+# Author: John Hess, RelayHealth
+
+# Version 1.0 - 11/4/2010
+# Initial release (perl implementation)
+#
+# Version 1.1 - 5/10/2011
+# - An app will now automatically be forced to red if it has been yellow (due to ERROR) for at least 3 hours (by default)
+# - Added -max-yellow-minutes command-line option
+# - Overall status will be forced to red if too many apps are currently in yellow status
+# - Added -max-yellow-apps and -max-pct-yellow-apps command-line options (default of 4 apps and 20% of apps)
+# - When running in bigbrother mode, each message in MESSAGE column is limited to 800 characters (by default)
+# - Added -max-message-length command-line option (for bigbrother mode) (default of 800)
+# - Removed reference to Data::Dumper module, since it is only used for debugging in dev
+# - For each app, green status will display latest event date and message logged at INFO or DEBUG level. However,
+# green status can only be obtained via INFO or FD* log message (e.g. WARN or ERROR followed by DEBUG is still yellow, but
+# INFO followed by DEBUG is green with event date and message of the DEBUG). In other words, in a green or purple status the
+# event date and message reflect the most recent event, but in a yellow or red status they reflect the most recent event
+# keeping the app in it's current status.
+#
+# Version 4.0 - 8/18/2011
+# - Fixed bug where perl error was encountered if any requested app_id had no activity within the requested time period.
+#
+# Version 4.9 - 6/20/2013
+# - Truncated event_date to eliminate seconds from displaying.
+# - Removed trailing spaces from end of message display.
+#
+# Version 5.0 - 20160406 Larry Spiwak <lawrence.spiwak@relayhealth.com>
+# - add in DSMONITOR Bridge functionality to push statistics into DSMONITOR for Orion monitoring
+#
+# Version 6.4d - 4/28/2017 J Hess
+# - Make status immediately go red when encountering MAX ATTEMPTS REACHED (LAMA). Leave red until launcher
+#   completes with all successful workers (LAEND).
+#
+# Version 6.5 - 2/21/2022 J Hess
+# - Rewrite/port from perl to python
+
+import cx_Oracle, re, sys, os, argparse
+from operator import itemgetter
+
+
+
+def get_dbh(schema_prefix):
+	env = os.environ.get('JOBPKG_ENV')
+
+	if not env:
+		print('environment variable JOBPKG_ENV is not set')
+		sys.exit(1)
+
+	login_env_var = schema_prefix + '_' + env + '_LOGIN'
+	login_str = os.environ.get(login_env_var)
+
+	if not login_str:
+		print(f'environment variable {login_env_var} is not set')
+		sys.exit(2)
+
+	login_re = re.compile('^([^/]+)/([^@]+)@[^:]+:[^:]+:(.+)$')
+	login_re_match = login_re.match(login_str)
+
+	if not login_re_match:
+		print ('Could not parse username, password, and service from environment variable ' + login_env_var)
+		sys.exit(1)
+
+	(username, pwd, service) = (login_re_match.group(1,2,3))
+
+	dbh = None
+
+	try:
+		dbh = cx_Oracle.connect(username, pwd, service)
+
+	except cx_Oracle.DatabaseError as e:
+		print('db connection error: ' + e.args[0].message)
+
+	return dbh
+
+
+
+def log_history(app_list, dbh, as_of_datetime, event_days_subtract):
+	# Run query to retrieve recent logged events for all desired App IDs.
+	# Note: replace query with recent_events() method call after converting
+	#       perl Job.pm package to python
+
+	# build query
+
+	log_history_sql = """
+	SELECT
+		app_id,
+		to_char(event_date, 'YYYYMMDD HH24:MI:SS') as event_date_str,
+		log_type,
+		event_code,
+		(sysdate - cast(event_date AS date)) * 24 * 60 as minutes_since_logged,
+		message
+	FROM job_log
+	WHERE	"""
+
+	if as_of_datetime is None:
+		# get most recent events
+		log_history_sql = log_history_sql + """event_date >= trunc(systimestamp) - """ + str(event_days_subtract)
+	else:
+		# get events up through point in time if specified on command-line
+		as_of_re = re.compile('^\d\d\d\d\d\d\d\d \d\d:\d\d:\d\d$')
+
+		if as_of_re.match(as_of_datetime):
+			log_history_sql = log_history_sql + """event_date < to_date('""" + as_of_datetime + """', 'YYYYMMDD HH24:MI:SS') and event_date > to_date('""" + as_of_datetime + """', 'YYYYMMDD HH24:MI:SS') - """ + str(event_days_subtract)
+		else:
+			raise Exception("As_of date/time value of '" + as_of_datetime + "' is not formatted properly")
+
+	# limit to desired list of apps
+	log_history_sql = log_history_sql + "\nAND app_id in ('" + '\', \''.join(app_list) + '\')'
+
+	log_history_sql = log_history_sql + """
+	ORDER BY app_id, event_date ASC
+	"""
+
+	log_info = {}
+
+
+	# fetch events into log_info structure
+	try:
+		with dbh.cursor() as sth:
+			sth.execute(log_history_sql)
+
+			while True:
+				row = sth.fetchone()
+
+				if row is None:
+					break
+
+				app_id = row[0]
+
+				if app_id in log_info:
+					log_info[app_id].append(row)
+				else:
+					log_info[app_id] = [row]
+
+	except Exception as e:
+		print('query error: ' + e.args[0].message)
+		sys.exit(1)
+
+	return log_info
+
+
+def app_id_list(dbh, app_id, group_id):
+	# Get list of App IDs, based on command line option or via query (default)
+	app_list = []
+
+	if app_id:
+		app_list.append(app_id)
+	else:
+		# Run query to obtain list of desired app_IDs
+
+		app_list_sql = """
+		SELECT c.app_id
+		FROM job_config c
+		LEFT OUTER JOIN job_param_default jpg
+			ON c.group_id = jpg.group_id and
+			jpg.param = \'STATUS_MONITOR\'
+		LEFT OUTER JOIN job_param_default jp_global
+			ON jp_global.group_id = \'GLOBAL\' and
+			jp_global.param = \'STATUS_MONITOR\'
+		WHERE nvl(c.status_monitor, nvl(jpg.value, jp_global.value)) = \'Y\'
+			AND (max_run_date > sysdate or max_run_date is null)
+		"""
+
+		if group_id:
+			app_list_sql = app_list_sql + "	AND c.group_id = '" + group_id + "'\n"
+
+		app_list_sql = app_list_sql + '	ORDER BY c.app_id'
+
+		try:
+			with dbh.cursor() as sth:
+				sth.execute(app_list_sql)
+
+				while True:
+					row = sth.fetchone()
+
+					if row is None:
+						break
+
+					app_id = row[0]
+					app_list.append(app_id)
+
+		except Exception as e:
+			print('query error: ' + e.args[0].message)
+			sys.exit(1)
+
+	return app_list
+
+
+def color_to_agg_status(color):
+	if color == 'green':
+		return 'INFO'
+	elif color == 'yellow':
+		return 'WARN'
+	elif color == 'red':
+		return 'ERROR'
+	else:
+		return 'UNK'
+
+
+def color_to_agg_status_text(color):
+	if color == 'green':
+		return 'All data feeds OK'
+	elif color == 'yellow':
+		return 'Warning'
+	elif color == 'red':
+		return 'ALERT'
+	else:
+		return 'Unknown/No activity'
+
+################ Main ################
+
+# setup and parse command-line options
+parser = argparse.ArgumentParser()
+parser.add_argument("-app_id", help = "Only show status of APP_ID")
+parser.add_argument("-group_id", help = "Only show status of apps in GROUP_ID")
+parser.add_argument("-days", type = int, default = 21, help = "Look back DAYS to find status info (default=21)")
+parser.add_argument("-max_yellow_minutes", type = int, default = 180, help = "Force app to red alert if yellow for # minutes (default=180)")
+parser.add_argument("-max_yellow_apps", type = int, default = 4, help = "Number of yellow apps required to force red alert (default=4, disable=0)")
+parser.add_argument("-max_pct_yellow_apps", type = int, default = 20, help = "%% of apps in yellow status that will force red alert (default=20, disable=0)")
+parser.add_argument("-as_of", help = "Report status as of the specified time. Format: YYYYMMDD HH:MI:SS")
+parser.add_argument("-bridge", action = 'store_true', default = False, help = "Send status to DSMONITOR")
+
+args = parser.parse_args()
+
+
+# Get database connection handles
+
+job_dbh = get_dbh('JOBPKG')
+
+dsmon_dbh = None
+
+if args.bridge:
+	dsmon_dbh = get_dbh('DSMONITOR')
+	with dsmon_dbh.cursor() as cursor:
+		cursor.execute("DELETE FROM ds_aggregate_status WHERE source = 'DATAFEED_BRIDGE'")
+
+
+# Get list of desired App IDs
+app_list = app_id_list(job_dbh, args.app_id, args.group_id)
+
+
+# Get recently logged events for each App ID
+log_info = log_history(app_list, job_dbh, args.as_of, args.days - 1)
+
+
+# If no apps found, force 1 dummy app into app list to avoid
+# handling special handling logic and allow for consistent
+# display of results.
+
+if not app_list:
+	app_list.append('')
+
+# Force empty log info for desired app_IDs with no recent job_log history.
+# This is so we can display "purple" status with "No activity"
+
+for app_id in app_list:
+	if app_id not in log_info:
+		log_info[app_id] = []
+
+
+# Loop through each recent job_log record for each app_id to determine latest status
+# of each app_id.
+
+fd_re = re.compile('^FD')
+spstatus_re = re.compile('^SPSTATUS')
+status_info = []
+
+
+for key_app_id in log_info:
+
+	# initialize status variables for this app
+	red = False
+	yellow = False
+	yellow_minutes = 0
+	green = False
+	purple = False
+	max_attempts = False
+
+	red_info = ""
+	yellow_info = ""
+	green_info = ""
+	purple_info = ""
+	max_attempts_info = ""
+	yellow_datetime = ""
+
+	# Loop through each recent job_log event (oldest to newest order)
+	# for this app and set various status variables (green, yellow, red
+	# max attempts, etc)
+
+	for t_log_rec in log_info[key_app_id]:
+		# convert tuple to list so we can modify items later
+		log_rec = list(t_log_rec)
+
+		event_date = log_rec[1]
+		log_type = log_rec[2]
+		event_code = str(log_rec[3])
+		minutes_since_logged = log_rec[4]
+
+		if fd_re.match(event_code):
+			green = True
+			green_info = log_rec
+			yellow = False
+			yellow_minutes = 0
+			red = False	
+		elif log_type == "LATE":
+			red = True
+			red_info = log_rec
+			yellow_minutes = 0
+		elif event_code == 'LAMA':
+			max_attempts = True
+			max_attempts_info = log_rec
+		elif event_code == 'LAEND':
+			max_attempts = False
+			max_attempts_info = ""
+			green = True
+			green_info = log_rec
+			yellow_minutes = 0
+			yellow = False
+		elif log_type == "WARN" or log_type == "ERROR":
+			yellow = True
+
+			if log_type == "ERROR":
+				if yellow_minutes == 0:
+					yellow_minutes = minutes_since_logged
+					yellow_datetime = event_date
+
+				yellow_info = log_rec
+			elif yellow_minutes == 0:
+				yellow_info = log_rec
+
+			if (spstatus_re.match(event_code)):
+				red = False
+		elif log_type == "INFO":
+			green = True
+			green_info = log_rec
+			yellow = False
+			yellow_minutes = 0
+
+			if spstatus_re.match(event_code):
+				red = False
+				max_attempts = False
+		elif log_type == 'DEBUG':
+			green_info = log_rec
+			purple_info = log_rec
+
+	if max_attempts and not red:
+		red = True
+		red_info = max_attempts_info
+
+	status = ""
+	status_row = [];
+
+	if red:
+		status = 'red'
+		status_row = red_info
+	elif yellow:
+		if yellow_minutes < args.max_yellow_minutes:
+			status = 'yellow'
+		else:
+			status = 'red'
+			yellow_info[5] += f". Status turned yellow at {yellow_datetime}, but was automatically set to red after being yellow (due to ERROR) for at least {args.max_yellow_minutes} minutes. It has been {int(yellow_minutes)} minutes since the first problem."
+
+		status_row = yellow_info
+	elif green:
+		status = 'green'
+		status_row = green_info
+	else:
+		status = 'purple'
+		status_row = purple_info
+
+	status_info.append({'STATUS': status, 'APP_ID': key_app_id})
+
+	if len(status_row) > 0:
+		status_info[-1]['EVENT_DATE'] = status_row[1]
+		status_info[-1]['LOG_TYPE'] = status_row[2]
+		status_info[-1]['EVENT_CODE'] = status_row[3]
+		status_info[-1]['MINUTES_SINCE_LOGGED'] = status_row[4]
+		status_info[-1]['MESSAGE'] = status_row[5]
+	else:
+		status_info[-1]['MESSAGE'] = "No activity"
+		status_info[-1]['EVENT_DATE'] = ""
+
+
+# Determine max length needed for each display field, for subsequent display formatting
+max_lengths = {}
+
+for status_rec in status_info:
+	for status_field in ["STATUS", "APP_ID", "EVENT_DATE", "MESSAGE"]:
+		length = len(status_rec[status_field])
+
+		if len(status_field) > length:
+			length = len(status_field)
+
+		if status_field in max_lengths.keys():
+			if length > max_lengths[status_field]:
+				max_lengths[status_field] = length
+		else:
+			max_lengths[status_field] = length
+
+# Force max length of EVENT_DATE to 14 to strip off trailing seconds from display
+max_lengths['EVENT_DATE'] = 14
+
+
+# Use max length of each display field to construct display format string
+print_format = ''
+
+for field in ["STATUS", "APP_ID", "EVENT_DATE"]:
+	print_format = print_format + '%-' + str(max_lengths[field]) + '.' + str(max_lengths[field]) + 's' + '  '
+
+print_format = print_format + '%-1.' + str(max_lengths['MESSAGE']) + 's'
+
+
+# display header
+if sys.stdin.isatty():
+	print(print_format % ('STATUS', 'APP ID', 'EVENT DATE', 'MESSAGE'))
+	print(print_format % ('-' * max_lengths['STATUS'], '-' * max_lengths['APP_ID'], '-' * max_lengths['EVENT_DATE'], '-' * max_lengths['MESSAGE']))
+
+# Display latest status for each app_id and determine overall status
+
+overall_red = False
+overall_yellow = False
+overall_green = False
+exit_status = False
+num_yellow_apps = False
+num_apps = 0
+dsmon_rows = []
+
+for status_rec in sorted(status_info, key=itemgetter('EVENT_DATE', 'APP_ID'), reverse=True):
+	status = status_rec['STATUS']
+
+	if status == 'red':
+		overall_red = True
+	elif status == 'yellow':
+		overall_yellow = True
+		num_yellow_apps += 1
+	elif status == 'green':
+		overall_green = True
+
+	num_apps += 1
+
+	if sys.stdin.isatty():
+		print(print_format % (status_rec['STATUS'], status_rec['APP_ID'], status_rec['EVENT_DATE'], status_rec['MESSAGE']))
+
+	dsmon_rows.append((color_to_agg_status(status_rec['STATUS']), status_rec['APP_ID'], status_rec['EVENT_DATE'], status_rec['MESSAGE'], num_apps))
+
+
+# Determine overall status color/text
+
+overall_status_text = ''
+
+if overall_red:
+	overall_color = 'red'
+	exit_status = 2
+elif overall_yellow:
+	pct_yellow_apps = 100 * num_yellow_apps / num_apps
+
+	if (args.max_yellow_apps >= 1) and (num_yellow_apps >= args.max_yellow_apps) and (args.max_pct_yellow_apps > 0) and (pct_yellow_apps >= args.max_pct_yellow_apps):
+		overall_color = 'red'
+		exit_status = 2
+		overall_status_text = "Too many feeds in {yellow_ind} status ({num_yellow_apps})"
+	else:
+		overall_color = 'yellow'
+		exit_status = 1
+elif overall_green:
+	overall_color = 'green'
+	exit_status = 0
+else:
+	overall_color = 'purple'
+	exit_status = 0
+
+if len(overall_status_text) == 0:
+	if overall_color == 'green':
+		overall_status_text = 'All data feeds OK'
+	elif overall_color == 'yellow':
+		overall_status_text = 'Warning'
+	elif overall_color == 'red':
+		overall_status_text = 'ALERT'
+	elif overall_color == 'purple':
+		overall_status_text = 'Unknown/No activity'
+
+
+# Display overall status color/text if this is an interactive session
+
+overall_message_text = f"Overall status - {overall_status_text} ({overall_color})"
+
+if sys.stdin.isatty():
+	print(f"\n{overall_message_text}")
+else:
+	print('job_status: Refusing to generate output: STDIN is NOT a terminal!', file=sys.stderr)
+
+# Add status rows to ds_aggregate_status table if -bridge command-line option used
+if dsmon_dbh:
+	# add overall status row to dsmon_rows w/sequence # 0
+	dsmon_rows.append((color_to_agg_status(overall_color), 'OVERALL_STATUS', '', overall_message_text, 0))
+
+	# insert rows to ds_aggregate_status table for each app id (+ overall status row)
+	with dsmon_dbh.cursor() as cursor:
+		cursor.executemany("""
+			INSERT INTO ds_aggregate_status (
+				entry_date,
+				status,
+				application,
+				process_appid,
+				event_date,
+				message,
+				seq_num, source
+			) VALUES (
+				sysdate,
+				:status,
+				'DS_DATAFEED',
+				:process_appid,
+				to_date(:event_date, 'YYYYMMDD HH24:MI:SS'),
+				:message,
+				:seq_num,
+				'DATAFEED_BRIDGE')""", dsmon_rows)
+
+	dsmon_dbh.commit()
