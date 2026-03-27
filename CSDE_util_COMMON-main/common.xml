@@ -1,0 +1,37 @@
+<mxGraphModel>
+  <root>
+    <mxCell id="0" />
+    <mxCell id="1" parent="0" />
+    <mxCell id="2" value="Start: al_index_manager" style="rounded=1;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+      <mxGeometry x="200" y="20" width="160" height="60" as="geometry" />
+    </mxCell>
+    <mxCell id="3" value="Validate Params (Date, Index ID)" style="whiteSpace=wrap;html=1;" vertex="1" parent="1">
+      <mxGeometry x="200" y="110" width="160" height="60" as="geometry" />
+    </mxCell>
+    <mxCell id="4" value="Type of Action?" style="rhombus;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+      <mxGeometry x="220" y="200" width="120" height="80" as="geometry" />
+    </mxCell>
+    <mxCell id="5" value="Build Index (alindex_build_child)" style="whiteSpace=wrap;html=1;" vertex="1" parent="1">
+      <mxGeometry x="40" y="320" width="140" height="60" as="geometry" />
+    </mxCell>
+    <mxCell id="6" value="Delete Index (alindex_delete_child)" style="whiteSpace=wrap;html=1;" vertex="1" parent="1">
+      <mxGeometry x="210" y="320" width="140" height="60" as="geometry" />
+    </mxCell>
+    <mxCell id="7" value="Aggregate (alindex_agg_child)" style="whiteSpace=wrap;html=1;" vertex="1" parent="1">
+      <mxGeometry x="380" y="320" width="140" height="60" as="geometry" />
+    </mxCell>
+    <mxCell id="8" value="Check Exit Code 200" style="rhombus;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+      <mxGeometry x="220" y="420" width="120" height="80" as="geometry" />
+    </mxCell>
+    <mxCell id="9" value="Success: Send Email &amp; Cleanup" style="rounded=1;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+      <mxGeometry x="200" y="540" width="160" height="60" as="geometry" />
+    </mxCell>
+    <mxCell id="10" edge="1" parent="1" source="2" target="3"><mxGeometry relative="1" as="geometry" /></mxCell>
+    <mxCell id="11" edge="1" parent="1" source="3" target="4"><mxGeometry relative="1" as="geometry" /></mxCell>
+    <mxCell id="12" edge="1" parent="1" source="4" target="5"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="110" y="240"/></Array></mxGeometry></mxCell>
+    <mxCell id="13" edge="1" parent="1" source="4" target="6"><mxGeometry relative="1" as="geometry" /></mxCell>
+    <mxCell id="14" edge="1" parent="1" source="4" target="7"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="450" y="240"/></Array></mxGeometry></mxCell>
+    <mxCell id="15" edge="1" parent="1" source="5" target="8"><mxGeometry relative="1" as="geometry"/></mxCell>
+    <mxCell id="16" edge="1" parent="1" source="8" target="9"><mxGeometry relative="1" as="geometry" /></mxCell>
+  </root>
+</mxGraphModel>
